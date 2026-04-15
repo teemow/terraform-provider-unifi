@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -132,19 +133,25 @@ func (r *portForwardResource) Schema(
 			"wan": schema.SingleNestedAttribute{
 				MarkdownDescription: "WAN configuration for the port forwarding rule.",
 				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 				Attributes: map[string]schema.Attribute{
 					"interface": schema.StringAttribute{
-						MarkdownDescription: "The WAN interface. Can be `wan`, `wan2`, or `both`.",
+						MarkdownDescription: "The WAN interface (e.g. `wan`, `wan2`, `wan3`, or `both`).",
 						Optional:            true,
-						Validators: []validator.String{
-							stringvalidator.OneOf("wan", "wan2", "both"),
+						Computed:            true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
 						},
 					},
 					"ip_address": schema.StringAttribute{
 						MarkdownDescription: "The WAN IP address for the port forwarding rule. Use `any` for all addresses.",
 						Optional:            true,
-						Validators: []validator.String{
-							validators.IPv4Validator(),
+						Computed:            true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
 						},
 					},
 					"port": schema.StringAttribute{
@@ -173,6 +180,10 @@ func (r *portForwardResource) Schema(
 			"source_limiting": schema.SingleNestedAttribute{
 				MarkdownDescription: "Source limiting configuration for the port forwarding rule.",
 				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 				Attributes: map[string]schema.Attribute{
 					"ip": schema.StringAttribute{
 						MarkdownDescription: "The source IPv4 address (or CIDR) of the port forwarding rule. For all traffic, specify `any`.",
