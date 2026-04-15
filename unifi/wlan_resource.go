@@ -16,8 +16,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -228,14 +228,13 @@ func (r *wlanFrameworkResource) Schema(
 				},
 			},
 			"wlan_bands": schema.SetAttribute{
-				MarkdownDescription: "List of WLAN bands.",
+				MarkdownDescription: "List of WLAN bands. If not set, derived from `wlan_band`.",
 				Optional:            true,
 				Computed:            true,
-				Default: setdefault.StaticValue(types.SetValueMust(types.StringType, []attr.Value{
-					types.StringValue("2g"),
-					types.StringValue("5g"),
-				})),
-				ElementType: types.StringType,
+				ElementType:         types.StringType,
+				PlanModifiers: []planmodifier.Set{
+					&wlanBandsFromBandModifier{},
+				},
 				Validators: []validator.Set{
 					setvalidator.ValueStringsAre(stringvalidator.OneOf("2g", "5g", "6g")),
 				},
@@ -250,6 +249,9 @@ func (r *wlanFrameworkResource) Schema(
 				MarkdownDescription: "MAC address filtering configuration.",
 				Optional:            true,
 				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 				Attributes: map[string]schema.Attribute{
 					"enabled": schema.BoolAttribute{
 						MarkdownDescription: "Indicates whether or not the MAC filter is turned on for the network.",
@@ -1110,4 +1112,45 @@ func (r *wlanFrameworkResource) wlanToModel(
 	}
 
 	return diags
+}
+
+// wlanBandsFromBandModifier derives wlan_bands from wlan_band when not explicitly set.
+// For imports it preserves the state value; for new resources it computes from wlan_band.
+type wlanBandsFromBandModifier struct{}
+
+func (m *wlanBandsFromBandModifier) Description(_ context.Context) string {
+	return "Derives wlan_bands from wlan_band when not explicitly configured."
+}
+
+func (m *wlanBandsFromBandModifier) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (m *wlanBandsFromBandModifier) PlanModifySet(ctx context.Context, req planmodifier.SetRequest, resp *planmodifier.SetResponse) {
+	if !req.ConfigValue.IsNull() {
+		return
+	}
+
+	if !req.StateValue.IsNull() && !req.StateValue.IsUnknown() {
+		resp.PlanValue = req.StateValue
+		return
+	}
+
+	var wlanBand types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("wlan_band"), &wlanBand)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	var bands []attr.Value
+	switch wlanBand.ValueString() {
+	case "2g":
+		bands = []attr.Value{types.StringValue("2g")}
+	case "5g":
+		bands = []attr.Value{types.StringValue("5g")}
+	default:
+		bands = []attr.Value{types.StringValue("2g"), types.StringValue("5g")}
+	}
+
+	resp.PlanValue = types.SetValueMust(types.StringType, bands)
 }
