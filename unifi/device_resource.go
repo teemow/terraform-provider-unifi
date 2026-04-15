@@ -27,8 +27,9 @@ import (
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                = &deviceResource{}
-	_ resource.ResourceWithImportState = &deviceResource{}
+	_ resource.Resource                   = &deviceResource{}
+	_ resource.ResourceWithImportState    = &deviceResource{}
+	_ resource.ResourceWithModifyPlan     = &deviceResource{}
 )
 
 func NewDeviceFrameworkResource() resource.Resource {
@@ -864,6 +865,104 @@ func (r *deviceResource) Configure(
 	}
 
 	r.client = client
+}
+
+// ModifyPlan corrects planned values for port_override attributes that the
+// terraform-plugin-framework's SetNestedBlock handling gets wrong. When set
+// element hashes change, Computed attributes revert to defaults instead of
+// using the user's config values. This fixup ensures op_mode is "aggregate"
+// when aggregate_members are present, preventing plan/apply mismatches.
+func (r *deviceResource) ModifyPlan(
+	ctx context.Context,
+	req resource.ModifyPlanRequest,
+	resp *resource.ModifyPlanResponse,
+) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var plan deviceResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if plan.PortOverride.IsNull() || plan.PortOverride.IsUnknown() {
+		return
+	}
+
+	var config deviceResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if config.PortOverride.IsNull() || config.PortOverride.IsUnknown() {
+		return
+	}
+
+	// Build a map of config port overrides keyed by index
+	configOverrides := make(map[int64]portOverrideModel)
+	for _, elem := range config.PortOverride.Elements() {
+		obj, ok := elem.(types.Object)
+		if !ok {
+			continue
+		}
+		var model portOverrideModel
+		resp.Diagnostics.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if !model.Index.IsNull() {
+			configOverrides[model.Index.ValueInt64()] = model
+		}
+	}
+
+	// Fix planned port overrides using config values
+	modified := false
+	newElements := make([]attr.Value, 0, len(plan.PortOverride.Elements()))
+	for _, elem := range plan.PortOverride.Elements() {
+		obj, ok := elem.(types.Object)
+		if !ok {
+			newElements = append(newElements, elem)
+			continue
+		}
+		var model portOverrideModel
+		resp.Diagnostics.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		if !model.Index.IsNull() {
+			if cfgModel, exists := configOverrides[model.Index.ValueInt64()]; exists {
+				if !cfgModel.OpMode.IsNull() && model.OpMode.ValueString() != cfgModel.OpMode.ValueString() {
+					model.OpMode = cfgModel.OpMode
+					modified = true
+				}
+				if !cfgModel.LagIdx.IsNull() && (model.LagIdx.IsNull() || model.LagIdx.ValueInt64() != cfgModel.LagIdx.ValueInt64()) {
+					model.LagIdx = cfgModel.LagIdx
+					modified = true
+				}
+			}
+		}
+
+		objVal, objDiags := types.ObjectValueFrom(ctx, portOverrideAttrTypes(), model)
+		resp.Diagnostics.Append(objDiags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		newElements = append(newElements, objVal)
+	}
+
+	if modified {
+		newSet, setDiags := types.SetValue(plan.PortOverride.ElementType(ctx), newElements)
+		resp.Diagnostics.Append(setDiags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		plan.PortOverride = newSet
+		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
+	}
 }
 
 func (r *deviceResource) Create(
