@@ -84,18 +84,18 @@ func (r *dynamicDNSResource) Schema(
 					stringplanmodifier.UseNonNullStateForUnknown(),
 				},
 			},
-			"interface": schema.StringAttribute{
-				MarkdownDescription: "The interface for the dynamic DNS. Can be `wan` or `wan2`.",
-				Optional:            true,
-				Computed:            true,
-				Default:             stringdefault.StaticString("wan"),
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
-				Validators: []validator.String{
-					stringvalidator.OneOf("wan", "wan2"),
-				},
+		"interface": schema.StringAttribute{
+			MarkdownDescription: "The interface for the dynamic DNS. Can be `wan`, `wan2`, or `wan3`.",
+			Optional:            true,
+			Computed:            true,
+			Default:             stringdefault.StaticString("wan"),
+			PlanModifiers: []planmodifier.String{
+				stringplanmodifier.RequiresReplace(),
 			},
+			Validators: []validator.String{
+				stringvalidator.OneOf("wan", "wan2", "wan3"),
+			},
+		},
 			"service": schema.StringAttribute{
 				MarkdownDescription: "The Dynamic DNS service provider, various values are supported (for example `dyndns`, etc.).",
 				Required:            true,
