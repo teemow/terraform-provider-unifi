@@ -122,6 +122,7 @@ type portOverrideModel struct {
 	Forward                    types.String `tfsdk:"forward"`
 	FullDuplex                 types.Bool   `tfsdk:"full_duplex"`
 	Isolation                  types.Bool   `tfsdk:"isolation"`
+	LagIdx                     types.Int64  `tfsdk:"lag_idx"`
 	LldpmedEnabled             types.Bool   `tfsdk:"lldpmed_enabled"`
 	LldpmedNotifyEnabled       types.Bool   `tfsdk:"lldpmed_notify_enabled"`
 	MirrorPortIDX              types.Int64  `tfsdk:"mirror_port_idx"`
@@ -706,8 +707,13 @@ func (r *deviceResource) Schema(
 							Optional:    true,
 							Computed:    true,
 						},
-						"isolation": schema.BoolAttribute{
+					"isolation": schema.BoolAttribute{
 							Description: "Enable port isolation.",
+							Optional:    true,
+							Computed:    true,
+						},
+						"lag_idx": schema.Int64Attribute{
+							Description: "LAG group number (starting at 1). Required when op_mode is `aggregate` to identify the LAG group on the switch.",
 							Optional:    true,
 							Computed:    true,
 						},
@@ -1699,6 +1705,8 @@ func (r *deviceResource) portOverridesToFramework(
 
 		model.EgressRateLimitKbps = types.Int64PointerValue(po.EgressRateLimitKbps)
 
+		model.LagIdx = types.Int64PointerValue(po.LagIdx)
+
 		model.MirrorPortIDX = types.Int64PointerValue(po.MirrorPortIDX)
 
 		model.PriorityQueue1Level = types.Int64PointerValue(po.PriorityQueue1Level)
@@ -1885,6 +1893,9 @@ func (r *deviceResource) frameworkToPortOverrides(
 			if !model.EgressRateLimitKbps.IsNull() {
 				po.EgressRateLimitKbps = model.EgressRateLimitKbps.ValueInt64Pointer()
 			}
+			if !model.LagIdx.IsNull() {
+				po.LagIdx = model.LagIdx.ValueInt64Pointer()
+			}
 			if !model.MirrorPortIDX.IsNull() {
 				po.MirrorPortIDX = model.MirrorPortIDX.ValueInt64Pointer()
 			}
@@ -2061,6 +2072,7 @@ func portOverrideAttrTypes() map[string]attr.Type {
 		"forward":                          types.StringType,
 		"full_duplex":                      types.BoolType,
 		"isolation":                        types.BoolType,
+		"lag_idx":                          types.Int64Type,
 		"lldpmed_enabled":                  types.BoolType,
 		"lldpmed_notify_enabled":           types.BoolType,
 		"mirror_port_idx":                  types.Int64Type,
