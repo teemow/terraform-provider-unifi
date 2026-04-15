@@ -1049,6 +1049,13 @@ func (r *deviceResource) Update(
 		return
 	}
 
+	var config deviceResourceModel
+	diags = req.Config.Get(ctx, &config)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	var state deviceResourceModel
 	diags = req.State.Get(ctx, &state)
 	resp.Diagnostics.Append(diags...)
@@ -1078,15 +1085,19 @@ func (r *deviceResource) Update(
 		return
 	}
 
-	// Apply plan changes to the state
+	// Apply plan changes to the state.
+	// port_override uses the config instead of the plan because
+	// SetNestedBlock has a framework bug where Computed attributes
+	// get default values instead of the user's config values when
+	// set element hashes change.
 	if !plan.Name.IsNull() && !plan.Name.IsUnknown() {
 		state.Name = plan.Name
 	}
 	if !plan.Disabled.IsNull() && !plan.Disabled.IsUnknown() {
 		state.Disabled = plan.Disabled
 	}
-	if !plan.PortOverride.IsNull() && !plan.PortOverride.IsUnknown() {
-		state.PortOverride = plan.PortOverride
+	if !config.PortOverride.IsNull() && !config.PortOverride.IsUnknown() {
+		state.PortOverride = config.PortOverride
 	}
 	if !plan.ConfigNetwork.IsNull() && !plan.ConfigNetwork.IsUnknown() {
 		state.ConfigNetwork = plan.ConfigNetwork
@@ -1969,6 +1980,14 @@ func (r *deviceResource) frameworkToPortOverrides(
 					return nil, diags
 				}
 				po.PortSecurityMACAddress = macAddresses
+			}
+
+			// SetNestedBlock has a known framework bug where Computed attributes
+			// can get default values instead of config values when set element
+			// hashes change. Ensure op_mode is consistent with aggregate_members
+			// to prevent silently destroying LAG groups.
+			if len(po.AggregateMembers) > 0 && po.OpMode != "aggregate" {
+				po.OpMode = "aggregate"
 			}
 
 			overrideMap[idx] = po
