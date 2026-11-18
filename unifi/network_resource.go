@@ -3,7 +3,6 @@ package unifi
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-nettypes/cidrtypes"
@@ -221,6 +220,7 @@ func (r *networkResource) Metadata(
 	resp *resource.MetadataResponse,
 ) {
 	resp.TypeName = req.ProviderTypeName + "_network"
+	resp.ResourceBehavior = controllerIDIdentity
 }
 
 // IdentitySchema implements [resource.ResourceWithIdentity].
@@ -840,7 +840,7 @@ func (r *networkResource) ImportState(
 	if strings.HasPrefix(req.ID, "name=") {
 		req.ID = strings.TrimPrefix(req.ID, "name=")
 		resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
-	} else if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(req.ID) {
+	} else if util.IsObjectID(req.ID) {
 		idModel := networkIdentityModel{ID: types.StringValue(req.ID)}
 		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 		if resp.Diagnostics.HasError() {
