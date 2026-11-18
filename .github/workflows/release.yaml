@@ -38,3 +38,7 @@ jobs:
           args: release --parallelism 2 --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A release is tagged on the commit of its release candidate. With
+          # two tags on one commit GoReleaser picks one itself, and it picked
+          # the candidate: name the tag this run is for.
+          GORELEASER_CURRENT_TAG: ${{ inputs.tag || github.ref_name }}
