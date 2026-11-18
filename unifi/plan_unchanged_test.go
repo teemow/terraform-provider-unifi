@@ -219,6 +219,7 @@ type nestedAttributes interface {
 	GetNestedObject() schema.NestedAttributeObject
 }
 
+//nolint:unparam // every caller starts at the root, with an empty prefix
 func (f planFixture) object(s schema.Schema, prefix string) (prior, config tftypes.Value) {
 	priorVals, configVals := f.attributes(s.Attributes, prefix)
 	for name, block := range s.Blocks {

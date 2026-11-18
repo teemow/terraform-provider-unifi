@@ -67,7 +67,8 @@ func TestFirewallPolicyIIDSchema(t *testing.T) {
 			len(opp.PlanModifiers) == 0 {
 			t.Errorf(
 				"%s.match_opposite_iid must be Optional+Computed with a create-only default, got %#v",
-				ep, opp,
+				ep,
+				opp,
 			)
 		}
 	}
