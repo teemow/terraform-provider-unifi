@@ -1111,7 +1111,7 @@ func (r *deviceResource) Read(
 		site = r.client.Site
 	}
 
-	device, err := r.client.GetDevice(ctx, site, id)
+	device, err := r.getDevice(ctx, site, id, state.MAC.ValueString())
 	if err != nil {
 		if _, ok := err.(*unifi.NotFoundError); ok {
 			resp.State.RemoveResource(ctx)
@@ -1171,7 +1171,7 @@ func (r *deviceResource) Update(
 	}
 
 	id := state.ID.ValueString()
-	currentDevice, err := r.client.GetDevice(ctx, site, id)
+	currentDevice, err := r.getDevice(ctx, site, id, state.MAC.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Reading Device for Update",
@@ -1353,6 +1353,25 @@ func (r *deviceResource) ImportState(
 }
 
 // Helper methods
+
+// getDevice looks a device up by its controller ID and, when the controller
+// does not know that ID, by its MAC. The MAC is the device's stable key, the ID
+// is not: the upgrade to Network 11 re-keys every device from an ObjectID to a
+// UUID, and the device list has no entry under the old one. Without the
+// fallback a refresh drops the device from state, and the next apply runs
+// Create, which sends the planned port overrides without the device's live
+// values.
+func (r *deviceResource) getDevice(
+	ctx context.Context,
+	site, id, mac string,
+) (*unifi.Device, error) {
+	device, err := r.client.GetDevice(ctx, site, id)
+	if _, notFound := err.(*unifi.NotFoundError); !notFound || mac == "" {
+		return device, err
+	}
+
+	return r.client.GetDeviceByMAC(ctx, site, cleanMAC(mac))
+}
 
 func (r *deviceResource) updateDevice(
 	ctx context.Context,
