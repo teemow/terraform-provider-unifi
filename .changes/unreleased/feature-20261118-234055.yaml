@@ -1,0 +1,3 @@
+kind: feature
+body: '**`unifi_device`: `port_override.lag_idx` holds the number of a link aggregation group, and a LAG port is written back with it.** The controller numbers the LAGs of a switch and reports the number as `lag_idx` on the lead port (`op_mode = "aggregate"`). go-unifi did not model the field, so a change to any port of a switch, which sends the whole `port_overrides` array, sent every LAG port without its number. It is now read, sent when set, and sent back as the controller reported it when a declared port leaves it out, like `stp_edge_state`. `unifi_device_port` takes the same attribute. Requires go-unifi with `lag_idx` in `DevicePortOverrides`'
+time: 2026-11-18T23:40:55.909207816+01:00
