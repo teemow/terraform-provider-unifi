@@ -46,6 +46,12 @@ jobs:
       with:
         go-version-file: "go.mod"
         cache: true
+    # tfplugindocs runs the Terraform CLI to export the provider schema. Without
+    # one in PATH it downloads its own and verifies it against a bundled
+    # HashiCorp signing key, which has expired.
+    - uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+      with:
+        terraform_wrapper: false
     - run: go generate ./...
     - name: git diff
       run: |
