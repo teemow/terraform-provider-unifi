@@ -3,7 +3,6 @@ package unifi
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
@@ -769,7 +768,7 @@ func (r *wlanFrameworkResource) ImportState(
 	rootAttributeName := "name"
 	if strings.HasPrefix(req.ID, "name=") {
 		req.ID = strings.TrimPrefix(req.ID, "name=")
-	} else if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(req.ID) {
+	} else if util.IsObjectID(req.ID) {
 		rootAttributeName = "id"
 	}
 

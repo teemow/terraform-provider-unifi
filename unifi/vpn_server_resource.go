@@ -179,6 +179,7 @@ func (r *vpnServerResource) Metadata(
 	resp *resource.MetadataResponse,
 ) {
 	resp.TypeName = req.ProviderTypeName + "_vpn_server"
+	resp.ResourceBehavior = controllerIDIdentity
 }
 
 // IdentitySchema implements [resource.ResourceWithIdentity].
@@ -662,7 +663,7 @@ func (r *vpnServerResource) ImportState(
 	if strings.HasPrefix(req.ID, "name=") {
 		req.ID = strings.TrimPrefix(req.ID, "name=")
 		resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
-	} else if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(req.ID) {
+	} else if util.IsObjectID(req.ID) {
 		idModel := vpnServerIdentityModel{ID: types.StringValue(req.ID)}
 		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 		if resp.Diagnostics.HasError() {

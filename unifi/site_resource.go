@@ -3,7 +3,6 @@ package unifi
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -14,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
@@ -304,7 +304,7 @@ func (r *siteFrameworkResource) ImportState(
 	rootAttributeName := "name"
 	if after, ok := strings.CutPrefix(req.ID, "name="); ok {
 		req.ID = after
-	} else if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(req.ID) {
+	} else if util.IsObjectID(req.ID) {
 		rootAttributeName = "id"
 	}
 
