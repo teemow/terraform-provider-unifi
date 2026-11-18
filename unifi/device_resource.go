@@ -34,6 +34,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/ubiquiti-community/go-unifi/unifi"
 	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
@@ -1636,7 +1637,10 @@ func (r *deviceResource) Create(
 	// only manage a subset (e.g. 27). Terraform's post-apply consistency check
 	// requires the set length to match the plan. On subsequent Read, the full
 	// port state will be loaded, which may cause a one-time update on next apply.
-	plan.PortOverride = plannedPortOverride
+	plan.PortOverride = resolvePlannedPortOverrides(ctx, &resp.Diagnostics, plannedPortOverride)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Keep the practitioner's declared radio_table shape (count/order/declared
 	// values); resolve only the sub-fields they left undeclared from the
@@ -1899,7 +1903,10 @@ func (r *deviceResource) Update(
 	}
 
 	// Restore port_override from plan (API returns all ports, plan has subset)
-	plan.PortOverride = plannedPortOverride
+	plan.PortOverride = resolvePlannedPortOverrides(ctx, &resp.Diagnostics, plannedPortOverride)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Keep the practitioner's declared radio_table shape (count/order/declared
 	// values); resolve only the sub-fields they left undeclared from the
@@ -3038,6 +3045,66 @@ func (r *deviceResource) reconcilePortOverrides(
 		return prior, diags
 	}
 	return setValue, diags
+}
+
+// resolvePlannedPortOverrides returns the planned port_override set with every
+// attribute the plan left unknown set to null.
+//
+// The plan cannot be stored as it is. Once anything on the device changes, the
+// framework marks the unset Optional+Computed attributes of a port_override
+// unknown wherever the planned element equals its block, which is the case for
+// every block that sets op_mode (a LAG port). Stored unresolved, those end the
+// apply in "Provider returned invalid result object after apply", after the
+// write has gone through.
+//
+// Null, not the controller's value: an element has to stay equal to its block.
+// Read keeps an unset attribute null for the same reason. A value the block
+// does not set makes the next plan miss the block when it looks the element
+// up, and the framework then applies op_mode's default over a configured
+// `aggregate`; a nested group resolved to an object of nulls is not paired
+// with its block at all (#616).
+func resolvePlannedPortOverrides(
+	ctx context.Context,
+	diags *diag.Diagnostics,
+	planned types.Set,
+) types.Set {
+	if planned.IsNull() || planned.IsUnknown() {
+		return planned
+	}
+
+	raw, err := planned.ToTerraformValue(ctx)
+	if err == nil {
+		raw, err = tftypes.Transform(
+			raw,
+			func(_ *tftypes.AttributePath, v tftypes.Value) (tftypes.Value, error) {
+				if v.IsKnown() {
+					return v, nil
+				}
+				return tftypes.NewValue(v.Type(), nil), nil
+			},
+		)
+	}
+	var resolved attr.Value
+	if err == nil {
+		resolved, err = planned.Type(ctx).ValueFromTerraform(ctx, raw)
+	}
+	if err != nil {
+		diags.AddError(
+			"Error Resolving Port Overrides",
+			fmt.Sprintf("Could not resolve the planned port overrides: %s", err),
+		)
+		return planned
+	}
+
+	set, ok := resolved.(types.Set)
+	if !ok {
+		diags.AddError(
+			"Error Resolving Port Overrides",
+			fmt.Sprintf("Planned port overrides resolved to %T, not a set.", resolved),
+		)
+		return planned
+	}
+	return set
 }
 
 // resolveUnknownPortOverrideAttrs fills any attribute in dst that is still
