@@ -1,0 +1,3 @@
+kind: feature
+body: '**`unifi_dynamic_dns` and `unifi_port_forward`: `wan3` is accepted as an interface.** Gateways with three WAN ports (UCG Ultra) name the third one `wan3`. `unifi_dynamic_dns.interface`, `unifi_port_forward.wan.interface` and `destination_ips[].interface` rejected it at plan time, so an entry on that port could only be adopted with a perpetual diff, and a port forward bound to another interface is stored by the controller and then ignored by the gateway'
+time: 2026-11-18T22:01:00Z

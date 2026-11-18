@@ -114,8 +114,8 @@ func (r *dynamicDNSResource) Schema(
 				},
 			},
 			"interface": schema.StringAttribute{
-				MarkdownDescription: "The interface for the dynamic DNS. Can be `wan` or " +
-					"`wan2`. Defaults to `wan` for a new entry; an existing entry keeps the " +
+				MarkdownDescription: "The interface for the dynamic DNS. Can be `wan`, `wan2` or " +
+					"`wan3`. Defaults to `wan` for a new entry; an existing entry keeps the " +
 					"controller's value when this is not set, so adopting a `wan2` entry " +
 					"does not plan to replace it (#544).",
 				Optional: true,
@@ -127,7 +127,7 @@ func (r *dynamicDNSResource) Schema(
 					stringplanmodifier.RequiresReplace(),
 				},
 				Validators: []validator.String{
-					stringvalidator.OneOf("wan", "wan2"),
+					stringvalidator.OneOf("wan", "wan2", "wan3"),
 				},
 			},
 			"service": schema.StringAttribute{
