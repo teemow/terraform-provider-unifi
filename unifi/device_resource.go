@@ -161,6 +161,7 @@ type portOverrideModel struct {
 	Forward                   types.String `tfsdk:"forward"`
 	FullDuplex                types.Bool   `tfsdk:"full_duplex"`
 	Isolation                 types.Bool   `tfsdk:"isolation"`
+	LagIdx                    types.Int64  `tfsdk:"lag_idx"`
 	Lldpmed                   types.Object `tfsdk:"lldpmed"`
 	MirrorPortIDX             types.Int64  `tfsdk:"mirror_port_idx"`
 	MulticastRouterNetworkIDs types.Set    `tfsdk:"multicast_router_networkconf_ids"`
@@ -1276,6 +1277,13 @@ func devicePortOverrideAttributes() map[string]schema.Attribute {
 					Optional:    true,
 					Computed:    true,
 				},
+			},
+		},
+		"lag_idx": schema.Int64Attribute{
+			Description: "Number of the link-aggregation (LAG) group, starting at 1, on the lead port of the group (`op_mode` `aggregate`). The controller needs it to keep the group: an aggregate port written without it falls back to `switch`. Only managed when set: leaving it unset keeps the port's current value.",
+			Optional:    true,
+			Validators: []validator.Int64{
+				int64validator.AtLeast(1),
 			},
 		},
 		"mirror_port_idx": schema.Int64Attribute{
@@ -2681,6 +2689,13 @@ func carryUnwritableFields(
 		declared.StpEdgeState = current.StpEdgeState
 	}
 
+	// lag_idx likewise. Losing it is worse than losing a setting: the
+	// controller turns an aggregate port that arrives without its group
+	// number back into a plain switch port, which tears the LAG down.
+	if declared.LagIdx == nil {
+		declared.LagIdx = current.LagIdx
+	}
+
 	declared.EeeEnabled = current.EeeEnabled
 	declared.LdMode = current.LdMode
 	declared.LdStatus = current.LdStatus
@@ -2899,6 +2914,9 @@ func reconcilePortOverride(
 		} else {
 			updated.StpEdgeState = types.StringValue(apiPO.StpEdgeState)
 		}
+	}
+	if !pm.LagIdx.IsNull() {
+		updated.LagIdx = types.Int64PointerValue(apiPO.LagIdx)
 	}
 
 	// The guards above only resolve fields the user explicitly configured.
@@ -3160,6 +3178,8 @@ func apiPortOverrideToModel(po unifi.DevicePortOverrides) (portOverrideModel, di
 	}
 
 	// Int64 attributes
+	model.LagIdx = types.Int64PointerValue(po.LagIdx)
+
 	model.MirrorPortIDX = types.Int64PointerValue(po.MirrorPortIDX)
 
 	model.PriorityQueue1Level = types.Int64PointerValue(po.PriorityQueue1Level)
@@ -3375,6 +3395,9 @@ func portOverrideModelToAPI(
 	}
 
 	// Int64 attributes
+	if !model.LagIdx.IsNull() && !model.LagIdx.IsUnknown() {
+		po.LagIdx = model.LagIdx.ValueInt64Pointer()
+	}
 	if !model.MirrorPortIDX.IsNull() {
 		po.MirrorPortIDX = model.MirrorPortIDX.ValueInt64Pointer()
 	}
@@ -3581,6 +3604,7 @@ func portOverrideAttrTypes() map[string]attr.Type {
 		"full_duplex":                      types.BoolType,
 		"isolation":                        types.BoolType,
 		"lldpmed":                          types.ObjectType{AttrTypes: portLldpmedAttrTypes()},
+		"lag_idx":                          types.Int64Type,
 		"mirror_port_idx":                  types.Int64Type,
 		"multicast_router_networkconf_ids": types.SetType{ElemType: types.StringType},
 		"native_networkconf_id":            types.StringType,

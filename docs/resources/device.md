@@ -244,6 +244,7 @@ Optional:
 - `forward` (String) Forwarding mode.
 - `full_duplex` (Boolean) Enable full duplex mode.
 - `isolation` (Boolean) Enable port isolation.
+- `lag_idx` (Number) Number of the link-aggregation (LAG) group, starting at 1, on the lead port of the group (`op_mode` `aggregate`). The controller needs it to keep the group: an aggregate port written without it falls back to `switch`. Only managed when set: leaving it unset keeps the port's current value.
 - `lldpmed` (Attributes) LLDP-MED settings. (see [below for nested schema](#nestedatt--port_override--lldpmed))
 - `mirror_port_idx` (Number) Mirror port index.
 - `multicast_router_networkconf_ids` (Set of String) List of network IDs for multicast router.
