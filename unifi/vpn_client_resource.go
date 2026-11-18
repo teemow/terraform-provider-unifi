@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-nettypes/cidrtypes"
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -18,15 +20,15 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/ubiquiti-community/go-unifi/unifi"
-	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/planmodifiers"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
@@ -56,7 +58,8 @@ type vpnClientResource struct {
 }
 
 type vpnClientIdentityModel struct {
-	ID types.String `tfsdk:"id"`
+	ID   types.String `tfsdk:"id"`
+	Site types.String `tfsdk:"site"`
 }
 
 // vpnClientListConfigModel describes the list configuration model.
@@ -102,6 +105,8 @@ func (m wireguardPeerModel) AttributeTypes() map[string]attr.Type {
 // wireguardModel describes the WireGuard VPN configuration.
 type wireguardModel struct {
 	PrivateKey          types.String `tfsdk:"private_key"`
+	PrivateKeyWO        types.String `tfsdk:"private_key_wo"`
+	PrivateKeyWOVersion types.Int64  `tfsdk:"private_key_wo_version"`
 	Configuration       types.Object `tfsdk:"configuration"`
 	Peer                types.Object `tfsdk:"peer"`
 	PresharedKeyEnabled types.Bool   `tfsdk:"preshared_key_enabled"`
@@ -112,7 +117,9 @@ type wireguardModel struct {
 
 func (m wireguardModel) AttributeTypes() map[string]attr.Type {
 	return map[string]attr.Type{
-		"private_key": types.StringType,
+		"private_key":            types.StringType,
+		"private_key_wo":         types.StringType,
+		"private_key_wo_version": types.Int64Type,
 		"configuration": types.ObjectType{
 			AttrTypes: wireguardConfigurationModel{}.AttributeTypes(),
 		},
@@ -131,9 +138,11 @@ type vpnClientResourceModel struct {
 	Name         types.String         `tfsdk:"name"`
 	Enabled      types.Bool           `tfsdk:"enabled"`
 	Subnet       cidrtypes.IPv4Prefix `tfsdk:"subnet"`
+	IPv6Subnet   cidrtypes.IPv6Prefix `tfsdk:"ipv6_subnet"`
 	DefaultRoute types.Bool           `tfsdk:"default_route"`
 	PullDNS      types.Bool           `tfsdk:"pull_dns"`
 	Wireguard    types.Object         `tfsdk:"wireguard"`
+	Timeouts     timeouts.Value       `tfsdk:"timeouts"`
 }
 
 func (r *vpnClientResource) Metadata(
@@ -142,7 +151,6 @@ func (r *vpnClientResource) Metadata(
 	resp *resource.MetadataResponse,
 ) {
 	resp.TypeName = req.ProviderTypeName + "_vpn_client"
-	resp.ResourceBehavior = controllerIDIdentity
 }
 
 // IdentitySchema implements [resource.ResourceWithIdentity].
@@ -152,12 +160,28 @@ func (r *vpnClientResource) IdentitySchema(
 	resp *resource.IdentitySchemaResponse,
 ) {
 	resp.IdentitySchema = identityschema.Schema{
+		Version: 2,
+		// The optional "site" attribute defaults to the provider site on
+		// import. Identities stored by older provider versions ({id} only)
+		// are version 0 and go through siteIdentityUpgraders, which fills
+		// site from the provider's configured site.
 		Attributes: map[string]identityschema.Attribute{
 			"id": identityschema.StringAttribute{
 				RequiredForImport: true,
 			},
+			"site": identityschema.StringAttribute{
+				OptionalForImport: true,
+			},
 		},
 	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity]. See
+// siteIdentityUpgraders.
+func (r *vpnClientResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return siteIdentityUpgraders(func() *Client { return r.client })
 }
 
 func (r *vpnClientResource) Schema(
@@ -190,36 +214,93 @@ func (r *vpnClientResource) Schema(
 				Required:            true,
 			},
 			"enabled": schema.BoolAttribute{
-				MarkdownDescription: "Specifies whether the VPN client is enabled.",
-				Optional:            true,
-				Computed:            true,
-				Default:             booldefault.StaticBool(true),
+				MarkdownDescription: "Specifies whether the VPN client is enabled. A new client " +
+					"is created enabled; an existing one keeps the controller's value when " +
+					"this is not set, so adopting a disabled tunnel does not re-enable it (#544).",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.Bool{
+					planmodifiers.BoolDefaultOnCreate(true),
+				},
 			},
 			"subnet": schema.StringAttribute{
 				MarkdownDescription: "The local IP address for the WireGuard tunnel in CIDR notation (e.g., `10.0.0.2/24`).",
 				Required:            true,
 				CustomType:          cidrtypes.IPv4PrefixType{},
 			},
+			"ipv6_subnet": schema.StringAttribute{
+				MarkdownDescription: "The local IPv6 address for the WireGuard tunnel in CIDR notation " +
+					"(e.g., `2001:db8::2/64`). In file mode it defaults to the IPv6 entry of the " +
+					"configuration's `Address` line. When not configured, the controller's value is kept, " +
+					"so an address set in the UI survives updates made through Terraform.",
+				Optional:   true,
+				Computed:   true,
+				CustomType: cidrtypes.IPv6PrefixType{},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
 			"default_route": schema.BoolAttribute{
-				MarkdownDescription: "Specifies whether to use the VPN as the default route.",
-				Optional:            true,
-				Computed:            true,
-				Default:             booldefault.StaticBool(false),
+				MarkdownDescription: "Specifies whether to use the VPN as the default route. " +
+					"Taken from the controller when not set (a new client gets `false`), so " +
+					"adopting a client that carries the default route does not drop it (#544).",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"pull_dns": schema.BoolAttribute{
-				MarkdownDescription: "Specifies whether to pull DNS servers from the VPN.",
-				Optional:            true,
-				Computed:            true,
-				Default:             booldefault.StaticBool(false),
+				MarkdownDescription: "Specifies whether to pull DNS servers from the VPN. " +
+					"Taken from the controller when not set (a new client gets `false`) (#544).",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"wireguard": schema.SingleNestedAttribute{
 				MarkdownDescription: "WireGuard VPN configuration. Specify either `configuration` for file upload mode or `peer` for manual configuration.",
 				Required:            true,
 				Attributes: map[string]schema.Attribute{
 					"private_key": schema.StringAttribute{
-						MarkdownDescription: "WireGuard private key for this client.",
-						Required:            true,
+						MarkdownDescription: "WireGuard private key for this client. Stored in state; use `private_key_wo` to avoid persisting the secret.",
+						Optional:            true,
 						Sensitive:           true,
+						Validators: []validator.String{
+							stringvalidator.AtLeastOneOf(
+								path.MatchRelative().AtParent().AtName("private_key"),
+								path.MatchRelative().AtParent().AtName("private_key_wo"),
+							),
+							stringvalidator.ConflictsWith(
+								path.MatchRelative().AtParent().AtName("private_key_wo"),
+							),
+						},
+					},
+					"private_key_wo": schema.StringAttribute{
+						MarkdownDescription: "Write-only equivalent of `private_key` (Terraform 1.11+). Used at apply time but never written to state. Mutually exclusive with `private_key`.",
+						Optional:            true,
+						Sensitive:           true,
+						WriteOnly:           true,
+						Validators: []validator.String{
+							stringvalidator.AtLeastOneOf(
+								path.MatchRelative().AtParent().AtName("private_key"),
+								path.MatchRelative().AtParent().AtName("private_key_wo"),
+							),
+							stringvalidator.ConflictsWith(
+								path.MatchRelative().AtParent().AtName("private_key"),
+							),
+						},
+					},
+					"private_key_wo_version": schema.Int64Attribute{
+						MarkdownDescription: "Version counter for `private_key_wo`. Increment this value to trigger a private key update.",
+						Optional:            true,
+						Validators: []validator.Int64{
+							int64validator.AtLeast(1),
+							int64validator.AlsoRequires(
+								path.MatchRelative().AtParent().AtName("private_key_wo"),
+							),
+						},
 					},
 					"configuration": schema.SingleNestedAttribute{
 						MarkdownDescription: "File-based WireGuard configuration. Provide a complete WireGuard .conf file.",
@@ -259,10 +340,15 @@ func (r *vpnClientResource) Schema(
 						},
 					},
 					"preshared_key_enabled": schema.BoolAttribute{
-						MarkdownDescription: "Specifies whether to use a preshared key for additional security.",
-						Optional:            true,
-						Computed:            true,
-						Default:             booldefault.StaticBool(false),
+						MarkdownDescription: "Specifies whether to use a preshared key for " +
+							"additional security. Taken from the controller when not set (a new " +
+							"client gets `false`, or `true` when the configuration file carries " +
+							"a preshared key) (#544).",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
 					},
 					"preshared_key": schema.StringAttribute{
 						MarkdownDescription: "WireGuard preshared key. Required when preshared_key_enabled is true.",
@@ -270,10 +356,15 @@ func (r *vpnClientResource) Schema(
 						Sensitive:           true,
 					},
 					"interface": schema.StringAttribute{
-						MarkdownDescription: "WAN interface to use for the VPN connection (e.g., `wan`, `wan2`).",
-						Optional:            true,
-						Computed:            true,
-						Default:             stringdefault.StaticString("wan"),
+						MarkdownDescription: "WAN interface to use for the VPN connection (e.g., " +
+							"`wan`, `wan2`). Defaults to `wan` for a new client; an existing " +
+							"client keeps the controller's value when this is not set, so " +
+							"adopting a tunnel on `wan2` does not move it (#544).",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.String{
+							planmodifiers.StringDefaultOnCreateKeepNull("wan"),
+						},
 						Validators: []validator.String{
 							stringvalidator.RegexMatches(
 								regexp.MustCompile(`^wan[2-9]?$`),
@@ -291,6 +382,12 @@ func (r *vpnClientResource) Schema(
 					},
 				},
 			},
+			"timeouts": timeouts.Attributes(ctx, timeouts.Opts{
+				Create: true,
+				Read:   true,
+				Update: true,
+				Delete: true,
+			}),
 		},
 	}
 }
@@ -333,11 +430,26 @@ func (r *vpnClientResource) Create(
 		return
 	}
 
+	createTimeout, timeoutDiags := data.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
 	// Convert to unifi.Network
 	network, diags := r.modelToNetwork(ctx, &data)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+	privateKeyWO := r.readPrivateKeyWO(ctx, req.Config, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !privateKeyWO.IsNull() && !privateKeyWO.IsUnknown() {
+		network.WireguardPrivateKey = privateKeyWO.ValueStringPointer()
 	}
 
 	site := data.Site.ValueString()
@@ -369,7 +481,7 @@ func (r *vpnClientResource) Create(
 	}
 
 	// Save data into Terraform state
-	idModel := vpnClientIdentityModel{ID: data.ID}
+	idModel := vpnClientIdentityModel{ID: data.ID, Site: data.Site}
 	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
@@ -387,21 +499,52 @@ func (r *vpnClientResource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Get the resource identity, tolerating null/empty identities (state
+	// written by older provider versions).
+	var identity vpnClientIdentityModel
+	if req.Identity != nil && !req.Identity.Raw.IsFullyNull() {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
 	site := data.Site.ValueString()
 	if site == "" {
+		site = identity.Site.ValueString()
+	}
+	if site == "" {
 		site = r.client.Site
+	}
+
+	// Prefer the state ID; fall back to the identity ID (the post-import
+	// refresh may run from an identity-only state).
+	lookupID := ""
+	if !data.ID.IsNull() && !data.ID.IsUnknown() {
+		lookupID = data.ID.ValueString()
+	}
+	if lookupID == "" && !identity.ID.IsNull() && !identity.ID.IsUnknown() {
+		lookupID = identity.ID.ValueString()
 	}
 
 	var err error
 	var network *unifi.Network
 
-	if !data.ID.IsNull() && !data.ID.IsUnknown() {
+	if lookupID != "" {
 		// Get the network by ID
-		network, err = r.client.GetNetwork(ctx, site, data.ID.ValueString())
+		network, err = r.client.GetNetwork(ctx, site, lookupID)
 		if err != nil {
 			resp.Diagnostics.AddError(
 				"Error Reading VPN Client",
-				"Could not read VPN client ID "+data.ID.ValueString()+": "+err.Error(),
+				"Could not read VPN client ID "+lookupID+": "+err.Error(),
 			)
 			return
 		}
@@ -430,9 +573,13 @@ func (r *vpnClientResource) Read(
 		return
 	}
 
-	// Save updated data into Terraform state
-	idModel := vpnClientIdentityModel{ID: data.ID}
-	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	// Terraform rejects any modification of an existing stored identity
+	// (including filling a null attribute), so pass an incoming identity
+	// through unchanged and only derive one when none is stored yet.
+	if resp.Identity != nil && (req.Identity == nil || req.Identity.Raw.IsFullyNull()) {
+		idModel := vpnClientIdentityModel{ID: data.ID, Site: data.Site}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -449,11 +596,26 @@ func (r *vpnClientResource) Update(
 		return
 	}
 
+	updateTimeout, timeoutDiags := data.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
 	// Convert to unifi.Network
 	network, diags := r.modelToNetwork(ctx, &data)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+	privateKeyWO := r.readPrivateKeyWO(ctx, req.Config, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !privateKeyWO.IsNull() && !privateKeyWO.IsUnknown() {
+		network.WireguardPrivateKey = privateKeyWO.ValueStringPointer()
 	}
 
 	site := data.Site.ValueString()
@@ -486,9 +648,12 @@ func (r *vpnClientResource) Update(
 		return
 	}
 
-	// Save updated data into Terraform state
-	idModel := vpnClientIdentityModel{ID: data.ID}
-	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	// Pass an existing identity through unchanged; only derive one when
+	// none is stored yet (see Read).
+	if resp.Identity != nil && (req.Identity == nil || req.Identity.Raw.IsFullyNull()) {
+		idModel := vpnClientIdentityModel{ID: data.ID, Site: data.Site}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -504,6 +669,14 @@ func (r *vpnClientResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := data.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	site := data.Site.ValueString()
 	if site == "" {
@@ -527,31 +700,69 @@ func (r *vpnClientResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	idParts := strings.Split(req.ID, ":")
-	if len(idParts) == 2 {
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), idParts[0])...)
-		req.ID = idParts[1]
-	}
-
-	if strings.HasPrefix(req.ID, "name=") {
-		req.ID = strings.TrimPrefix(req.ID, "name=")
-		resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
-	} else if util.IsObjectID(req.ID) {
-		idModel := vpnClientIdentityModel{ID: types.StringValue(req.ID)}
-		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	// Identity-based import (Terraform 1.12+ import block with identity).
+	if req.ID == "" {
+		if req.Identity == nil {
+			resp.Diagnostics.AddError(
+				"Invalid Import Request",
+				"Importing a VPN client requires either an import ID or a resource identity.",
+			)
+			return
+		}
+		var identity vpnClientIdentityModel
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		resource.ImportStatePassthroughWithIdentity(
-			ctx,
-			path.Root("id"),
-			path.Root("id"),
-			req,
-			resp,
-		)
-	} else {
-		resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
+		if identity.ID.IsNull() || identity.ID.ValueString() == "" {
+			resp.Diagnostics.AddError(
+				"Invalid Import Identity",
+				"The `id` identity attribute is required to import a VPN client.",
+			)
+			return
+		}
+		if identity.Site.IsNull() || identity.Site.ValueString() == "" {
+			identity.Site = types.StringValue(r.client.Site)
+		}
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &identity)...)
+		return
 	}
+
+	// Classic string import: "id", "site:id", "name=<name>", "site:name=<name>",
+	// or a bare network name.
+	importID := req.ID
+	site := ""
+	if idParts := strings.Split(importID, ":"); len(idParts) == 2 {
+		site = idParts[0]
+		importID = idParts[1]
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), site)...)
+	}
+	if site == "" {
+		site = r.client.Site
+	}
+
+	if name, ok := strings.CutPrefix(importID, "name="); ok {
+		// Import by name; Read resolves the ID and fills the identity.
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
+		return
+	}
+
+	if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(importID) {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), importID)...)
+		idModel := vpnClientIdentityModel{
+			ID:   types.StringValue(importID),
+			Site: types.StringValue(site),
+		}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+		return
+	}
+
+	// Fall back to import by name; Read resolves the ID and fills the identity.
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), importID)...)
 }
 
 // modelToNetwork converts from Terraform model to unifi.Network.
@@ -564,11 +775,14 @@ func (r *vpnClientResource) modelToNetwork(
 	network := &unifi.Network{
 		Name:                  model.Name.ValueStringPointer(),
 		Purpose:               unifi.PurposeVPNClient,
-		Enabled:               model.Enabled.ValueBool(),
+		Enabled:               boolPointerIfKnown(model.Enabled),
 		IPSubnet:              model.Subnet.ValueStringPointer(),
-		VPNType:               util.Ptr("wireguard-client"),
+		VPNType:               new("wireguard-client"),
 		VPNClientDefaultRoute: model.DefaultRoute.ValueBool(),
 		VPNClientPullDNS:      model.PullDNS.ValueBool(),
+	}
+	if !model.IPv6Subnet.IsNull() && !model.IPv6Subnet.IsUnknown() {
+		network.IPV6Subnet = model.IPv6Subnet.ValueStringPointer()
 	}
 
 	// Handle WireGuard configuration
@@ -579,7 +793,7 @@ func (r *vpnClientResource) modelToNetwork(
 		if !diags.HasError() {
 			network.WireguardPrivateKey = wireguard.PrivateKey.ValueStringPointer()
 			network.WireguardClientPresharedKeyEnabled = wireguard.PresharedKeyEnabled.ValueBool()
-			network.WireguardInterface = wireguard.Interface.ValueStringPointer()
+			network.WireguardInterface = stringPointerIfKnown(wireguard.Interface)
 
 			// Handle DNS servers
 			if !wireguard.DnsServers.IsNull() && !wireguard.DnsServers.IsUnknown() {
@@ -588,10 +802,10 @@ func (r *vpnClientResource) modelToNetwork(
 				diags.Append(d...)
 				if !diags.HasError() {
 					if len(dnsServers) > 0 {
-						network.DHCPDDNS1 = dnsServers[0]
+						network.DHCPDDNS1 = new(dnsServers[0])
 					}
 					if len(dnsServers) > 1 {
-						network.DHCPDDNS2 = dnsServers[1]
+						network.DHCPDDNS2 = new(dnsServers[1])
 					}
 				}
 			}
@@ -614,30 +828,37 @@ func (r *vpnClientResource) modelToNetwork(
 						return nil, diags
 					}
 
-					network.WireguardClientMode = util.Ptr("manual")
-					network.WireguardClientPeerPublicKey = util.Ptr(parsed.PublicKey)
-					network.WireguardClientPeerIP = util.Ptr(parsed.EndpointIP)
-					network.WireguardClientPeerPort = util.Ptr(parsed.EndpointPort)
+					network.WireguardClientMode = new("manual")
+					network.WireguardClientPeerPublicKey = new(parsed.PublicKey)
+					network.WireguardClientPeerIP = new(parsed.EndpointIP)
+					network.WireguardClientPeerPort = new(parsed.EndpointPort)
+
+					// Use the IPv6 tunnel address from the config file if not set explicitly
+					if network.IPV6Subnet == nil {
+						if v6 := ipv6FromAddress(parsed.Address); v6 != "" {
+							network.IPV6Subnet = new(v6)
+						}
+					}
 
 					// Use private key from config file if not set explicitly
 					if parsed.PrivateKey != "" &&
 						(wireguard.PrivateKey.IsNull() || wireguard.PrivateKey.IsUnknown()) {
-						network.WireguardPrivateKey = util.Ptr(parsed.PrivateKey)
+						network.WireguardPrivateKey = new(parsed.PrivateKey)
 					}
 
 					// Use preshared key from config file if present
 					if parsed.PresharedKey != "" {
 						network.WireguardClientPresharedKeyEnabled = true
-						network.WireguardClientPresharedKey = util.Ptr(parsed.PresharedKey)
+						network.WireguardClientPresharedKey = new(parsed.PresharedKey)
 					}
 
 					// Use DNS servers from config file if not set explicitly
 					if len(parsed.DNS) > 0 && wireguard.DnsServers.IsNull() {
 						if len(parsed.DNS) > 0 {
-							network.DHCPDDNS1 = parsed.DNS[0]
+							network.DHCPDDNS1 = new(parsed.DNS[0])
 						}
 						if len(parsed.DNS) > 1 {
-							network.DHCPDDNS2 = parsed.DNS[1]
+							network.DHCPDDNS2 = new(parsed.DNS[1])
 						}
 					}
 				}
@@ -647,7 +868,7 @@ func (r *vpnClientResource) modelToNetwork(
 				d := wireguard.Peer.As(ctx, &peer, basetypes.ObjectAsOptions{})
 				diags.Append(d...)
 				if !diags.HasError() {
-					network.WireguardClientMode = util.Ptr("manual")
+					network.WireguardClientMode = new("manual")
 					network.WireguardClientPeerIP = peer.IP.ValueStringPointer()
 					network.WireguardClientPeerPort = peer.Port.ValueInt64Pointer()
 					network.WireguardClientPeerPublicKey = peer.PublicKey.ValueStringPointer()
@@ -664,6 +885,16 @@ func (r *vpnClientResource) modelToNetwork(
 	return network, diags
 }
 
+// networkCreateEnabled creates a VPN network enabled unless the configuration
+// says otherwise. The plan already carries `enabled = true` for a new network
+// (planmodifiers.BoolDefaultOnCreate on the attribute), so this is only the
+// request-side fallback of vpnServerCreateDefaults.
+func networkCreateEnabled(network *unifi.Network) {
+	if network.Enabled == nil {
+		network.Enabled = new(true)
+	}
+}
+
 // networkToModel converts from unifi.Network to Terraform model.
 func (r *vpnClientResource) networkToModel(
 	ctx context.Context,
@@ -677,11 +908,16 @@ func (r *vpnClientResource) networkToModel(
 	model.ID = types.StringValue(network.ID)
 	model.Site = types.StringValue(site)
 	model.Name = types.StringPointerValue(network.Name)
-	model.Enabled = types.BoolValue(network.Enabled)
+	model.Enabled = networkEnabled(network.Enabled)
 	if network.IPSubnet != nil {
 		model.Subnet = cidrtypes.NewIPv4PrefixValue(*network.IPSubnet)
 	} else {
 		model.Subnet = cidrtypes.NewIPv4PrefixNull()
+	}
+	if network.IPV6Subnet != nil && *network.IPV6Subnet != "" {
+		model.IPv6Subnet = cidrtypes.NewIPv6PrefixValue(*network.IPV6Subnet)
+	} else {
+		model.IPv6Subnet = cidrtypes.NewIPv6PrefixNull()
 	}
 	model.DefaultRoute = types.BoolValue(network.VPNClientDefaultRoute)
 	model.PullDNS = types.BoolValue(network.VPNClientPullDNS)
@@ -748,13 +984,7 @@ func (r *vpnClientResource) networkToModel(
 		diags.Append(d...)
 		dnsServersList = priorWG.DnsServers
 	} else {
-		var dnsServers []string
-		if network.DHCPDDNS1 != "" {
-			dnsServers = append(dnsServers, network.DHCPDDNS1)
-		}
-		if network.DHCPDDNS2 != "" {
-			dnsServers = append(dnsServers, network.DHCPDDNS2)
-		}
+		dnsServers := collectNonEmptyStringPointers(network.DHCPDDNS1, network.DHCPDDNS2)
 		if len(dnsServers) > 0 {
 			var d diag.Diagnostics
 			dnsServersList, d = types.ListValueFrom(ctx, types.StringType, dnsServers)
@@ -767,6 +997,7 @@ func (r *vpnClientResource) networkToModel(
 	// For private key and preshared key: when file mode was used, preserve the
 	// values from prior state since the API may return different representations.
 	privateKeyVal := strPtrToType(network.WireguardPrivateKey)
+	privateKeyWOVersion := types.Int64Null()
 	presharedKeyVal := strPtrToType(network.WireguardClientPresharedKey)
 	presharedKeyEnabled := types.BoolValue(network.WireguardClientPresharedKeyEnabled)
 
@@ -777,12 +1008,33 @@ func (r *vpnClientResource) networkToModel(
 		if !diags.HasError() {
 			privateKeyVal = priorWG.PrivateKey
 			presharedKeyVal = priorWG.PresharedKey
-			presharedKeyEnabled = priorWG.PresharedKeyEnabled
+			// On create the plan leaves an undeclared flag unknown: take the
+			// controller's value then (#544).
+			if !priorWG.PresharedKeyEnabled.IsUnknown() {
+				presharedKeyEnabled = priorWG.PresharedKeyEnabled
+			}
+		}
+	}
+
+	// A null private_key in prior state means the write-only alternative was
+	// used. Never copy the controller's echoed private key into state.
+	if priorState != nil && !priorState.Wireguard.IsNull() &&
+		!priorState.Wireguard.IsUnknown() {
+		var priorWG wireguardModel
+		d := priorState.Wireguard.As(ctx, &priorWG, basetypes.ObjectAsOptions{})
+		diags.Append(d...)
+		if !diags.HasError() && priorWG.PrivateKey.IsNull() {
+			privateKeyVal = types.StringNull()
+		}
+		if !diags.HasError() {
+			privateKeyWOVersion = priorWG.PrivateKeyWOVersion
 		}
 	}
 
 	wireguardValue := wireguardModel{
 		PrivateKey:          privateKeyVal,
+		PrivateKeyWO:        types.StringNull(),
+		PrivateKeyWOVersion: privateKeyWOVersion,
 		Configuration:       configurationObj,
 		Peer:                peerObj,
 		PresharedKeyEnabled: presharedKeyEnabled,
@@ -800,6 +1052,22 @@ func (r *vpnClientResource) networkToModel(
 	model.Wireguard = wireguardObj
 
 	return diags
+}
+
+// readPrivateKeyWO reads the write-only key from configuration. Write-only
+// values are never available through plan or state.
+func (r *vpnClientResource) readPrivateKeyWO(
+	ctx context.Context,
+	config tfsdk.Config,
+	diags *diag.Diagnostics,
+) types.String {
+	var privateKeyWO types.String
+	diags.Append(config.GetAttribute(
+		ctx,
+		path.Root("wireguard").AtName("private_key_wo"),
+		&privateKeyWO,
+	)...)
+	return privateKeyWO
 }
 
 // ListResourceConfigSchema implements [list.ListResource].
@@ -894,11 +1162,10 @@ func (r *vpnClientResource) List(
 
 			// Set identity.
 			result.Diagnostics.Append(
-				result.Identity.SetAttribute(
-					ctx,
-					path.Root("id"),
-					types.StringValue(network.ID),
-				)...,
+				result.Identity.Set(ctx, vpnClientIdentityModel{
+					ID:   types.StringValue(network.ID),
+					Site: types.StringValue(site),
+				})...,
 			)
 
 			// Convert to model.
@@ -906,6 +1173,7 @@ func (r *vpnClientResource) List(
 			result.Diagnostics.Append(
 				r.networkToModel(ctx, &network, &model, site, &vpnClientResourceModel{})...)
 			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
 				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
 			}
 

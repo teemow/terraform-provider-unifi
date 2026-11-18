@@ -95,12 +95,13 @@ resource "unifi_bgp" "structured" {
 
 - `asn` (Number) The BGP Autonomous System Number. Conflicts with `config`.
 - `config` (String) The raw FRRouting BGP daemon configuration. Conflicts with `asn`, `router_id`, and `peers`.
-- `description` (String) Description of the BGP configuration.
-- `enabled` (Boolean) Enable BGP routing.
+- `description` (String) Description of the BGP configuration. Defaults to `BGP Configuration` for a new configuration; an existing one keeps the controller's value when this is not set (#544).
+- `enabled` (Boolean) Enable BGP routing. Taken from the controller when not set (a new configuration is created disabled), so adopting a running BGP configuration does not switch it off (#544).
 - `peers` (Attributes List) List of BGP peer groups. Conflicts with `config`. (see [below for nested schema](#nestedatt--peers))
 - `router_id` (String) The BGP router ID (typically an IP address). Conflicts with `config`.
 - `site` (String) The name of the site to associate the BGP configuration with.
-- `upload_file_name` (String) The name of the uploaded configuration file.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
+- `upload_file_name` (String) The name of the uploaded configuration file. Defaults to `frr.conf` for a new configuration; an existing one keeps the controller's value when this is not set (#544).
 
 ### Read-Only
 
@@ -118,3 +119,14 @@ Optional:
 
 - `description` (String) Description of this peer group.
 - `networks` (List of String) List of network CIDR ranges to listen on for this peer group.
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).

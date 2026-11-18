@@ -40,13 +40,29 @@ resource "unifi_wlan" "wifi" {
   security   = "wpapsk"
 
   # enable WPA2/WPA3 support
-  wpa3_support    = true
-  wpa3_transition = true
-  pmf_mode        = "optional"
+  wpa3 = {
+    support    = true
+    transition = true
+  }
+  pmf_mode = "optional"
 
   network_id    = unifi_network.vlan.id
-  ap_group_ids  = [data.unifi_ap_group.default.id]
   user_group_id = data.unifi_client_qos_rate.default.id
+  ap_group = {
+    ids = [data.unifi_ap_group.default.id]
+  }
+
+  # Per-key (PPSK) passphrases, each optionally bound to its own network/VLAN
+  private_preshared_keys_enabled = true
+  private_preshared_keys = [
+    {
+      password   = "guest-key-1234"
+      network_id = unifi_network.vlan.id
+    },
+    {
+      password = "iot-key-5678"
+    },
+  ]
 }
 ```
 
@@ -61,39 +77,67 @@ resource "unifi_wlan" "wifi" {
 
 ### Optional
 
-- `ap_group_ids` (Set of String) List of AP group IDs to apply this WLAN to.
-- `ap_group_mode` (String) Access point group mode.
+> **NOTE**: [Write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments) are supported in Terraform 1.11 and later.
+
+- `ap_group` (Attributes) Access point group assignment. (see [below for nested schema](#nestedatt--ap_group))
+- `bandsteering_mode` (String, Deprecated) **Moved to `unifi_device.bandsteering_mode`.** Per-SSID band steering mode (`off`, `equal`, `prefer_5g`), which steers dual-band capable clients toward the less congested / higher-throughput band. UniFi Network 10.x moved band steering off the WLAN back to the access point, so this attribute no longer reaches the controller: set `bandsteering_mode` on the `unifi_device` resource for the AP instead. Still accepted and preserved in state for one release.
+- `bc_filter_list` (Set of String) List of MAC addresses for the broadcast filter. The controller may populate this on its own, so it is computed when unset.
 - `bss_transition` (Boolean) Improves client roaming by providing connection details of nearby APs.
-- `enabled` (Boolean) Enable or disable the WLAN.
+- `dtim_6e` (Number) DTIM period for the 6 GHz band (1-255). Only used when `dtim_mode` is `custom`. Computed from the controller when not set.
+- `dtim_mode` (String) DTIM mode. Can be one of `default` or `custom`. Use `custom` together with `dtim_ng`/`dtim_na`/`dtim_6e`. Defaults to `default` for a newly created WLAN; an existing WLAN keeps the controller's value when unset.
+- `dtim_na` (Number) DTIM period for the 5 GHz band (1-255). Only used when `dtim_mode` is `custom`. Computed from the controller when not set.
+- `dtim_ng` (Number) DTIM period for the 2.4 GHz band (1-255). Only used when `dtim_mode` is `custom`. Computed from the controller when not set.
+- `enabled` (Boolean) Enable or disable the WLAN. Defaults to `true` for a newly created WLAN; an existing WLAN keeps the controller's value when unset.
+- `enhanced_iot` (Boolean) Enable enhanced IoT connectivity. When `true`, the controller forces `iapp_enabled = true`, `wpa3.support = false`, `wpa3.transition = false`, `pmf_mode = "disabled"` and `dtim_ng = 1`; the provider pins those fields to match, so any conflicting values you set for them are ignored (this disables WPA3 on the SSID).
 - `fast_roaming_enabled` (Boolean) Enable fast roaming, aka 802.11r.
+- `group_rekey` (Number) Group rekey interval in seconds (0 to disable). Computed from the controller when not set.
 - `hide_ssid` (Boolean) Indicates whether or not to hide the SSID from broadcast.
+- `hotspot2conf_enabled` (Boolean) Enable Hotspot 2.0 configuration.
+- `iapp_enabled` (Boolean) Enable Inter-Access Point Protocol (802.11f) for faster roaming. Computed from the controller when not set.
 - `is_guest` (Boolean) Indicates that this is a guest WLAN and should use guest behaviors.
 - `l2_isolation` (Boolean) Isolates stations on layer 2 (ethernet) level.
 - `mac_filter` (Attributes) MAC address filtering configuration. (see [below for nested schema](#nestedatt--mac_filter))
-- `minimum_data_rate_2g_kbps` (Number) Minimum data rate for 2G clients in Kbps.
-- `minimum_data_rate_5g_kbps` (Number) Minimum data rate for 5G clients in Kbps.
-- `minrate_setting_preference` (String) Minimum rate setting preference.
+- `minimum_data_rate_2g_kbps` (Number) Minimum data rate for 2G clients in Kbps. When unset, the controller assigns a value (e.g. `1000` in `auto` mode), so this is computed rather than defaulted to `0`.
+- `minimum_data_rate_5g_kbps` (Number) Minimum data rate for 5G clients in Kbps. When unset, the controller assigns a value (e.g. `6000` in `auto` mode), so this is computed rather than defaulted to `0`.
+- `minrate_setting_preference` (String) Minimum rate setting preference. Defaults to `auto` for a newly created WLAN; an existing WLAN keeps the controller's value when unset.
+- `mlo_enabled` (Boolean) Enable Multi-Link Operation (6 GHz).
 - `multicast_enhance` (Boolean) Indicates whether or not Multicast Enhance is turned of for the network.
 - `nas_identifier_type` (String) NAS identifier type for RADIUS.
 - `network_id` (String) ID of the network for this WLAN.
 - `no2ghz_oui` (Boolean) Connect high performance clients to 5 GHz only.
-- `passphrase` (String, Sensitive) The passphrase for the network, this is only required if `security` is not set to `open`.
+- `passphrase` (String, Sensitive) The passphrase for the network, only required if `security` is not `open`. Stored in state — use `passphrase_wo` to avoid persisting the secret.
+- `passphrase_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) Write-only equivalent of `passphrase` (Terraform 1.11+). Sent on create and whenever `passphrase_wo_version` changes, and never written to state, so it can be sourced from an ephemeral resource (e.g. a Vault secret). Mutually exclusive with `passphrase`.
+- `passphrase_wo_version` (Number) Version counter for `passphrase_wo`. Increment this value to send the current `passphrase_wo` to the controller on the next apply.
 - `pmf_mode` (String) Enable Protected Management Frames. This cannot be disabled if using WPA 3.
+- `private_preshared_keys` (Attributes List) Private pre-shared keys (PPSK): a list of per-key passphrases, each optionally bound to its own network/VLAN. Only valid when `private_preshared_keys_enabled` is `true`. (see [below for nested schema](#nestedatt--private_preshared_keys))
+- `private_preshared_keys_enabled` (Boolean) Whether per-key (PPSK) passphrases are enabled for this WLAN. Requires `security = wpapsk`.
 - `proxy_arp` (Boolean) Reduces airtime usage by allowing APs to "proxy" common broadcast frames as unicast.
-- `radius_profile_id` (String) ID of the RADIUS profile to use when security `wpaeap`.
+- `radius` (Attributes) RADIUS settings. (see [below for nested schema](#nestedatt--radius))
+- `roaming_assistant_6e` (Attributes) 6 GHz roaming assistant. Disconnects clients whose signal drops below `rssi` so they re-associate with a closer AP. (see [below for nested schema](#nestedatt--roaming_assistant_6e))
+- `roaming_assistant_na` (Attributes) 5 GHz roaming assistant. Disconnects clients whose signal drops below `rssi` so they re-associate with a closer AP. Replaces the device-level `radio_table.assisted_roaming_*` attributes, which UniFi Network 10.x moved to the WLAN. (see [below for nested schema](#nestedatt--roaming_assistant_na))
 - `schedule` (Block List) Start and stop schedules for the WLAN (see [below for nested schema](#nestedblock--schedule))
 - `site` (String) The name of the site to associate the WLAN with.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 - `uapsd` (Boolean) Enable Unscheduled Automatic Power Save Delivery.
 - `vlan` (Number) VLAN ID.
 - `vlan_enabled` (Boolean) Enable VLAN tagging.
 - `wlan_band` (String) WLAN band.
-- `wlan_bands` (Set of String) List of WLAN bands. If not set, derived from `wlan_band`.
-- `wpa3_support` (Boolean) Enable WPA 3 support (security must be `wpapsk` and PMF must be turned on).
-- `wpa3_transition` (Boolean) Enable WPA 3 and WPA 2 support (security must be `wpapsk` and `wpa3_support` must be true).
+- `wlan_bands` (Set of String) List of WLAN bands.
+- `wpa` (Attributes) WPA mode and encryption settings. (see [below for nested schema](#nestedatt--wpa))
+- `wpa3` (Attributes) WPA3 settings. (see [below for nested schema](#nestedatt--wpa3))
 
 ### Read-Only
 
 - `id` (String) The ID of the WLAN.
+
+<a id="nestedatt--ap_group"></a>
+### Nested Schema for `ap_group`
+
+Optional:
+
+- `ids` (Set of String) List of AP group IDs to apply this WLAN to.
+- `mode` (String) Access point group mode. Defaults to `all` for a newly created WLAN; an existing WLAN keeps the controller's value when unset.
+
 
 <a id="nestedatt--mac_filter"></a>
 ### Nested Schema for `mac_filter`
@@ -102,7 +146,46 @@ Optional:
 
 - `enabled` (Boolean) Indicates whether or not the MAC filter is turned on for the network.
 - `list` (Set of String) List of MAC addresses to filter (only valid if `enabled` is `true`).
-- `policy` (String) MAC address filter policy (only valid if `enabled` is `true`).
+- `policy` (String) MAC address filter policy (only valid if `enabled` is `true`). Defaults to `deny` for a newly created WLAN; an existing WLAN keeps the controller's value when unset.
+
+
+<a id="nestedatt--private_preshared_keys"></a>
+### Nested Schema for `private_preshared_keys`
+
+Required:
+
+- `password` (String, Sensitive) The passphrase for this key (8-255 characters).
+
+Optional:
+
+- `network_id` (String) ID of the network/VLAN this key is bound to. Leave unset to use the WLAN's default network.
+
+
+<a id="nestedatt--radius"></a>
+### Nested Schema for `radius`
+
+Optional:
+
+- `mac_auth_enabled` (Boolean) Enable RADIUS MAC authentication. Defaults to `false` when not set.
+- `profile_id` (String) ID of the RADIUS profile to use when security `wpaeap`. The controller may assign a default profile, so this is computed when unset.
+
+
+<a id="nestedatt--roaming_assistant_6e"></a>
+### Nested Schema for `roaming_assistant_6e`
+
+Optional:
+
+- `enabled` (Boolean) Enable the 6 GHz roaming assistant.
+- `rssi` (Number) Signal strength threshold in dBm, `-90` to `-70`. The controller supplies a value when unset.
+
+
+<a id="nestedatt--roaming_assistant_na"></a>
+### Nested Schema for `roaming_assistant_na`
+
+Optional:
+
+- `enabled` (Boolean) Enable the 5 GHz roaming assistant.
+- `rssi` (Number) Signal strength threshold in dBm, `-80` to `-60`. The controller supplies a value when unset.
 
 
 <a id="nestedblock--schedule"></a>
@@ -111,19 +194,61 @@ Optional:
 Required:
 
 - `day_of_week` (String) Day of week for the block.
-- `duration` (Number) Length of the block in minutes.
-- `start_hour` (Number) Start hour for the block (0-23).
+- `duration` (String) Length of the block, as a Go duration string. The controller stores this value with one-minute resolution, so the duration must be at least `1m` and a whole multiple of one minute (e.g. `30m`, `2h`).
+- `start` (Attributes) Start time of the block. (see [below for nested schema](#nestedatt--schedule--start))
 
 Optional:
 
 - `name` (String) Name of the block.
-- `start_minute` (Number) Start minute for the block (0-59).
+
+<a id="nestedatt--schedule--start"></a>
+### Nested Schema for `schedule.start`
+
+Required:
+
+- `hour` (Number) Start hour for the block (0-23).
+
+Optional:
+
+- `minute` (Number) Start minute for the block (0-59).
+
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+
+
+<a id="nestedatt--wpa"></a>
+### Nested Schema for `wpa`
+
+Optional:
+
+- `enc` (String) WPA encryption. Can be one of `auto`, `ccmp`, `gcmp`, `ccmp-256`, or `gcmp-256`. Computed from the controller when not set.
+- `mode` (String) WPA mode. Can be one of `auto`, `wpa1`, or `wpa2`. Defaults to `wpa2` for a newly created WLAN; an existing WLAN keeps the controller's value when unset.
+
+
+<a id="nestedatt--wpa3"></a>
+### Nested Schema for `wpa3`
+
+Optional:
+
+- `enhanced_192` (Boolean) Enable WPA3 Enterprise 192-bit mode.
+- `fast_roaming` (Boolean) Enable WPA3 fast roaming (802.11r).
+- `support` (Boolean) Enable WPA 3 support (security must be `wpapsk` and PMF must be turned on).
+- `transition` (Boolean) Enable WPA 3 and WPA 2 support (security must be `wpapsk` and `wpa3.support` must be true).
 
 ## Import
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # import from provider configured site

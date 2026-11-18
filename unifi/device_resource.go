@@ -2,38 +2,78 @@ package unifi
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-nettypes/hwtypes"
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework-timetypes/timetypes"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
+	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util/retry"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/validators"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                = &deviceResource{}
-	_ resource.ResourceWithImportState = &deviceResource{}
-	_ resource.ResourceWithModifyPlan  = &deviceResource{}
+	_ resource.Resource                    = &deviceResource{}
+	_ resource.ResourceWithImportState     = &deviceResource{}
+	_ resource.ResourceWithIdentity        = &deviceResource{}
+	_ resource.ResourceWithUpgradeState    = &deviceResource{}
+	_ resource.ResourceWithUpgradeIdentity = &deviceResource{}
+)
+
+// Ensure provider defined types fully satisfy list interfaces.
+var (
+	_ list.ListResource              = &deviceResource{}
+	_ list.ListResourceWithConfigure = &deviceResource{}
 )
 
 func NewDeviceFrameworkResource() resource.Resource {
 	return &deviceResource{}
+}
+
+func NewDeviceListResource() list.ListResource {
+	return &deviceResource{}
+}
+
+// deviceListConfigModel describes the list configuration model.
+type deviceListConfigModel struct {
+	Site   types.String `tfsdk:"site"`
+	Filter types.List   `tfsdk:"filter"`
+}
+
+// deviceListFilterModel represents a single name/value filter entry.
+type deviceListFilterModel struct {
+	Name  types.String `tfsdk:"name"`
+	Value types.String `tfsdk:"value"`
 }
 
 // deviceResource defines the resource implementation.
@@ -55,17 +95,14 @@ type deviceResourceModel struct {
 	// Network configuration
 	ConfigNetwork types.Object `tfsdk:"config_network"`
 
-	// LED settings
-	LedOverride                types.String `tfsdk:"led_override"`
-	LedOverrideColor           types.String `tfsdk:"led_override_color"`
-	LedOverrideColorBrightness types.Int64  `tfsdk:"led_override_color_brightness"`
+	// LED settings (led = { override, color, brightness })
+	Led types.Object `tfsdk:"led"`
 
 	// Device features
 	BandsteeringMode  types.String `tfsdk:"bandsteering_mode"`
 	FlowctrlEnabled   types.Bool   `tfsdk:"flowctrl_enabled"`
 	JumboframeEnabled types.Bool   `tfsdk:"jumboframe_enabled"`
-	StpVersion        types.String `tfsdk:"stp_version"`
-	StpPriority       types.Int64  `tfsdk:"stp_priority"`
+	Stp               types.Object `tfsdk:"stp"`
 	Locked            types.Bool   `tfsdk:"locked"`
 
 	// PoE settings
@@ -73,6 +110,9 @@ type deviceResourceModel struct {
 
 	// VLAN
 	SwitchVLANEnabled types.Bool `tfsdk:"switch_vlan_enabled"`
+
+	// Mesh
+	MeshStaVapEnabled types.Bool `tfsdk:"mesh_sta_vap_enabled"`
 
 	// Radio settings
 	RadioTable types.List `tfsdk:"radio_table"`
@@ -82,13 +122,8 @@ type deviceResourceModel struct {
 	Volume              types.Int64  `tfsdk:"volume"`
 	BaresipPassword     types.String `tfsdk:"x_baresip_password"`
 
-	// LCD/LCM settings
-	LcmBrightness          types.Int64  `tfsdk:"lcm_brightness"`
-	LcmBrightnessOverride  types.Bool   `tfsdk:"lcm_brightness_override"`
-	LcmIDleTimeout         types.Int64  `tfsdk:"lcm_idle_timeout"`
-	LcmIDleTimeoutOverride types.Bool   `tfsdk:"lcm_idle_timeout_override"`
-	LcmNightModeBegins     types.String `tfsdk:"lcm_night_mode_begins"`
-	LcmNightModeEnds       types.String `tfsdk:"lcm_night_mode_ends"`
+	// LCD/LCM settings (lcm = { brightness, …, night_mode = { begins, ends } })
+	Lcm types.Object `tfsdk:"lcm"`
 
 	// Outlet settings
 	OutletOverrides types.List `tfsdk:"outlet_overrides"`
@@ -97,60 +132,143 @@ type deviceResourceModel struct {
 	// Management
 	MgmtNetworkID types.String `tfsdk:"mgmt_network_id"`
 
+	// Etherlighting (etherlighting = { mode, brightness, behavior, led_mode })
+	Etherlighting types.Object `tfsdk:"etherlighting"`
+
 	// Computed attributes
 	Adopted types.Bool   `tfsdk:"adopted"`
 	Model   types.String `tfsdk:"model"`
 	Type    types.String `tfsdk:"type"`
 	State   types.Int64  `tfsdk:"state"`
+
+	Timeouts timeouts.Value `tfsdk:"timeouts"`
 }
 
 // portOverrideModel describes the port override data model.
 type portOverrideModel struct {
-	Index                      types.Int64  `tfsdk:"index"`
-	Name                       types.String `tfsdk:"name"`
-	PortProfileID              types.String `tfsdk:"port_profile_id"`
-	OpMode                     types.String `tfsdk:"op_mode"`
-	PoeMode                    types.String `tfsdk:"poe_mode"`
-	AggregateMembers           types.List   `tfsdk:"aggregate_members"`
-	Autoneg                    types.Bool   `tfsdk:"autoneg"`
-	Dot1XCtrl                  types.String `tfsdk:"dot1x_ctrl"`
-	Dot1XIDleTimeout           types.Int64  `tfsdk:"dot1x_idle_timeout"`
-	EgressRateLimitKbps        types.Int64  `tfsdk:"egress_rate_limit_kbps"`
-	EgressRateLimitKbpsEnabled types.Bool   `tfsdk:"egress_rate_limit_kbps_enabled"`
-	ExcludedNetworkIDs         types.List   `tfsdk:"excluded_networkconf_ids"`
-	FecMode                    types.String `tfsdk:"fec_mode"`
-	FlowControlEnabled         types.Bool   `tfsdk:"flow_control_enabled"`
-	Forward                    types.String `tfsdk:"forward"`
-	FullDuplex                 types.Bool   `tfsdk:"full_duplex"`
-	Isolation                  types.Bool   `tfsdk:"isolation"`
-	LagIdx                     types.Int64  `tfsdk:"lag_idx"`
-	LldpmedEnabled             types.Bool   `tfsdk:"lldpmed_enabled"`
-	LldpmedNotifyEnabled       types.Bool   `tfsdk:"lldpmed_notify_enabled"`
-	MirrorPortIDX              types.Int64  `tfsdk:"mirror_port_idx"`
-	MulticastRouterNetworkIDs  types.List   `tfsdk:"multicast_router_networkconf_ids"`
-	NativeNetworkID            types.String `tfsdk:"native_networkconf_id"`
-	PortKeepaliveEnabled       types.Bool   `tfsdk:"port_keepalive_enabled"`
-	PortSecurityEnabled        types.Bool   `tfsdk:"port_security_enabled"`
-	PortSecurityMACAddress     types.List   `tfsdk:"port_security_mac_address"`
-	PriorityQueue1Level        types.Int64  `tfsdk:"priority_queue1_level"`
-	PriorityQueue2Level        types.Int64  `tfsdk:"priority_queue2_level"`
-	PriorityQueue3Level        types.Int64  `tfsdk:"priority_queue3_level"`
-	PriorityQueue4Level        types.Int64  `tfsdk:"priority_queue4_level"`
-	SettingPreference          types.String `tfsdk:"setting_preference"`
-	Speed                      types.Int64  `tfsdk:"speed"`
-	StormctrlBroadcastEnabled  types.Bool   `tfsdk:"stormctrl_bcast_enabled"`
-	StormctrlBroadcastLevel    types.Int64  `tfsdk:"stormctrl_bcast_level"`
-	StormctrlBroadcastRate     types.Int64  `tfsdk:"stormctrl_bcast_rate"`
-	StormctrlMcastEnabled      types.Bool   `tfsdk:"stormctrl_mcast_enabled"`
-	StormctrlMcastLevel        types.Int64  `tfsdk:"stormctrl_mcast_level"`
-	StormctrlMcastRate         types.Int64  `tfsdk:"stormctrl_mcast_rate"`
-	StormctrlType              types.String `tfsdk:"stormctrl_type"`
-	StormctrlUcastEnabled      types.Bool   `tfsdk:"stormctrl_ucast_enabled"`
-	StormctrlUcastLevel        types.Int64  `tfsdk:"stormctrl_ucast_level"`
-	StormctrlUcastRate         types.Int64  `tfsdk:"stormctrl_ucast_rate"`
-	StpPortMode                types.Bool   `tfsdk:"stp_port_mode"`
-	TaggedVLANMgmt             types.String `tfsdk:"tagged_vlan_mgmt"`
-	VoiceNetworkID             types.String `tfsdk:"voice_networkconf_id"`
+	Index                     types.Int64  `tfsdk:"index"`
+	Name                      types.String `tfsdk:"name"`
+	PortProfileID             types.String `tfsdk:"port_profile_id"`
+	OpMode                    types.String `tfsdk:"op_mode"`
+	PoeMode                   types.String `tfsdk:"poe_mode"`
+	AggregateMembers          types.List   `tfsdk:"aggregate_members"`
+	Autoneg                   types.Bool   `tfsdk:"autoneg"`
+	Dot1X                     types.Object `tfsdk:"dot1x"`
+	EgressRateLimit           types.Object `tfsdk:"egress_rate_limit"`
+	ExcludedNetworkIDs        types.Set    `tfsdk:"excluded_networkconf_ids"`
+	FecMode                   types.String `tfsdk:"fec_mode"`
+	FlowControlEnabled        types.Bool   `tfsdk:"flow_control_enabled"`
+	Forward                   types.String `tfsdk:"forward"`
+	FullDuplex                types.Bool   `tfsdk:"full_duplex"`
+	Isolation                 types.Bool   `tfsdk:"isolation"`
+	Lldpmed                   types.Object `tfsdk:"lldpmed"`
+	MirrorPortIDX             types.Int64  `tfsdk:"mirror_port_idx"`
+	MulticastRouterNetworkIDs types.Set    `tfsdk:"multicast_router_networkconf_ids"`
+	NativeNetworkID           types.String `tfsdk:"native_networkconf_id"`
+	PortKeepaliveEnabled      types.Bool   `tfsdk:"port_keepalive_enabled"`
+	PortSecurity              types.Object `tfsdk:"port_security"`
+	PriorityQueue1Level       types.Int64  `tfsdk:"priority_queue1_level"`
+	PriorityQueue2Level       types.Int64  `tfsdk:"priority_queue2_level"`
+	PriorityQueue3Level       types.Int64  `tfsdk:"priority_queue3_level"`
+	PriorityQueue4Level       types.Int64  `tfsdk:"priority_queue4_level"`
+	SettingPreference         types.String `tfsdk:"setting_preference"`
+	Speed                     types.Int64  `tfsdk:"speed"`
+	Stormctrl                 types.Object `tfsdk:"stormctrl"`
+	StpEdgeState              types.String `tfsdk:"stp_edge_state"`
+	StpPortMode               types.Bool   `tfsdk:"stp_port_mode"`
+	TaggedNetworkIDs          types.Set    `tfsdk:"tagged_networkconf_ids"`
+	TaggedVLANMgmt            types.String `tfsdk:"tagged_vlan_mgmt"`
+	VoiceNetworkID            types.String `tfsdk:"voice_networkconf_id"`
+}
+
+// devicePortSecurityModel is the port_override `port_security` nested object.
+// Unlike unifi_port_profile, mac_address is a List here (historical shape).
+type devicePortSecurityModel struct {
+	Enabled    types.Bool `tfsdk:"enabled"`
+	MACAddress types.List `tfsdk:"mac_address"`
+}
+
+func devicePortSecurityAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"enabled":     types.BoolType,
+		"mac_address": types.ListType{ElemType: types.StringType},
+	}
+}
+
+// deviceLedModel is the `led` nested object.
+type deviceLedModel struct {
+	Override   types.String `tfsdk:"override"`
+	Color      types.String `tfsdk:"color"`
+	Brightness types.Int64  `tfsdk:"brightness"`
+}
+
+func deviceLedAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"override":   types.StringType,
+		"color":      types.StringType,
+		"brightness": types.Int64Type,
+	}
+}
+
+// deviceStpModel is the `stp` nested object.
+type deviceStpModel struct {
+	Version  types.String `tfsdk:"version"`
+	Priority types.Int64  `tfsdk:"priority"`
+}
+
+func deviceStpAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"version":  types.StringType,
+		"priority": types.Int64Type,
+	}
+}
+
+// deviceLcmModel is the `lcm` nested object.
+type deviceLcmModel struct {
+	Brightness          types.Int64          `tfsdk:"brightness"`
+	BrightnessOverride  types.Bool           `tfsdk:"brightness_override"`
+	IdleTimeout         timetypes.GoDuration `tfsdk:"idle_timeout"`
+	IdleTimeoutOverride types.Bool           `tfsdk:"idle_timeout_override"`
+	NightMode           types.Object         `tfsdk:"night_mode"`
+}
+
+func deviceLcmAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"brightness":            types.Int64Type,
+		"brightness_override":   types.BoolType,
+		"idle_timeout":          timetypes.GoDurationType{},
+		"idle_timeout_override": types.BoolType,
+		"night_mode":            types.ObjectType{AttrTypes: deviceLcmNightModeAttrTypes()},
+	}
+}
+
+// deviceLcmNightModeModel is the `lcm.night_mode` nested object.
+type deviceLcmNightModeModel struct {
+	Begins types.String `tfsdk:"begins"`
+	Ends   types.String `tfsdk:"ends"`
+}
+
+func deviceLcmNightModeAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"begins": types.StringType,
+		"ends":   types.StringType,
+	}
+}
+
+type deviceEtherlightingModel struct {
+	Mode       types.String `tfsdk:"mode"`
+	Brightness types.Int64  `tfsdk:"brightness"`
+	Behavior   types.String `tfsdk:"behavior"`
+	LedMode    types.String `tfsdk:"led_mode"`
+}
+
+func deviceEtherlightingAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"mode":       types.StringType,
+		"brightness": types.Int64Type,
+		"behavior":   types.StringType,
+		"led_mode":   types.StringType,
+	}
 }
 
 func (m portOverrideModel) AttributeTypes() map[string]attr.Type {
@@ -208,12 +326,92 @@ func (r *deviceResource) Metadata(
 	resp.TypeName = req.ProviderTypeName + "_device"
 }
 
+// IdentitySchema implements [resource.ResourceWithIdentity].
+//
+// The natural import key of a device is its MAC address (users import devices
+// by MAC); it uses the same custom hwtypes.MACAddressType as the resource
+// schema's mac attribute so values compare with semantic equality.
+//
+// Version 1: v0.56.0 switched the key from id to mac but kept version 0, so
+// version 0 identities come in both shapes and are sorted out by
+// UpgradeIdentity.
+func (r *deviceResource) IdentitySchema(
+	_ context.Context,
+	_ resource.IdentitySchemaRequest,
+	resp *resource.IdentitySchemaResponse,
+) {
+	resp.IdentitySchema = identityschema.Schema{
+		Version: 1,
+		Attributes: map[string]identityschema.Attribute{
+			"mac": identityschema.StringAttribute{
+				CustomType:        hwtypes.MACAddressType{},
+				RequiredForImport: true,
+			},
+		},
+	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity].
+//
+// Version 0 identities are either {"id": ...} (v0.55.0 and earlier) or
+// {"mac": ...} (v0.56.0). A MAC is carried over; an id-only identity is
+// upgraded to a null MAC, which the framework accepts as "no identity yet" so
+// the next Read derives it from the state's mac attribute.
+func (r *deviceResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return map[int64]resource.IdentityUpgrader{
+		0: {
+			IdentityUpgrader: upgradeDeviceIdentityV0,
+		},
+	}
+}
+
+func upgradeDeviceIdentityV0(
+	ctx context.Context,
+	req resource.UpgradeIdentityRequest,
+	resp *resource.UpgradeIdentityResponse,
+) {
+	var prior struct {
+		MAC *string `json:"mac"`
+	}
+	if req.RawIdentity != nil && len(req.RawIdentity.JSON) > 0 {
+		if err := json.Unmarshal(req.RawIdentity.JSON, &prior); err != nil {
+			resp.Diagnostics.AddError(
+				"Unable to Upgrade Device Identity",
+				fmt.Sprintf("Could not parse the stored version 0 identity: %s", err),
+			)
+			return
+		}
+	}
+
+	identity := deviceIdentityModel{MAC: hwtypes.NewMACAddressNull()}
+	if prior.MAC != nil && *prior.MAC != "" {
+		identity.MAC = hwtypes.NewMACAddressValue(*prior.MAC)
+	}
+	// The response identity has no value yet, so SetAttribute cannot be used.
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
+}
+
+// deviceIdentityModel describes the resource identity data model.
+type deviceIdentityModel struct {
+	MAC hwtypes.MACAddress `tfsdk:"mac"`
+}
+
 func (r *deviceResource) Schema(
 	ctx context.Context,
 	req resource.SchemaRequest,
 	resp *resource.SchemaResponse,
 ) {
 	resp.Schema = schema.Schema{
+		// v1: lcm_idle_timeout and port_override.dot1x_idle_timeout changed from
+		//     Int64 (seconds) to GoDuration strings.
+		// v2: port_override.{excluded,multicast_router,tagged}_networkconf_ids changed
+		//     from List to Set (#384).
+		// v3: prefixed attributes bundled into nested objects: led_*, stp_*, lcm_*
+		//     and port_override.{dot1x,egress_rate_limit,lldpmed,port_security,
+		//     stormctrl}_*. See UpgradeState.
+		Version: 3,
 		Description: "`unifi_device` manages a device of the network.\n\n" +
 			"Devices are adopted by the controller, so it is not possible for this resource to be created through " +
 			"Terraform, the create operation instead will simply start managing the device specified by MAC address. " +
@@ -250,23 +448,35 @@ func (r *deviceResource) Schema(
 				Description: "The name of the device.",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"disabled": schema.BoolAttribute{
 				Description: "Specifies whether this device should be disabled.",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"allow_adoption": schema.BoolAttribute{
 				Description: "Specifies whether this resource should tell the controller to adopt the device on create.",
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(true),
+				// A provider-side behaviour flag, not a controller field, so the
+				// Default cannot overwrite anything the controller holds; Read
+				// fills the same value in on import. The UseStateForUnknown it
+				// used to carry was dead code: the framework applies a Default
+				// before plan modifiers, so the plan is never unknown (#544).
+				Default: booldefault.StaticBool(true),
 			},
 			"forget_on_destroy": schema.BoolAttribute{
 				Description: "Specifies whether this resource should tell the controller to forget the device on destroy.",
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(true),
+				// Provider-side behaviour flag; see allow_adoption.
+				Default: booldefault.StaticBool(true),
 			},
 
 			// Network configuration
@@ -319,26 +529,48 @@ func (r *deviceResource) Schema(
 						Computed:    true,
 					},
 				},
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// LED settings
-			"led_override": schema.StringAttribute{
-				Description: "LED override setting; valid values are `default`, `on`, and `off`.",
+			"led": schema.SingleNestedAttribute{
+				Description: "LED settings.",
 				Optional:    true,
 				Computed:    true,
-				Validators: []validator.String{
-					stringvalidator.OneOf("default", "on", "off"),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
 				},
-			},
-			"led_override_color": schema.StringAttribute{
-				Description: "LED color override (hex color code).",
-				Optional:    true,
-				Computed:    true,
-			},
-			"led_override_color_brightness": schema.Int64Attribute{
-				Description: "LED brightness (0-100).",
-				Optional:    true,
-				Computed:    true,
+				Attributes: map[string]schema.Attribute{
+					"override": schema.StringAttribute{
+						Description: "LED override setting; valid values are `default`, `on`, and `off`.",
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("default", "on", "off"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"color": schema.StringAttribute{
+						Description: "LED color override (hex color code).",
+						Optional:    true,
+						Computed:    true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"brightness": schema.Int64Attribute{
+						Description: "LED brightness (0-100).",
+						Optional:    true,
+						Computed:    true,
+						PlanModifiers: []planmodifier.Int64{
+							int64planmodifier.UseStateForUnknown(),
+						},
+					},
+				},
 			},
 
 			// Device features
@@ -349,41 +581,63 @@ func (r *deviceResource) Schema(
 				Validators: []validator.String{
 					stringvalidator.OneOf("off", "equal", "prefer_5g"),
 				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"flowctrl_enabled": schema.BoolAttribute{
 				Description: "Enable flow control.",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"jumboframe_enabled": schema.BoolAttribute{
 				Description: "Enable jumbo frames.",
 				Optional:    true,
 				Computed:    true,
-			},
-			"stp_version": schema.StringAttribute{
-				Description: "STP version; valid values are `stp`, `rstp`, and `disabled`.",
-				Optional:    true,
-				Computed:    true,
-				Validators: []validator.String{
-					stringvalidator.OneOf("stp", "rstp", "disabled"),
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"stp_priority": schema.Int64Attribute{
-				Description: "STP priority.",
+			"stp": schema.SingleNestedAttribute{
+				Description: "Spanning Tree Protocol (STP) settings.",
 				Optional:    true,
 				Computed:    true,
-				Validators: []validator.Int64{
-					int64validator.OneOf(
-						0, 4096, 8192, 12288, 16384, 20480,
-						24576, 28672, 32768, 36864, 40960,
-						45056, 49152, 53248, 57344, 61440,
-					),
+				Attributes: map[string]schema.Attribute{
+					"version": schema.StringAttribute{
+						Description: "STP version; valid values are `stp`, `rstp`, and `disabled`.",
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("stp", "rstp", "disabled"),
+						},
+					},
+					"priority": schema.Int64Attribute{
+						Description: "STP bridge priority.",
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.Int64{
+							int64validator.OneOf(
+								0, 4096, 8192, 12288, 16384, 20480,
+								24576, 28672, 32768, 36864, 40960,
+								45056, 49152, 53248, 57344, 61440,
+							),
+						},
+					},
+				},
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
 				},
 			},
 			"locked": schema.BoolAttribute{
 				Description: "Specifies whether the device is locked.",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// PoE settings
@@ -394,6 +648,9 @@ func (r *deviceResource) Schema(
 				Validators: []validator.String{
 					stringvalidator.OneOf("auto", "pasv24", "passthrough", "off"),
 				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// VLAN
@@ -401,6 +658,19 @@ func (r *deviceResource) Schema(
 				Description: "Enable VLAN support on the switch.",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
+
+			// Mesh
+			"mesh_sta_vap_enabled": schema.BoolAttribute{
+				Description: "Enable the mesh station VAP (the UI \"Mesh Connect\" toggle), letting this AP uplink wirelessly to a mesh parent.",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// Advanced features
@@ -411,49 +681,82 @@ func (r *deviceResource) Schema(
 				Validators: []validator.String{
 					stringvalidator.OneOf("default", "on", "off"),
 				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"volume": schema.Int64Attribute{
 				Description: "Volume level (0-100).",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.UseStateForUnknown(),
+				},
 			},
 			"x_baresip_password": schema.StringAttribute{
 				Description: "Baresip password.",
 				Optional:    true,
 				Sensitive:   true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// LCD/LCM settings
-			"lcm_brightness": schema.Int64Attribute{
-				Description: "LCM brightness (1-100).",
+			"lcm": schema.SingleNestedAttribute{
+				Description: "LCD/display (LCM) settings for devices with a screen.",
 				Optional:    true,
 				Computed:    true,
-			},
-			"lcm_brightness_override": schema.BoolAttribute{
-				Description: "Override LCM brightness.",
-				Optional:    true,
-				Computed:    true,
-			},
-			"lcm_idle_timeout": schema.Int64Attribute{
-				Description: "LCM idle timeout in seconds (10-3600).",
-				Optional:    true,
-				Computed:    true,
-			},
-			"lcm_idle_timeout_override": schema.BoolAttribute{
-				Description: "Override LCM idle timeout.",
-				Optional:    true,
-				Computed:    true,
-			},
-			"lcm_night_mode_begins": schema.StringAttribute{
-				Description: "LCM night mode begin time (HH:MM format).",
-				Optional:    true,
-				Computed:    true,
-			},
-			"lcm_night_mode_ends": schema.StringAttribute{
-				Description: "LCM night mode end time (HH:MM format).",
-				Optional:    true,
-				Computed:    true,
+				Attributes: map[string]schema.Attribute{
+					"brightness": schema.Int64Attribute{
+						Description: "LCM brightness (1-100).",
+						Optional:    true,
+						Computed:    true,
+					},
+					"brightness_override": schema.BoolAttribute{
+						Description: "Override the site-wide LCM brightness with `brightness`.",
+						Optional:    true,
+						Computed:    true,
+					},
+					"idle_timeout": schema.StringAttribute{
+						Description: "LCM idle timeout, as a Go duration string (e.g. `10m`, `600s`).",
+						CustomType:  timetypes.GoDurationType{},
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.String{
+							validators.GoDurationBetween(10*time.Second, 3600*time.Second),
+							validators.GoDurationMultipleOf(time.Second),
+						},
+					},
+					"idle_timeout_override": schema.BoolAttribute{
+						Description: "Override the site-wide LCM idle timeout with `idle_timeout`.",
+						Optional:    true,
+						Computed:    true,
+					},
+					"night_mode": schema.SingleNestedAttribute{
+						Description: "Window during which the display is dimmed.",
+						Optional:    true,
+						Computed:    true,
+						Attributes: map[string]schema.Attribute{
+							"begins": schema.StringAttribute{
+								Description: "Night mode start time, 24-hour `HH:MM`.",
+								Optional:    true,
+								Computed:    true,
+								Validators:  []validator.String{validators.TimeOfDay()},
+							},
+							"ends": schema.StringAttribute{
+								Description: "Night mode end time, 24-hour `HH:MM`.",
+								Optional:    true,
+								Computed:    true,
+								Validators:  []validator.String{validators.TimeOfDay()},
+							},
+						},
+					},
+				},
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// Outlet settings
@@ -461,27 +764,98 @@ func (r *deviceResource) Schema(
 				Description: "Enable outlet control.",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 
 			// Management
 			"mgmt_network_id": schema.StringAttribute{
-				Description: "Management network ID.",
+				Description: "Management network ID. The network this device uses for its own management traffic (the UI's Network Override). When set, the device tags its management onto this network's VLAN, so that VLAN must already be tagged on the device's upstream switch port(s) before this attribute is applied. Otherwise the device loses its management path, drops off, and the apply fails with an inconsistent-result error. Apply in two steps: tag the VLAN on the uplink (a port_override tagged_networkconf_ids entry) first, then set mgmt_network_id. Leave unset to manage on the uplink's native (untagged) network.",
 				Optional:    true,
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+
+			// Etherlighting
+			"etherlighting": schema.SingleNestedAttribute{
+				Description: "Etherlighting settings for switches with per-port LED lighting " +
+					"(e.g. USW Pro Max). The per-speed and per-network colors are site-wide " +
+					"and are configured with `unifi_setting`'s `etherlighting` block.",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"mode": schema.StringAttribute{
+						Description: "What the port LEDs show; valid values are `speed` (color by link speed) and `network` (color by network).",
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("speed", "network"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"brightness": schema.Int64Attribute{
+						Description: "Etherlighting brightness (1-100).",
+						Optional:    true,
+						Computed:    true,
+						Validators:  []validator.Int64{int64validator.Between(1, 100)},
+						PlanModifiers: []planmodifier.Int64{
+							int64planmodifier.UseStateForUnknown(),
+						},
+					},
+					"behavior": schema.StringAttribute{
+						Description: "LED behavior; valid values are `steady` and `breath`.",
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("steady", "breath"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"led_mode": schema.StringAttribute{
+						Description: "LED mode; valid values are `etherlighting` and `standard`.",
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("etherlighting", "standard"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+				},
 			},
 
 			// Computed attributes
 			"adopted": schema.BoolAttribute{
 				Description: "Whether the device is adopted.",
 				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"model": schema.StringAttribute{
 				Description: "Device model.",
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"type": schema.StringAttribute{
 				Description: "Device type.",
 				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"state": schema.Int64Attribute{
 				Description: "Device state.",
@@ -493,6 +867,12 @@ func (r *deviceResource) Schema(
 				Description: "Radio configuration table.",
 				Optional:    true,
 				Computed:    true,
+				// Controller-managed radio config: keep the prior value when the plan
+				// leaves it unknown, so editing an unrelated device field doesn't replan
+				// the whole table to "(known after apply)".
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.UseStateForUnknown(),
+				},
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"radio": schema.StringAttribute{
@@ -541,14 +921,32 @@ func (r *deviceResource) Schema(
 							Computed:    true,
 						},
 						"assisted_roaming_enabled": schema.BoolAttribute{
-							Description: "Enable assisted roaming.",
-							Optional:    true,
-							Computed:    true,
+							Description: "**Moved to `unifi_wlan.roaming_assistant_na.enabled`** " +
+								"(and `roaming_assistant_6e.enabled` for 6 GHz). UniFi Network 10.x " +
+								"moved assisted roaming from the device's radio table onto the WLAN, " +
+								"so this attribute no longer reaches the controller. Still accepted " +
+								"and preserved in state for one release.",
+							DeprecationMessage: "Deprecated: moved to `unifi_wlan.roaming_assistant_na` (5 GHz) and `unifi_wlan.roaming_assistant_6e` (6 GHz). UniFi Network 10.x moved assisted roaming from the device's radio table onto the WLAN, so this attribute no longer reaches the controller and will be removed in a future release.",
+							Optional:           true,
+							// Computed so an omitted leaf follows prior state: a value an
+							// earlier release read from the controller is carried forward
+							// on every read, and as a plain Optional it planned as a change
+							// that left the device's computed attributes unknown (#615).
+							Computed: true,
 						},
 						"assisted_roaming_rssi": schema.Int64Attribute{
-							Description: "Assisted roaming RSSI threshold.",
-							Optional:    true,
-							Computed:    true,
+							Description: "**Moved to `unifi_wlan.roaming_assistant_na.rssi`** " +
+								"(and `roaming_assistant_6e.rssi` for 6 GHz). UniFi Network 10.x " +
+								"moved assisted roaming from the device's radio table onto the WLAN, " +
+								"so this attribute no longer reaches the controller. Still accepted " +
+								"and preserved in state for one release.",
+							DeprecationMessage: "Deprecated: moved to `unifi_wlan.roaming_assistant_na` (5 GHz) and `unifi_wlan.roaming_assistant_6e` (6 GHz). UniFi Network 10.x moved assisted roaming from the device's radio table onto the WLAN, so this attribute no longer reaches the controller and will be removed in a future release.",
+							Optional:           true,
+							// Computed so an omitted leaf follows prior state: a value an
+							// earlier release read from the controller is carried forward
+							// on every read, and as a plain Optional it planned as a change
+							// that left the device's computed attributes unknown (#615).
+							Computed: true,
 						},
 						"dfs": schema.BoolAttribute{
 							Description: "Enable DFS (Dynamic Frequency Selection).",
@@ -599,6 +997,12 @@ func (r *deviceResource) Schema(
 				Description: "Outlet configuration overrides.",
 				Optional:    true,
 				Computed:    true,
+				// Keep the prior value when the plan leaves it unknown, so editing an
+				// unrelated device field doesn't replan every outlet to
+				// "(known after apply)".
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.UseStateForUnknown(),
+				},
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"index": schema.Int64Attribute{
@@ -623,222 +1027,385 @@ func (r *deviceResource) Schema(
 					},
 				},
 			},
+
+			"timeouts": timeouts.Attributes(
+				ctx,
+				timeouts.Opts{Create: true, Read: true, Update: true, Delete: true},
+			),
 		},
 
 		Blocks: map[string]schema.Block{
 			"port_override": schema.SetNestedBlock{
-				Description: "Settings overrides for specific switch ports.",
+				Description: "Per-port settings overrides, applied only to the ports you " +
+					"declare. Ports without a `port_override` block keep their existing " +
+					"controller-side configuration — the provider merges your declared " +
+					"ports (by `index`) into the device's current overrides rather than " +
+					"replacing the whole set. Removing a block stops managing that port " +
+					"but does not reset it; clear a port by overriding it back to the " +
+					"defaults instead. A port can instead be managed on its own, and " +
+					"imported directly, with `unifi_device_port`; do not declare the same " +
+					"port in both places, the last write wins and the other one drifts.",
 				NestedObject: schema.NestedBlockObject{
-					Attributes: map[string]schema.Attribute{
-						"index": schema.Int64Attribute{
-							Description: "Switch port index.",
-							Required:    true,
-						},
-						"name": schema.StringAttribute{
-							Description: "Human-readable name of the port.",
-							Optional:    true,
-						},
-						"port_profile_id": schema.StringAttribute{
-							Description: "ID of the Port Profile used on this port.",
-							Optional:    true,
-						},
-						"op_mode": schema.StringAttribute{
-							Description: "Operating mode of the port, valid values are `switch`, `mirror`, and `aggregate`.",
-							Optional:    true,
-							Computed:    true,
-							Default:     stringdefault.StaticString("switch"),
-							Validators: []validator.String{
-								stringvalidator.OneOf("switch", "mirror", "aggregate"),
-							},
-						},
-						"poe_mode": schema.StringAttribute{
-							Description: "PoE mode of the port; valid values are `auto`, `pasv24`, `passthrough`, and `off`.",
-							Optional:    true,
-							Validators: []validator.String{
-								stringvalidator.OneOf("auto", "pasv24", "passthrough", "off"),
-							},
-						},
-						"aggregate_members": schema.ListAttribute{
-							Description: "Number of ports in the aggregate.",
-							Optional:    true,
-							ElementType: types.Int64Type,
-						},
-						"autoneg": schema.BoolAttribute{
-							Description: "Enable auto-negotiation for port speed.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"dot1x_ctrl": schema.StringAttribute{
-							Description: "802.1X control mode.",
-							Optional:    true,
-						},
-						"dot1x_idle_timeout": schema.Int64Attribute{
-							Description: "802.1X idle timeout in seconds.",
-							Optional:    true,
-						},
-						"egress_rate_limit_kbps": schema.Int64Attribute{
-							Description: "Egress rate limit in kbps.",
-							Optional:    true,
-						},
-						"egress_rate_limit_kbps_enabled": schema.BoolAttribute{
-							Description: "Enable egress rate limiting.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"excluded_networkconf_ids": schema.ListAttribute{
-							Description: "List of network IDs to exclude from this port.",
-							Optional:    true,
-							ElementType: types.StringType,
-						},
-						"fec_mode": schema.StringAttribute{
-							Description: "Forward Error Correction mode.",
-							Optional:    true,
-						},
-						"flow_control_enabled": schema.BoolAttribute{
-							Description: "Enable flow control.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"forward": schema.StringAttribute{
-							Description: "Forwarding mode.",
-							Optional:    true,
-						},
-						"full_duplex": schema.BoolAttribute{
-							Description: "Enable full duplex mode.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"isolation": schema.BoolAttribute{
-							Description: "Enable port isolation.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"lag_idx": schema.Int64Attribute{
-							Description: "LAG group number (starting at 1). Required when op_mode is `aggregate` to identify the LAG group on the switch.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"lldpmed_enabled": schema.BoolAttribute{
-							Description: "Enable LLDP-MED.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"lldpmed_notify_enabled": schema.BoolAttribute{
-							Description: "Enable LLDP-MED notifications.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"mirror_port_idx": schema.Int64Attribute{
-							Description: "Mirror port index.",
-							Optional:    true,
-						},
-						"multicast_router_networkconf_ids": schema.ListAttribute{
-							Description: "List of network IDs for multicast router.",
-							Optional:    true,
-							ElementType: types.StringType,
-						},
-						"native_networkconf_id": schema.StringAttribute{
-							Description: "Native network ID (VLAN).",
-							Optional:    true,
-						},
-						"port_keepalive_enabled": schema.BoolAttribute{
-							Description: "Enable port keepalive.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"port_security_enabled": schema.BoolAttribute{
-							Description: "Enable port security.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"port_security_mac_address": schema.ListAttribute{
-							Description: "List of MAC addresses allowed when port security is enabled.",
-							Optional:    true,
-							ElementType: types.StringType,
-						},
-						"priority_queue1_level": schema.Int64Attribute{
-							Description: "Priority queue 1 level.",
-							Optional:    true,
-						},
-						"priority_queue2_level": schema.Int64Attribute{
-							Description: "Priority queue 2 level.",
-							Optional:    true,
-						},
-						"priority_queue3_level": schema.Int64Attribute{
-							Description: "Priority queue 3 level.",
-							Optional:    true,
-						},
-						"priority_queue4_level": schema.Int64Attribute{
-							Description: "Priority queue 4 level.",
-							Optional:    true,
-						},
-						"setting_preference": schema.StringAttribute{
-							Description: "Setting preference.",
-							Optional:    true,
-						},
-						"speed": schema.Int64Attribute{
-							Description: "Port speed in Mbps.",
-							Optional:    true,
-						},
-						"stormctrl_bcast_enabled": schema.BoolAttribute{
-							Description: "Enable broadcast storm control.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"stormctrl_bcast_level": schema.Int64Attribute{
-							Description: "Broadcast storm control level.",
-							Optional:    true,
-						},
-						"stormctrl_bcast_rate": schema.Int64Attribute{
-							Description: "Broadcast storm control rate.",
-							Optional:    true,
-						},
-						"stormctrl_mcast_enabled": schema.BoolAttribute{
-							Description: "Enable multicast storm control.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"stormctrl_mcast_level": schema.Int64Attribute{
-							Description: "Multicast storm control level.",
-							Optional:    true,
-						},
-						"stormctrl_mcast_rate": schema.Int64Attribute{
-							Description: "Multicast storm control rate.",
-							Optional:    true,
-						},
-						"stormctrl_type": schema.StringAttribute{
-							Description: "Storm control type.",
-							Optional:    true,
-						},
-						"stormctrl_ucast_enabled": schema.BoolAttribute{
-							Description: "Enable unicast storm control.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"stormctrl_ucast_level": schema.Int64Attribute{
-							Description: "Unicast storm control level.",
-							Optional:    true,
-						},
-						"stormctrl_ucast_rate": schema.Int64Attribute{
-							Description: "Unicast storm control rate.",
-							Optional:    true,
-						},
-						"stp_port_mode": schema.BoolAttribute{
-							Description: "STP port mode.",
-							Optional:    true,
-							Computed:    true,
-						},
-						"tagged_vlan_mgmt": schema.StringAttribute{
-							Description: "Tagged VLAN management.",
-							Optional:    true,
-						},
-						"voice_networkconf_id": schema.StringAttribute{
-							Description: "Voice network ID.",
-							Optional:    true,
-						},
+					Attributes: devicePortOverrideAttributes(),
+				},
+			},
+		},
+	}
+}
+
+// UpgradeState migrates prior device state to the current schema version.
+//
+//	v0 -> current: lcm_idle_timeout and each port_override.dot1x_idle_timeout
+//	    changed from integer seconds to GoDuration strings.
+//	v1 -> current: port_override.{excluded,multicast_router,tagged}_networkconf_ids
+//	    changed from List to Set (#384). No JSON rewrite is needed - a JSON array
+//	    decodes into either collection - so the raw state is simply reconciled
+//	    against the current (Set) schema type.
+//	v2 -> current: flat prefixed attributes moved into nested objects (led, stp,
+//	    lcm and the port_override feature groups). See nestDeviceState.
+//
+// Each upgrader targets the CURRENT schema type, so older state picks up every
+// later change via the shared rewrite and reconciliation.
+func (r *deviceResource) UpgradeState(
+	ctx context.Context,
+) map[int64]resource.StateUpgrader {
+	var schemaResp resource.SchemaResponse
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	upgrader := func(rewrite func(state map[string]any)) resource.StateUpgrader {
+		return resource.StateUpgrader{
+			StateUpgrader: func(
+				ctx context.Context,
+				req resource.UpgradeStateRequest,
+				resp *resource.UpgradeStateResponse,
+			) {
+				if req.RawState == nil {
+					return
+				}
+				dv, err := util.UpgradeRawState(
+					schemaType,
+					req.RawState.JSON,
+					func(state map[string]any) {
+						rewrite(state)
+						nestDeviceState(state)
+					},
+				)
+				if err != nil {
+					resp.Diagnostics.AddError("Failed to upgrade device state", err.Error())
+					return
+				}
+				resp.DynamicValue = dv
+			},
+		}
+	}
+
+	return map[int64]resource.StateUpgrader{
+		0: upgrader(func(state map[string]any) {
+			util.SetDurationField(state, "lcm_idle_timeout", time.Second)
+			util.EachObject(state, "port_override", func(pm map[string]any) {
+				util.SetDurationField(pm, "dot1x_idle_timeout", time.Second)
+			})
+		}),
+		// v1 already stores durations as strings; only the List->Set change
+		// applies, which reconcileType handles against the current schema type.
+		1: upgrader(func(map[string]any) {}),
+		2: upgrader(func(map[string]any) {}),
+	}
+}
+
+// nestDeviceState rewrites flat v0-v2 device state into the nested-object
+// layout introduced in schema v3. Keys that are absent are skipped, so it is
+// safe to run on state from any earlier version.
+func nestDeviceState(state map[string]any) {
+	util.NestFields(state, "led", map[string]string{
+		"led_override":                  "override",
+		"led_override_color":            "color",
+		"led_override_color_brightness": "brightness",
+	})
+	util.NestFields(state, "stp", map[string]string{
+		"stp_version":  "version",
+		"stp_priority": "priority",
+	})
+	util.NestFields(state, "lcm", map[string]string{
+		"lcm_brightness":            "brightness",
+		"lcm_brightness_override":   "brightness_override",
+		"lcm_idle_timeout":          "idle_timeout",
+		"lcm_idle_timeout_override": "idle_timeout_override",
+		"lcm_night_mode_begins":     "night_mode_begins",
+		"lcm_night_mode_ends":       "night_mode_ends",
+	})
+	util.WithObject(state, "lcm", func(lcm map[string]any) {
+		util.NestFields(lcm, "night_mode", map[string]string{
+			"night_mode_begins": "begins",
+			"night_mode_ends":   "ends",
+		})
+	})
+	util.EachObject(state, "port_override", nestPortGroupState)
+}
+
+// devicePortOverrideAttributes is the attribute set of one port override. It
+// is shared by the port_override block of unifi_device and by the top level of
+// unifi_device_port, so the two resources accept and store the same settings.
+func devicePortOverrideAttributes() map[string]schema.Attribute {
+	return map[string]schema.Attribute{
+		"index": schema.Int64Attribute{
+			Description: "Switch port index.",
+			Required:    true,
+		},
+		"name": schema.StringAttribute{
+			Description: "Human-readable name of the port.",
+			Optional:    true,
+		},
+		"port_profile_id": schema.StringAttribute{
+			Description: "ID of the Port Profile used on this port.",
+			Optional:    true,
+		},
+		"op_mode": schema.StringAttribute{
+			Description: "Operating mode of the port: `switch` (default), `mirror`, or `aggregate`. " +
+				"Set `aggregate` on the lead port of an SFP+/link-aggregation (LAG) group and list the member ports in `aggregate_members`. " +
+				"Only written when not `switch`, as gateway devices (UDM) reject op_mode on update.",
+			Optional: true,
+			Computed: true,
+			// Kept despite #544: "switch" is never written (see
+			// modelToAPIPortOverride) and carryUnwritableFields
+			// keeps the controller's op_mode, so this Default
+			// cannot change a port's mode on the controller.
+			Default: stringdefault.StaticString("switch"),
+			Validators: []validator.String{
+				stringvalidator.OneOf("switch", "mirror", "aggregate"),
+			},
+		},
+		"poe_mode": schema.StringAttribute{
+			Description: "PoE mode of the port; valid values are `auto`, `pasv24`, `passthrough`, and `off`.",
+			Optional:    true,
+			Validators: []validator.String{
+				stringvalidator.OneOf("auto", "pasv24", "passthrough", "off"),
+			},
+		},
+		"aggregate_members": schema.ListAttribute{
+			Description: "Port indices that make up this link-aggregation (LAG) group. " +
+				"Only takes effect when `op_mode` is `aggregate` on this port.",
+			Optional:    true,
+			ElementType: types.Int64Type,
+		},
+		"autoneg": schema.BoolAttribute{
+			Description: "Enable auto-negotiation for port speed.",
+			Optional:    true,
+			Computed:    true,
+		},
+		"dot1x": schema.SingleNestedAttribute{
+			Description: "802.1X port authentication settings.",
+			Optional:    true,
+			Computed:    true,
+			Attributes: map[string]schema.Attribute{
+				"ctrl": schema.StringAttribute{
+					Description: "802.1X control mode.",
+					Optional:    true,
+					Computed:    true,
+				},
+				"idle_timeout": schema.StringAttribute{
+					Description: "802.1X idle timeout, as a Go duration string (e.g. `5m`, `300s`).",
+					CustomType:  timetypes.GoDurationType{},
+					Optional:    true,
+					Computed:    true,
+					Validators: []validator.String{
+						validators.GoDurationBetween(0, 65535*time.Second),
+						validators.GoDurationMultipleOf(time.Second),
 					},
 				},
 			},
+		},
+		"egress_rate_limit": schema.SingleNestedAttribute{
+			Description: "Egress rate limiting.",
+			Optional:    true,
+			Computed:    true,
+			Attributes: map[string]schema.Attribute{
+				"enabled": schema.BoolAttribute{
+					Description: "Enable egress rate limiting.",
+					Optional:    true,
+					Computed:    true,
+				},
+				"kbps": schema.Int64Attribute{
+					Description: "Egress rate limit in kbps.",
+					Optional:    true,
+					Computed:    true,
+				},
+			},
+		},
+		"excluded_networkconf_ids": schema.SetAttribute{
+			Description: "List of network IDs to exclude from this port.",
+			Optional:    true,
+			ElementType: types.StringType,
+		},
+		"fec_mode": schema.StringAttribute{
+			Description: "Forward Error Correction mode.",
+			Optional:    true,
+		},
+		"flow_control_enabled": schema.BoolAttribute{
+			Description: "Enable flow control.",
+			Optional:    true,
+			Computed:    true,
+		},
+		"forward": schema.StringAttribute{
+			Description: "Forwarding mode.",
+			Optional:    true,
+		},
+		"full_duplex": schema.BoolAttribute{
+			Description: "Enable full duplex mode.",
+			Optional:    true,
+			Computed:    true,
+		},
+		"isolation": schema.BoolAttribute{
+			Description: "Enable port isolation.",
+			Optional:    true,
+			Computed:    true,
+		},
+		"lldpmed": schema.SingleNestedAttribute{
+			Description: "LLDP-MED settings.",
+			Optional:    true,
+			Computed:    true,
+			Attributes: map[string]schema.Attribute{
+				"enabled": schema.BoolAttribute{
+					Description: "Enable LLDP-MED.",
+					Optional:    true,
+					Computed:    true,
+				},
+				"notify_enabled": schema.BoolAttribute{
+					Description: "Enable LLDP-MED topology change notifications.",
+					Optional:    true,
+					Computed:    true,
+				},
+			},
+		},
+		"mirror_port_idx": schema.Int64Attribute{
+			Description: "Mirror port index.",
+			Optional:    true,
+		},
+		"multicast_router_networkconf_ids": schema.SetAttribute{
+			Description: "List of network IDs for multicast router.",
+			Optional:    true,
+			ElementType: types.StringType,
+		},
+		"native_networkconf_id": schema.StringAttribute{
+			Description: "Native network ID (VLAN).",
+			Optional:    true,
+		},
+		"port_keepalive_enabled": schema.BoolAttribute{
+			Description: "Enable port keepalive.",
+			Optional:    true,
+			Computed:    true,
+		},
+		"port_security": schema.SingleNestedAttribute{
+			Description: "Port security (MAC allow-list) settings.",
+			Optional:    true,
+			Computed:    true,
+			Attributes: map[string]schema.Attribute{
+				"enabled": schema.BoolAttribute{
+					Description: "Enable port security.",
+					Optional:    true,
+					Computed:    true,
+				},
+				"mac_address": schema.ListAttribute{
+					Description: "List of MAC addresses allowed when port security is enabled.",
+					Optional:    true,
+					Computed:    true,
+					ElementType: types.StringType,
+				},
+			},
+		},
+		"priority_queue1_level": schema.Int64Attribute{
+			Description: "Priority queue 1 level.",
+			Optional:    true,
+		},
+		"priority_queue2_level": schema.Int64Attribute{
+			Description: "Priority queue 2 level.",
+			Optional:    true,
+		},
+		"priority_queue3_level": schema.Int64Attribute{
+			Description: "Priority queue 3 level.",
+			Optional:    true,
+		},
+		"priority_queue4_level": schema.Int64Attribute{
+			Description: "Priority queue 4 level.",
+			Optional:    true,
+		},
+		"setting_preference": schema.StringAttribute{
+			Description: "Setting preference.",
+			Optional:    true,
+		},
+		"speed": schema.Int64Attribute{
+			Description: "Port speed in Mbps.",
+			Optional:    true,
+		},
+		"stormctrl": devicePortStormctrlSchema(),
+		"stp_edge_state": schema.StringAttribute{
+			Description: "STP edge port mode; valid values are `enabled`, `disabled`, and `auto`. An edge port (the UI's Edge port mode, `enabled`) forwards as soon as its link comes up and sends no topology change when it goes up or down, for a port with an end device behind it. `auto` detects edge ports (RSTP auto-edge). Only managed when set: leaving it unset keeps the port's current value.",
+			Optional:    true,
+			Validators: []validator.String{
+				stringvalidator.OneOf("enabled", "disabled", "auto"),
+			},
+		},
+		"stp_port_mode": schema.BoolAttribute{
+			Description: "STP port mode.",
+			Optional:    true,
+			Computed:    true,
+		},
+		"tagged_networkconf_ids": schema.SetAttribute{
+			Description: "Set of network IDs to tag on this port (the UI's Tagged VLAN Management \"Custom\" selection; pair with `tagged_vlan_mgmt = \"custom\"`). Only managed when set: leaving it unset keeps the port's current tagged networks, and an empty set clears them.",
+			Optional:    true,
+			ElementType: types.StringType,
+		},
+		"tagged_vlan_mgmt": schema.StringAttribute{
+			Description: "Tagged VLAN management.",
+			Optional:    true,
+		},
+		"voice_networkconf_id": schema.StringAttribute{
+			Description: "Voice network ID.",
+			Optional:    true,
+		},
+	}
+}
+
+// devicePortStormctrlSchema is the port_override `stormctrl` nested attribute.
+func devicePortStormctrlSchema() schema.SingleNestedAttribute {
+	class := func(kind string) schema.SingleNestedAttribute {
+		return schema.SingleNestedAttribute{
+			Description: kind + " storm control.",
+			Optional:    true,
+			Computed:    true,
+			Attributes: map[string]schema.Attribute{
+				"enabled": schema.BoolAttribute{
+					Description: "Enable " + kind + " storm control.",
+					Optional:    true,
+					Computed:    true,
+				},
+				"level": schema.Int64Attribute{
+					Description: kind + " storm control level (percent), used when `type` is `level`.",
+					Optional:    true,
+					Computed:    true,
+				},
+				"rate": schema.Int64Attribute{
+					Description: kind + " storm control rate (packets per second), used when `type` is `rate`.",
+					Optional:    true,
+					Computed:    true,
+				},
+			},
+		}
+	}
+	return schema.SingleNestedAttribute{
+		Description: "Storm control settings.",
+		Optional:    true,
+		Computed:    true,
+		Attributes: map[string]schema.Attribute{
+			"type": schema.StringAttribute{
+				Description: "Storm control type; `level` or `rate`.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"bcast": class("Broadcast"),
+			"mcast": class("Multicast"),
+			"ucast": class("Unknown unicast"),
 		},
 	}
 }
@@ -867,106 +1434,6 @@ func (r *deviceResource) Configure(
 	r.client = client
 }
 
-// ModifyPlan corrects planned values for port_override attributes that the
-// terraform-plugin-framework's SetNestedBlock handling gets wrong. When set
-// element hashes change, Computed attributes revert to defaults instead of
-// using the user's config values. This fixup ensures op_mode is "aggregate"
-// when aggregate_members are present, preventing plan/apply mismatches.
-func (r *deviceResource) ModifyPlan(
-	ctx context.Context,
-	req resource.ModifyPlanRequest,
-	resp *resource.ModifyPlanResponse,
-) {
-	if req.Plan.Raw.IsNull() {
-		return
-	}
-
-	var plan deviceResourceModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	if plan.PortOverride.IsNull() || plan.PortOverride.IsUnknown() {
-		return
-	}
-
-	var config deviceResourceModel
-	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	if config.PortOverride.IsNull() || config.PortOverride.IsUnknown() {
-		return
-	}
-
-	// Build a map of config port overrides keyed by index
-	configOverrides := make(map[int64]portOverrideModel)
-	for _, elem := range config.PortOverride.Elements() {
-		obj, ok := elem.(types.Object)
-		if !ok {
-			continue
-		}
-		var model portOverrideModel
-		resp.Diagnostics.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
-		if resp.Diagnostics.HasError() {
-			return
-		}
-		if !model.Index.IsNull() {
-			configOverrides[model.Index.ValueInt64()] = model
-		}
-	}
-
-	// Fix planned port overrides using config values
-	modified := false
-	newElements := make([]attr.Value, 0, len(plan.PortOverride.Elements()))
-	for _, elem := range plan.PortOverride.Elements() {
-		obj, ok := elem.(types.Object)
-		if !ok {
-			newElements = append(newElements, elem)
-			continue
-		}
-		var model portOverrideModel
-		resp.Diagnostics.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
-		if resp.Diagnostics.HasError() {
-			return
-		}
-
-		if !model.Index.IsNull() {
-			if cfgModel, exists := configOverrides[model.Index.ValueInt64()]; exists {
-				if !cfgModel.OpMode.IsNull() &&
-					model.OpMode.ValueString() != cfgModel.OpMode.ValueString() {
-					model.OpMode = cfgModel.OpMode
-					modified = true
-				}
-				if !cfgModel.LagIdx.IsNull() &&
-					(model.LagIdx.IsNull() || model.LagIdx.ValueInt64() != cfgModel.LagIdx.ValueInt64()) {
-					model.LagIdx = cfgModel.LagIdx
-					modified = true
-				}
-			}
-		}
-
-		objVal, objDiags := types.ObjectValueFrom(ctx, portOverrideAttrTypes(), model)
-		resp.Diagnostics.Append(objDiags...)
-		if resp.Diagnostics.HasError() {
-			return
-		}
-		newElements = append(newElements, objVal)
-	}
-
-	if modified {
-		newSet, setDiags := types.SetValue(plan.PortOverride.ElementType(ctx), newElements)
-		resp.Diagnostics.Append(setDiags...)
-		if resp.Diagnostics.HasError() {
-			return
-		}
-		plan.PortOverride = newSet
-		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
-	}
-}
-
 func (r *deviceResource) Create(
 	ctx context.Context,
 	req resource.CreateRequest,
@@ -978,6 +1445,14 @@ func (r *deviceResource) Create(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	createTimeout, timeoutDiags := plan.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
 
 	site := plan.Site.ValueString()
 	if site == "" {
@@ -1039,8 +1514,9 @@ func (r *deviceResource) Create(
 			return
 		}
 
-		d, err := r.waitForDeviceState(
+		d, err := waitForDeviceState(
 			ctx,
+			r.client,
 			site, mac,
 			unifi.DeviceStateConnected,
 			[]unifi.DeviceState{
@@ -1049,7 +1525,7 @@ func (r *deviceResource) Create(
 				unifi.DeviceStateProvisioning,
 				unifi.DeviceStateUpgrading,
 			},
-			2*time.Minute,
+			3*time.Minute,
 		)
 		if err != nil {
 			resp.Diagnostics.AddError(
@@ -1065,26 +1541,67 @@ func (r *deviceResource) Create(
 	plan.Site = types.StringValue(site)
 	plan.Adopted = types.BoolValue(true)
 
+	// Save plan-only values before they get overwritten later.
+	allowAdoption := plan.AllowAdoption
+	forgetOnDestroy := plan.ForgetOnDestroy
+	plannedPortOverride := plan.PortOverride
+	plannedRadioTable := plan.RadioTable
+
+	// Set Type from the API so updateDevice can include it in the PUT body.
+	// We deliberately do NOT call setResourceData here — it would fill the model
+	// with ALL device fields (radio_table, outlet_overrides, etc.) which then get
+	// serialized into the PUT body and cause "not found" errors from the API.
+	plan.Type = types.StringValue(device.Type)
+	plan.Model = types.StringValue(device.Model)
+
 	if plan.ConfigNetwork.IsNull() || plan.ConfigNetwork.IsUnknown() {
 		plan.ConfigNetwork = types.ObjectNull(configNetworkAttrTypes())
 	}
 
-	// Preserve plan-only flags
-	allowAdoption := plan.AllowAdoption
-	forgetOnDestroy := plan.ForgetOnDestroy
-
-	// Apply the update operation
+	// Apply the update operation (sends only user-configured fields + type/model)
 	diags = r.updateDevice(ctx, &plan)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
+	// Re-read the device from the API to get the actual state after create/update,
+	// but preserve port_override from the plan. The API returns ALL ports (e.g. 32)
+	// while the plan only contains the ports we manage (e.g. 27). Terraform's
+	// post-apply consistency check requires the returned set to match the plan.
+	freshDevice, _ := r.client.GetDeviceByMAC(ctx, site, plan.MAC.ValueString())
+	if freshDevice == nil {
+		freshDevice, _ = r.client.GetDevice(ctx, site, plan.ID.ValueString())
+	}
+	if freshDevice != nil {
+		r.setResourceData(ctx, &resp.Diagnostics, freshDevice, &plan, site)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	// Restore port_override from plan. The API returns ALL ports (e.g. 32) but we
+	// only manage a subset (e.g. 27). Terraform's post-apply consistency check
+	// requires the set length to match the plan. On subsequent Read, the full
+	// port state will be loaded, which may cause a one-time update on next apply.
+	plan.PortOverride = plannedPortOverride
+
+	// Keep the practitioner's declared radio_table shape (count/order/declared
+	// values); resolve only the sub-fields they left undeclared from the
+	// applied controller values (#427).
+	reconciledRadios, radioDiags := r.reconcileRadioTableWithPlan(
+		ctx, plannedRadioTable, plan.RadioTable)
+	resp.Diagnostics.Append(radioDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	plan.RadioTable = reconciledRadios
+
 	// Restore plan-only flags
 	plan.AllowAdoption = allowAdoption
 	plan.ForgetOnDestroy = forgetOnDestroy
 
 	// Set state
+	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("mac"), plan.MAC)...)
 	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
 }
@@ -1101,25 +1618,65 @@ func (r *deviceResource) Read(
 		return
 	}
 
-	// Preserve plan-only flags before reading API state
+	readTimeout, timeoutDiags := state.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Preserve plan-only flags and port_override before reading API state.
+	// Port_override is a Set where ALL fields contribute to identity. The API
+	// returns all ports with all fields, but the user only configures a subset.
+	// Keeping the user's minimal set in state prevents phantom drift on every plan.
 	allowAdoption := state.AllowAdoption
 	forgetOnDestroy := state.ForgetOnDestroy
+	priorPortOverride := state.PortOverride
+	priorRadioTable := state.RadioTable
+
+	// The identity (device MAC) may be the only key available — e.g. the state
+	// written by an identity-based import carries just the MAC. Fall back to it
+	// when the state has no MAC so the refresh can still find the device.
+	if state.MAC.IsNull() || state.MAC.IsUnknown() {
+		if req.Identity != nil && !req.Identity.Raw.IsNull() {
+			var identityMAC hwtypes.MACAddress
+			resp.Diagnostics.Append(
+				req.Identity.GetAttribute(ctx, path.Root("mac"), &identityMAC)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			if !identityMAC.IsNull() && !identityMAC.IsUnknown() {
+				state.MAC = identityMAC
+			}
+		}
+	}
 
 	id := state.ID.ValueString()
+	mac := state.MAC.ValueString()
 	site := state.Site.ValueString()
 	if site == "" {
 		site = r.client.Site
 	}
 
-	device, err := r.getDevice(ctx, site, id, state.MAC.ValueString())
+	// Prefer GetDeviceByMAC (stat/device/{mac}) because stat/device/{id} doesn't
+	// work through the cloud connector proxy. Fall back to GetDevice for local setups.
+	var device *unifi.Device
+	var err error
+	if mac != "" {
+		device, err = r.client.GetDeviceByMAC(ctx, site, mac)
+	}
+	if device == nil || err != nil {
+		device, err = r.client.GetDevice(ctx, site, id)
+	}
 	if err != nil {
 		if _, ok := err.(*unifi.NotFoundError); ok {
-			resp.State.RemoveResource(ctx)
+			removeResourceOnRead(ctx, resp, deviceIdentityModel{MAC: state.MAC})
 			return
 		}
 		resp.Diagnostics.AddError(
 			"Error Reading Device",
-			fmt.Sprintf("Could not read device %s: %s", id, err),
+			fmt.Sprintf("Could not read device %s (mac %s): %s", id, mac, err),
 		)
 		return
 	}
@@ -1130,10 +1687,50 @@ func (r *deviceResource) Read(
 		return
 	}
 
-	// Restore plan-only flags
-	state.AllowAdoption = allowAdoption
-	state.ForgetOnDestroy = forgetOnDestroy
+	// Restore plan-only flags. These are write-only and never returned by the
+	// API, so keep the prior value. After an import the prior value is null/unknown;
+	// normalize it to the schema default (true) so a later apply does not see a
+	// null and report an inconsistent result.
+	if allowAdoption.IsNull() || allowAdoption.IsUnknown() {
+		state.AllowAdoption = types.BoolValue(true)
+	} else {
+		state.AllowAdoption = allowAdoption
+	}
+	if forgetOnDestroy.IsNull() || forgetOnDestroy.IsUnknown() {
+		state.ForgetOnDestroy = types.BoolValue(true)
+	} else {
+		state.ForgetOnDestroy = forgetOnDestroy
+	}
 
+	// Reconcile port_override: the API returns all ports with all fields, but
+	// the user only configures a subset. Rebuild state from the API response
+	// using only the ports/fields the user configured, so drift is detectable.
+	// If the user configured no port_overrides, keep state null so Terraform
+	// doesn't plan to remove ports it doesn't manage.
+	if priorPortOverride.IsNull() || priorPortOverride.IsUnknown() {
+		state.PortOverride = priorPortOverride
+	} else {
+		reconciled, reconcileDiags := r.reconcilePortOverrides(
+			ctx,
+			priorPortOverride,
+			device.PortOverrides,
+		)
+		resp.Diagnostics.Append(reconcileDiags...)
+		if !resp.Diagnostics.HasError() {
+			state.PortOverride = reconciled
+		}
+	}
+
+	// The deprecated radio-level assisted roaming leaves have no controller
+	// backing, so refresh would otherwise null out whatever the practitioner
+	// configured and report it as drift forever.
+	carried, carryDiags := carryDeprecatedAssistedRoaming(ctx, priorRadioTable, state.RadioTable)
+	resp.Diagnostics.Append(carryDiags...)
+	if !resp.Diagnostics.HasError() {
+		state.RadioTable = carried
+	}
+
+	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("mac"), state.MAC)...)
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
 }
@@ -1150,12 +1747,13 @@ func (r *deviceResource) Update(
 		return
 	}
 
-	var config deviceResourceModel
-	diags = req.Config.Get(ctx, &config)
-	resp.Diagnostics.Append(diags...)
+	updateTimeout, timeoutDiags := plan.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
 
 	var state deviceResourceModel
 	diags = req.State.Get(ctx, &state)
@@ -1171,7 +1769,17 @@ func (r *deviceResource) Update(
 	}
 
 	id := state.ID.ValueString()
-	currentDevice, err := r.getDevice(ctx, site, id, state.MAC.ValueString())
+	mac := state.MAC.ValueString()
+
+	// Prefer MAC lookup (works through cloud connector). Fall back to ID lookup.
+	var currentDevice *unifi.Device
+	var err error
+	if mac != "" {
+		currentDevice, err = r.client.GetDeviceByMAC(ctx, site, mac)
+	}
+	if currentDevice == nil || err != nil {
+		currentDevice, err = r.client.GetDevice(ctx, site, id)
+	}
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Reading Device for Update",
@@ -1180,115 +1788,90 @@ func (r *deviceResource) Update(
 		return
 	}
 
-	// Apply current API values to state
-	r.setResourceData(ctx, &resp.Diagnostics, currentDevice, &state, site)
-	if resp.Diagnostics.HasError() {
-		return
+	// Set type/model on plan from current device (required by API for PUT).
+	// We deliberately skip setResourceData to avoid filling the model with ALL
+	// device fields which would bloat the PUT body and cause API errors.
+	if plan.Type.IsNull() || plan.Type.IsUnknown() {
+		plan.Type = types.StringValue(currentDevice.Type)
+	}
+	if plan.Model.IsNull() || plan.Model.IsUnknown() {
+		plan.Model = types.StringValue(currentDevice.Model)
+	}
+	plan.ID = state.ID
+
+	// Preserve plan-only flags. They are write-only (config or default); keep the
+	// planned value and only fall back to prior state if the plan left them unset.
+	// Do NOT unconditionally overwrite with state — a null state (e.g. after an
+	// import) would clobber the planned `true` and produce an inconsistent result.
+	if plan.AllowAdoption.IsNull() || plan.AllowAdoption.IsUnknown() {
+		plan.AllowAdoption = state.AllowAdoption
+	}
+	if plan.ForgetOnDestroy.IsNull() || plan.ForgetOnDestroy.IsUnknown() {
+		plan.ForgetOnDestroy = state.ForgetOnDestroy
 	}
 
-	// Apply plan changes to the state.
-	// port_override uses the config instead of the plan because
-	// SetNestedBlock has a framework bug where Computed attributes
-	// get default values instead of the user's config values when
-	// set element hashes change.
-	if !plan.Name.IsNull() && !plan.Name.IsUnknown() {
-		state.Name = plan.Name
-	}
-	if !plan.Disabled.IsNull() && !plan.Disabled.IsUnknown() {
-		state.Disabled = plan.Disabled
-	}
-	if !config.PortOverride.IsNull() && !config.PortOverride.IsUnknown() {
-		state.PortOverride = config.PortOverride
-	}
-	if !plan.ConfigNetwork.IsNull() && !plan.ConfigNetwork.IsUnknown() {
-		state.ConfigNetwork = plan.ConfigNetwork
-	}
-	if !plan.LedOverride.IsNull() && !plan.LedOverride.IsUnknown() {
-		state.LedOverride = plan.LedOverride
-	}
-	if !plan.LedOverrideColor.IsNull() && !plan.LedOverrideColor.IsUnknown() {
-		state.LedOverrideColor = plan.LedOverrideColor
-	}
-	if !plan.LedOverrideColorBrightness.IsNull() && !plan.LedOverrideColorBrightness.IsUnknown() {
-		state.LedOverrideColorBrightness = plan.LedOverrideColorBrightness
-	}
-	if !plan.BandsteeringMode.IsNull() && !plan.BandsteeringMode.IsUnknown() {
-		state.BandsteeringMode = plan.BandsteeringMode
-	}
-	if !plan.FlowctrlEnabled.IsNull() && !plan.FlowctrlEnabled.IsUnknown() {
-		state.FlowctrlEnabled = plan.FlowctrlEnabled
-	}
-	if !plan.JumboframeEnabled.IsNull() && !plan.JumboframeEnabled.IsUnknown() {
-		state.JumboframeEnabled = plan.JumboframeEnabled
-	}
-	if !plan.StpVersion.IsNull() && !plan.StpVersion.IsUnknown() {
-		state.StpVersion = plan.StpVersion
-	}
-	if !plan.StpPriority.IsNull() && !plan.StpPriority.IsUnknown() {
-		state.StpPriority = plan.StpPriority
-	}
-	if !plan.Locked.IsNull() && !plan.Locked.IsUnknown() {
-		state.Locked = plan.Locked
-	}
-	if !plan.PoeMode.IsNull() && !plan.PoeMode.IsUnknown() {
-		state.PoeMode = plan.PoeMode
-	}
-	if !plan.SwitchVLANEnabled.IsNull() && !plan.SwitchVLANEnabled.IsUnknown() {
-		state.SwitchVLANEnabled = plan.SwitchVLANEnabled
-	}
-	if !plan.OutdoorModeOverride.IsNull() && !plan.OutdoorModeOverride.IsUnknown() {
-		state.OutdoorModeOverride = plan.OutdoorModeOverride
-	}
-	if !plan.Volume.IsNull() && !plan.Volume.IsUnknown() {
-		state.Volume = plan.Volume
-	}
-	if !plan.BaresipPassword.IsNull() && !plan.BaresipPassword.IsUnknown() {
-		state.BaresipPassword = plan.BaresipPassword
-	}
-	if !plan.LcmBrightness.IsNull() && !plan.LcmBrightness.IsUnknown() {
-		state.LcmBrightness = plan.LcmBrightness
-	}
-	if !plan.LcmBrightnessOverride.IsNull() && !plan.LcmBrightnessOverride.IsUnknown() {
-		state.LcmBrightnessOverride = plan.LcmBrightnessOverride
-	}
-	if !plan.LcmIDleTimeout.IsNull() && !plan.LcmIDleTimeout.IsUnknown() {
-		state.LcmIDleTimeout = plan.LcmIDleTimeout
-	}
-	if !plan.LcmIDleTimeoutOverride.IsNull() && !plan.LcmIDleTimeoutOverride.IsUnknown() {
-		state.LcmIDleTimeoutOverride = plan.LcmIDleTimeoutOverride
-	}
-	if !plan.LcmNightModeBegins.IsNull() && !plan.LcmNightModeBegins.IsUnknown() {
-		state.LcmNightModeBegins = plan.LcmNightModeBegins
-	}
-	if !plan.LcmNightModeEnds.IsNull() && !plan.LcmNightModeEnds.IsUnknown() {
-		state.LcmNightModeEnds = plan.LcmNightModeEnds
-	}
-	if !plan.OutletEnabled.IsNull() && !plan.OutletEnabled.IsUnknown() {
-		state.OutletEnabled = plan.OutletEnabled
-	}
-	if !plan.OutletOverrides.IsNull() && !plan.OutletOverrides.IsUnknown() {
-		state.OutletOverrides = plan.OutletOverrides
-	}
-	if !plan.MgmtNetworkID.IsNull() && !plan.MgmtNetworkID.IsUnknown() {
-		state.MgmtNetworkID = plan.MgmtNetworkID
-	}
-	if !plan.RadioTable.IsNull() && !plan.RadioTable.IsUnknown() {
-		state.RadioTable = plan.RadioTable
+	if plan.ConfigNetwork.IsNull() || plan.ConfigNetwork.IsUnknown() {
+		plan.ConfigNetwork = types.ObjectNull(configNetworkAttrTypes())
 	}
 
-	// Preserve config-only fields that don't exist in the API.
-	// These must always come from the plan, not from API state.
-	state.AllowAdoption = plan.AllowAdoption
-	state.ForgetOnDestroy = plan.ForgetOnDestroy
+	// Save planned port overrides for post-update restore
+	plannedPortOverride := plan.PortOverride
 
-	// Update the resource
-	diags = r.updateDevice(ctx, &state)
+	// Save the planned radio table: the post-update read replaces it with the
+	// controller's full, device-ordered table, which may not match the shape
+	// the practitioner declared (#427).
+	plannedRadioTable := plan.RadioTable
+
+	// Save the planned values the controller applies to APs asynchronously (see
+	// reassertAsyncApplied).
+	asyncPlanned := plan
+
+	// Update the device with only user-configured fields
+	diags = r.updateDevice(ctx, &plan)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	diags = resp.State.Set(ctx, state)
+	// Re-read the full device state after update
+	freshDevice, _ := r.client.GetDeviceByMAC(ctx, site, mac)
+	if freshDevice == nil {
+		freshDevice, _ = r.client.GetDevice(ctx, site, id)
+	}
+	if freshDevice != nil {
+		r.setResourceData(ctx, &resp.Diagnostics, freshDevice, &plan, site)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	// Restore port_override from plan (API returns all ports, plan has subset)
+	plan.PortOverride = plannedPortOverride
+
+	// Keep the practitioner's declared radio_table shape (count/order/declared
+	// values); resolve only the sub-fields they left undeclared from the
+	// applied controller values (#427).
+	reconciledRadios, radioDiags := r.reconcileRadioTableWithPlan(
+		ctx, plannedRadioTable, plan.RadioTable)
+	resp.Diagnostics.Append(radioDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	plan.RadioTable = reconciledRadios
+
+	reassertAsyncApplied(ctx, &plan, &asyncPlanned)
+	// allow_adoption / forget_on_destroy were resolved before the update and are
+	// not touched by setResourceData; ensure a concrete value (default true)
+	// rather than overwriting the planned value with prior state.
+	if plan.AllowAdoption.IsNull() || plan.AllowAdoption.IsUnknown() {
+		plan.AllowAdoption = types.BoolValue(true)
+	}
+	if plan.ForgetOnDestroy.IsNull() || plan.ForgetOnDestroy.IsUnknown() {
+		plan.ForgetOnDestroy = types.BoolValue(true)
+	}
+
+	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("mac"), plan.MAC)...)
+	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
 }
 
@@ -1303,6 +1886,14 @@ func (r *deviceResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := state.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	if !state.ForgetOnDestroy.ValueBool() {
 		return
@@ -1323,12 +1914,13 @@ func (r *deviceResource) Delete(
 		return
 	}
 
-	_, err = r.waitForDeviceState(
+	_, err = waitForDeviceState(
 		ctx,
+		r.client,
 		site, mac,
 		unifi.DeviceStatePending,
 		[]unifi.DeviceState{unifi.DeviceStateConnected, unifi.DeviceStateDeleting},
-		1*time.Minute,
+		3*time.Minute,
 	)
 	if _, ok := err.(*unifi.NotFoundError); !ok && err != nil {
 		resp.Diagnostics.AddError(
@@ -1344,33 +1936,224 @@ func (r *deviceResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	resource.ImportStatePassthroughID(
-		ctx,
-		path.Root("id"),
-		req,
-		resp,
-	)
+	// Import by resource identity (import block with identity, Terraform 1.12+).
+	// The mac attribute uses the custom hwtypes.MACAddressType in both the
+	// resource and identity schemas, so the passthrough is hand-rolled:
+	// resource.ImportStatePassthroughWithIdentity only supports plain string
+	// attributes and would fail with a Value Conversion Error. Read then looks
+	// the device up by MAC when the state carries no controller ID.
+	if req.ID == "" {
+		var identityMAC hwtypes.MACAddress
+		resp.Diagnostics.Append(
+			req.Identity.GetAttribute(ctx, path.Root("mac"), &identityMAC)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("mac"), identityMAC)...)
+		return
+	}
+
+	importID := req.ID
+	mac := cleanMAC(importID)
+	site := r.client.Site
+
+	normalizeMAC := func(m string) string {
+		m = strings.ToLower(m)
+		m = strings.ReplaceAll(m, ":", "")
+		m = strings.ReplaceAll(m, "-", "")
+		return m
+	}
+
+	var device *unifi.Device
+	var getErr, listErr error
+	var deviceCount int
+
+	// The import identifier may be either a MAC address or the controller's
+	// internal device ID (the value of the `id` attribute, which is what
+	// ImportStateVerify replays). Try a MAC lookup first, then fall back to an
+	// ID lookup, then to scanning the device list matching on either.
+	device, getErr = r.client.GetDeviceByMAC(ctx, site, mac)
+	if (getErr != nil || device == nil || device.ID == "") && importID != "" {
+		if d, idErr := r.client.GetDevice(ctx, site, importID); idErr == nil && d != nil &&
+			d.ID != "" {
+			device = d
+			getErr = nil
+		}
+	}
+	if getErr != nil || device == nil || device.ID == "" {
+		if getErr != nil {
+			tflog.Warn(ctx, "GetDeviceByMAC failed, falling back to device list",
+				map[string]any{"mac": mac, "error": getErr.Error()})
+		}
+
+		// Fallback: list all devices and match by MAC or internal ID. This also
+		// avoids the full JSON deserialization that can fail on some device types.
+		devices, err := r.client.ListDevice(ctx, site)
+		listErr = err
+		if listErr != nil {
+			resp.Diagnostics.AddError(
+				"Error Listing Devices",
+				fmt.Sprintf(
+					"Could not list devices to find %s: %s (original error: %v)",
+					importID,
+					listErr,
+					getErr,
+				),
+			)
+			return
+		}
+
+		deviceCount = len(devices)
+		normalizedImport := normalizeMAC(mac)
+		for _, d := range devices {
+			if normalizeMAC(d.MAC) == normalizedImport || d.ID == importID {
+				device = &d
+				break
+			}
+		}
+	}
+
+	if device == nil || device.ID == "" {
+		var macList []string
+		if deviceCount > 0 {
+			devices, _ := r.client.ListDevice(ctx, site)
+			for _, d := range devices {
+				macList = append(macList, fmt.Sprintf("%s (id=%s)", d.MAC, d.ID))
+			}
+		}
+		resp.Diagnostics.AddError(
+			"Device Not Found",
+			fmt.Sprintf(
+				"No device found matching %q (tried MAC and internal ID) on site %s. GetDeviceByMAC error: %v. ListDevice found %d device(s): %v",
+				importID,
+				site,
+				getErr,
+				deviceCount,
+				macList,
+			),
+		)
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), device.ID)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("mac"), device.MAC)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), site)...)
+	// Mirror the import key into the resource identity.
+	resp.Diagnostics.Append(resp.Identity.SetAttribute(
+		ctx, path.Root("mac"), hwtypes.NewMACAddressValue(device.MAC))...)
 }
 
 // Helper methods
 
-// getDevice looks a device up by its controller ID and, when the controller
-// does not know that ID, by its MAC. The MAC is the device's stable key, the ID
-// is not: the upgrade to Network 11 re-keys every device from an ObjectID to a
-// UUID, and the device list has no entry under the old one. Without the
-// fallback a refresh drops the device from state, and the next apply runs
-// Create, which sends the planned port overrides without the device's live
-// values.
-func (r *deviceResource) getDevice(
-	ctx context.Context,
-	site, id, mac string,
-) (*unifi.Device, error) {
-	device, err := r.client.GetDevice(ctx, site, id)
-	if _, notFound := err.(*unifi.NotFoundError); !notFound || mac == "" {
-		return device, err
+// buildMinimalUpdateDevice assembles the Device sent in an update PUT. The full
+// Device struct carries computed fields (adopted, state, …) whose Go zero-values
+// the API rejects, so only the user-configured / API-required fields are sent.
+// LED overrides MUST be included: omitting them makes the controller keep the
+// old values, so the post-apply read conflicts with the plan (#337). All of the
+// LED fields are `omitempty`, so unset ones are dropped from the body.
+//
+// mgmt_network_id (the UI "Network Override") is likewise user-configurable and
+// must be carried here: the earlier hand-listed body dropped it, so the
+// controller never received the value and the per-device management VLAN could
+// not be set through the provider (#329). modelToAPIDevice only sets it when
+// configured, and it is `omitempty`, so a null value stays off the wire and
+// never reintroduces the #177 zero-value rejection.
+//
+// switch_vlan_enabled (the UI "Port VLAN" toggle, needed on APs with a built-in
+// switch to make VLAN tagging take effect on the built-in ports) is the same
+// story: the hand-listed body dropped it, so the controller kept its old value
+// and the post-apply read conflicted with a configured `true`. It is `omitempty`,
+// so a `false` stays off the wire and doesn't disturb the controller default.
+//
+// stp.version / stp.priority (#476) were likewise never copied into the PUT, so
+// changing the bridge priority planned cleanly but never reached the controller
+// and the post-apply read failed with an inconsistent result. Both are
+// `omitempty` in go-unifi, so an unset value stays off the wire.
+//
+// config_network must be included for per-device management IP/DNS changes. It
+// is optional on the API struct, so null Terraform config stays off the wire.
+//
+// radio_table and mesh_sta_vap_enabled are the same bug class for the mesh
+// toggles. radio_table[].vwire_enabled (the UI "Mesh Parent" toggle) is fully
+// wired through the schema and converters, but the hand-listed body never copied
+// radio_table across, so every radio_table sub-field — vwire_enabled included —
+// was dropped from the PUT. mesh_sta_vap_enabled (the top-level "Mesh Connect"
+// toggle) is likewise carried here. Both are `omitempty` (radio_table at the
+// device level, and every DeviceRadioTable sub-field), so an unset table or a
+// false/zero sub-field stays off the wire. Note that when radio_table is in the
+// plan (user-configured, or state-inherited via the list's UseStateForUnknown),
+// its non-zero sub-fields (channel, tx_power, …) also travel in the PUT; sending
+// back the values the controller already returned is idempotent.
+// Every other user-configurable field that modelToAPIDevice populates is carried
+// as well: stp_version and stp_priority (#476), outlet_overrides (#510), and the
+// LCM display, PoE, outlet, lock, disable, band-steering, flow-control,
+// jumbo-frame, outdoor-mode, volume, Talk password and etherlighting settings.
+// Each of them is `omitempty` in go-unifi, so an unset attribute stays off the
+// wire, while a configured one must travel or the controller keeps its old
+// value and the post-apply read fails with an inconsistent-result error. When
+// adding an attribute to modelToAPIDevice, add it here and to
+// Test_buildMinimalUpdateDevice_carriesConfigurableFields.
+func buildMinimalUpdateDevice(
+	deviceReq, currentDevice *unifi.Device,
+	portOverrides []unifi.DevicePortOverrides,
+) *unifi.Device {
+	// A nil slice marshals to `port_overrides: null`, which UDM/Dream Machine
+	// gateways reject with api.err.InvalidPayload (400) — but go-unifi's
+	// UpdateDevice diffs this body against the existing device and only sends
+	// the keys that changed, so `null` can only ever be SENT when the existing
+	// device's port_overrides is something other than null. Mirror the current
+	// device's exact representation (nil-for-null, empty-for-[]) so an
+	// unchanged port_overrides always drops out of the PUT: the previous
+	// unconditional `[]` manufactured a spurious null→[] diff on devices whose
+	// existing port_overrides is null (access points), and some controllers
+	// reject `port_overrides: []` on such devices with api.err.Invalid (#427's
+	// simulated UAP repro). A declared or controller-side override list is
+	// passed through unchanged, so #436 (never wipe live overrides with [])
+	// and #177 (never send bare null over a real list) both hold.
+	if portOverrides == nil && currentDevice != nil {
+		portOverrides = currentDevice.PortOverrides
 	}
-
-	return r.client.GetDeviceByMAC(ctx, site, cleanMAC(mac))
+	minimalDevice := &unifi.Device{
+		ID:                         deviceReq.ID,
+		Type:                       deviceReq.Type,
+		MAC:                        deviceReq.MAC,
+		Name:                       deviceReq.Name,
+		PortOverrides:              portOverrides,
+		MgmtNetworkID:              deviceReq.MgmtNetworkID,
+		LedOverride:                deviceReq.LedOverride,
+		LedOverrideColor:           deviceReq.LedOverrideColor,
+		LedOverrideColorBrightness: deviceReq.LedOverrideColorBrightness,
+		SwitchVLANEnabled:          deviceReq.SwitchVLANEnabled,
+		ConfigNetwork:              deviceReq.ConfigNetwork,
+		MeshStaVapEnabled:          deviceReq.MeshStaVapEnabled,
+		RadioTable:                 deviceReq.RadioTable,
+		Disabled:                   deviceReq.Disabled,
+		BandsteeringMode:           deviceReq.BandsteeringMode,
+		FlowctrlEnabled:            deviceReq.FlowctrlEnabled,
+		JumboframeEnabled:          deviceReq.JumboframeEnabled,
+		StpVersion:                 deviceReq.StpVersion,
+		StpPriority:                deviceReq.StpPriority,
+		Locked:                     deviceReq.Locked,
+		PoeMode:                    deviceReq.PoeMode,
+		OutdoorModeOverride:        deviceReq.OutdoorModeOverride,
+		Volume:                     deviceReq.Volume,
+		BaresipPassword:            deviceReq.BaresipPassword,
+		LcmBrightness:              deviceReq.LcmBrightness,
+		LcmBrightnessOverride:      deviceReq.LcmBrightnessOverride,
+		LcmIDleTimeout:             deviceReq.LcmIDleTimeout,
+		LcmIDleTimeoutOverride:     deviceReq.LcmIDleTimeoutOverride,
+		LcmNightModeBegins:         deviceReq.LcmNightModeBegins,
+		LcmNightModeEnds:           deviceReq.LcmNightModeEnds,
+		OutletEnabled:              deviceReq.OutletEnabled,
+		OutletOverrides:            deviceReq.OutletOverrides,
+		EtherLighting:              deviceReq.EtherLighting,
+	}
+	if currentDevice != nil {
+		minimalDevice.State = currentDevice.State
+		minimalDevice.Adopted = currentDevice.Adopted
+	}
+	return minimalDevice
 }
 
 func (r *deviceResource) updateDevice(
@@ -1393,19 +2176,94 @@ func (r *deviceResource) updateDevice(
 
 	deviceReq.ID = model.ID.ValueString()
 
-	// Retry UpdateDevice on "not found" errors (timing issue with API)
-	var device *unifi.Device
-	if err := retry.RetryContext(ctx, 30*time.Second, func() *retry.RetryError {
-		d, err := r.client.UpdateDevice(ctx, site, deviceReq)
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				return retry.RetryableError(err)
+	// Serialise against the other writers of this device's port_overrides
+	// (unifi_device_port, the port action): see Client.lockDevice.
+	unlock := r.client.lockDevice(deviceLockKey(deviceReq.MAC, deviceReq.ID))
+	defer unlock()
+
+	// Fetch the current device once. We need it for two reasons:
+	//   1. 'type' is a computed field the API requires in the PUT body.
+	//   2. UpdateDevice sends a diff against the existing device. The Device
+	//      struct marshals `state` and `adopted` without omitempty, so leaving
+	//      them at their Go zero-values makes the diff try to reset state to 0
+	//      and adopted to false — which UDM/Dream Machine gateways reject with
+	//      api.err.Invalid (issue #177). Echo the current values so they don't
+	//      appear in the diff.
+	// Prefer MAC lookup (works through cloud connector); fall back to ID (local).
+	// Capture each lookup error so that auth/network/permission failures are
+	// surfaced distinctly from a simple not-found case (review feedback on PR #378).
+	// GetDeviceByMAC and GetDevice both return *unifi.NotFoundError when the device
+	// is missing; that sentinel must NOT be treated as a lookup failure.
+	var currentDevice *unifi.Device
+	var macErr, idErr error
+	if deviceReq.MAC != "" {
+		currentDevice, macErr = r.client.GetDeviceByMAC(ctx, site, deviceReq.MAC)
+	}
+	if currentDevice == nil && deviceReq.ID != "" {
+		currentDevice, idErr = r.client.GetDevice(ctx, site, deviceReq.ID)
+	}
+	if currentDevice == nil {
+		// Everything below (state/adopted echo, port_overrides echo) depends on
+		// currentDevice. Proceeding without it would leave state/adopted at their Go
+		// zero-values in the PUT body — precisely the condition that triggers
+		// api.err.InvalidPayload (400) on UDM/Dream Machine gateways that this PR
+		// exists to fix (#177/#150). Fail fast with a clear diagnostic instead of
+		// silently reintroducing that failure mode (review feedback on PR #378).
+		var detail string
+		if isLookupFailure(macErr) || isLookupFailure(idErr) {
+			// Pick the REAL failure, not merely the first non-nil error: a
+			// not-found from one lookup must never mask a genuine
+			// auth/network/permission failure from the other (either order).
+			lookupErr := macErr
+			if !isLookupFailure(lookupErr) {
+				lookupErr = idErr
 			}
-			return retry.NonRetryableError(err)
+			detail = fmt.Sprintf(
+				"Could not fetch the current device (mac=%q, id=%q) on site %q before updating: %v — "+
+					"refusing to send an update with state/adopted left unset, which UDM/Dream "+
+					"Machine gateways reject.",
+				deviceReq.MAC,
+				deviceReq.ID,
+				site,
+				lookupErr,
+			)
+		} else {
+			detail = fmt.Sprintf(
+				"Could not fetch the current device (mac=%q, id=%q) on site %q before updating — "+
+					"refusing to send an update with state/adopted left unset, which UDM/Dream "+
+					"Machine gateways reject. Verify the device still exists on this site and that "+
+					"its MAC/ID are correct.",
+				deviceReq.MAC, deviceReq.ID, site,
+			)
 		}
-		device = d
-		return nil
-	}); err != nil {
+		diags.AddError("Error Updating Device", detail)
+		return diags
+	}
+	if deviceReq.Type == "" {
+		deviceReq.Type = currentDevice.Type
+	}
+
+	// Echo hardware-derived radio fields the user left unset (radio name,
+	// antenna_gain, antenna_id, …) from the device's current radio table, so a
+	// partially-declared radio_table entry neither zero-fills them nor omits a
+	// controller-required field (#427).
+	if len(deviceReq.RadioTable) > 0 {
+		mergeRadioTableFromDevice(deviceReq.RadioTable, currentDevice.RadioTable)
+	}
+
+	portOverrides := resolvePortOverridesForUpdate(currentDevice, deviceReq)
+
+	minimalDevice := buildMinimalUpdateDevice(deviceReq, currentDevice, portOverrides)
+
+	if reqJSON, jsonErr := json.Marshal(minimalDevice); jsonErr == nil {
+		tflog.Info(ctx, "Sending device update", map[string]any{
+			"id": minimalDevice.ID, "type": minimalDevice.Type, "mac": minimalDevice.MAC,
+			"body_length": len(reqJSON),
+		})
+	}
+
+	device, err := r.client.UpdateDevice(ctx, site, minimalDevice)
+	if err != nil {
 		diags.AddError(
 			"Error Updating Device",
 			fmt.Sprintf("Could not update device: %s", err),
@@ -1414,12 +2272,13 @@ func (r *deviceResource) updateDevice(
 	}
 
 	// Wait for device to be in connected state
-	if d, err := r.waitForDeviceState(
+	if d, err := waitForDeviceState(
 		ctx,
+		r.client,
 		site, device.MAC,
 		unifi.DeviceStateConnected,
 		[]unifi.DeviceState{unifi.DeviceStateAdopting, unifi.DeviceStateProvisioning},
-		1*time.Minute,
+		3*time.Minute,
 	); err != nil {
 		diags.AddError(
 			"Error Waiting for Device Update",
@@ -1433,6 +2292,14 @@ func (r *deviceResource) updateDevice(
 	// Update state from API response
 	r.setResourceData(ctx, &diags, device, model, site)
 	return diags
+}
+
+func isLookupFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var notFound *unifi.NotFoundError
+	return !errors.As(err, &notFound)
 }
 
 func (r *deviceResource) setResourceData(
@@ -1476,22 +2343,15 @@ func (r *deviceResource) setResourceData(
 	// State is always present as int64
 	model.State = types.Int64Value(int64(device.State))
 
-	// LED settings
-	if device.LedOverride == "" {
-		model.LedOverride = types.StringNull()
-	} else {
-		model.LedOverride = types.StringValue(device.LedOverride)
+	// LED settings — write-only in practice: the controller frequently does not
+	// echo these back. When the API returns an empty value, preserve the
+	// configured/known value from the model instead of nulling it (which would
+	// trigger "inconsistent result after apply"). Only resolve unknowns to null.
+	led, convDiags := r.ledToFramework(ctx, device, model.Led)
+	diags.Append(convDiags...)
+	if !diags.HasError() {
+		model.Led = led
 	}
-
-	if device.LedOverrideColor == "" {
-		model.LedOverrideColor = types.StringNull()
-	} else {
-		model.LedOverrideColor = types.StringValue(device.LedOverrideColor)
-	}
-
-	model.LedOverrideColorBrightness = types.Int64PointerValue(
-		device.LedOverrideColorBrightness,
-	)
 
 	// Device features
 	if device.BandsteeringMode == "" {
@@ -1503,13 +2363,14 @@ func (r *deviceResource) setResourceData(
 	model.FlowctrlEnabled = types.BoolValue(device.FlowctrlEnabled)
 	model.JumboframeEnabled = types.BoolValue(device.JumboframeEnabled)
 
-	if device.StpVersion == "" {
-		model.StpVersion = types.StringNull()
-	} else {
-		model.StpVersion = types.StringValue(device.StpVersion)
+	stp, convDiags := types.ObjectValueFrom(ctx, deviceStpAttrTypes(), deviceStpModel{
+		Version:  stringOrNull(device.StpVersion),
+		Priority: types.Int64PointerValue(device.StpPriority),
+	})
+	diags.Append(convDiags...)
+	if !diags.HasError() {
+		model.Stp = stp
 	}
-
-	model.StpPriority = types.Int64PointerValue(device.StpPriority)
 
 	model.Locked = types.BoolValue(device.Locked)
 
@@ -1522,6 +2383,9 @@ func (r *deviceResource) setResourceData(
 
 	// VLAN
 	model.SwitchVLANEnabled = types.BoolValue(device.SwitchVLANEnabled)
+
+	// Mesh
+	model.MeshStaVapEnabled = types.BoolValue(device.MeshStaVapEnabled)
 
 	// Advanced features
 	if device.OutdoorModeOverride == "" {
@@ -1539,24 +2403,10 @@ func (r *deviceResource) setResourceData(
 	}
 
 	// LCD/LCM settings
-	model.LcmBrightness = types.Int64PointerValue(device.LcmBrightness)
-
-	model.LcmBrightnessOverride = types.BoolValue(device.LcmBrightnessOverride)
-
-	model.LcmIDleTimeout = types.Int64PointerValue(device.LcmIDleTimeout)
-
-	model.LcmIDleTimeoutOverride = types.BoolValue(device.LcmIDleTimeoutOverride)
-
-	if device.LcmNightModeBegins == "" {
-		model.LcmNightModeBegins = types.StringNull()
-	} else {
-		model.LcmNightModeBegins = types.StringValue(device.LcmNightModeBegins)
-	}
-
-	if device.LcmNightModeEnds == "" {
-		model.LcmNightModeEnds = types.StringNull()
-	} else {
-		model.LcmNightModeEnds = types.StringValue(device.LcmNightModeEnds)
+	lcm, convDiags := r.lcmToFramework(ctx, device)
+	diags.Append(convDiags...)
+	if !diags.HasError() {
+		model.Lcm = lcm
 	}
 
 	// Outlet settings
@@ -1567,6 +2417,13 @@ func (r *deviceResource) setResourceData(
 		model.MgmtNetworkID = types.StringNull()
 	} else {
 		model.MgmtNetworkID = types.StringValue(device.MgmtNetworkID)
+	}
+
+	// Etherlighting
+	etherlighting, convDiags := r.etherlightingToFramework(ctx, device.EtherLighting)
+	diags.Append(convDiags...)
+	if !diags.HasError() {
+		model.Etherlighting = etherlighting
 	}
 
 	// Convert config network
@@ -1609,20 +2466,31 @@ func (r *deviceResource) modelToAPIDevice(
 		Name: model.Name.ValueString(),
 	}
 
+	if !model.Type.IsNull() && !model.Type.IsUnknown() {
+		device.Type = model.Type.ValueString()
+	}
+	if !model.Model.IsNull() && !model.Model.IsUnknown() {
+		device.Model = model.Model.ValueString()
+	}
+
 	// Only set Disabled if it's explicitly configured
 	if !model.Disabled.IsNull() && !model.Disabled.IsUnknown() {
 		device.Disabled = model.Disabled.ValueBool()
 	}
 
 	// LED settings
-	if !model.LedOverride.IsNull() {
-		device.LedOverride = model.LedOverride.ValueString()
-	}
-	if !model.LedOverrideColor.IsNull() {
-		device.LedOverrideColor = model.LedOverrideColor.ValueString()
-	}
-	if !model.LedOverrideColorBrightness.IsNull() && !model.LedOverrideColorBrightness.IsUnknown() {
-		device.LedOverrideColorBrightness = model.LedOverrideColorBrightness.ValueInt64Pointer()
+	if led, ok, d := util.ObjectAs[deviceLedModel](ctx, model.Led); ok {
+		if !led.Override.IsNull() {
+			device.LedOverride = led.Override.ValueString()
+		}
+		if !led.Color.IsNull() {
+			device.LedOverrideColor = led.Color.ValueString()
+		}
+		if !led.Brightness.IsNull() && !led.Brightness.IsUnknown() {
+			device.LedOverrideColorBrightness = led.Brightness.ValueInt64Pointer()
+		}
+	} else {
+		diags.Append(d...)
 	}
 
 	// Device features
@@ -1631,11 +2499,15 @@ func (r *deviceResource) modelToAPIDevice(
 	}
 	device.FlowctrlEnabled = model.FlowctrlEnabled.ValueBool()
 	device.JumboframeEnabled = model.JumboframeEnabled.ValueBool()
-	if !model.StpVersion.IsNull() {
-		device.StpVersion = model.StpVersion.ValueString()
-	}
-	if !model.StpPriority.IsNull() && !model.StpPriority.IsUnknown() {
-		device.StpPriority = model.StpPriority.ValueInt64Pointer()
+	if stp, ok, d := util.ObjectAs[deviceStpModel](ctx, model.Stp); ok {
+		if !stp.Version.IsNull() {
+			device.StpVersion = stp.Version.ValueString()
+		}
+		if !stp.Priority.IsNull() && !stp.Priority.IsUnknown() {
+			device.StpPriority = stp.Priority.ValueInt64Pointer()
+		}
+	} else {
+		diags.Append(d...)
 	}
 	device.Locked = model.Locked.ValueBool()
 
@@ -1646,6 +2518,9 @@ func (r *deviceResource) modelToAPIDevice(
 
 	// VLAN
 	device.SwitchVLANEnabled = model.SwitchVLANEnabled.ValueBool()
+
+	// Mesh
+	device.MeshStaVapEnabled = model.MeshStaVapEnabled.ValueBool()
 
 	// Advanced features
 	if !model.OutdoorModeOverride.IsNull() {
@@ -1659,19 +2534,27 @@ func (r *deviceResource) modelToAPIDevice(
 	}
 
 	// LCD/LCM settings
-	if !model.LcmBrightness.IsNull() && !model.LcmBrightness.IsUnknown() {
-		device.LcmBrightness = model.LcmBrightness.ValueInt64Pointer()
-	}
-	device.LcmBrightnessOverride = model.LcmBrightnessOverride.ValueBool()
-	if !model.LcmIDleTimeout.IsNull() && !model.LcmIDleTimeout.IsUnknown() {
-		device.LcmIDleTimeout = model.LcmIDleTimeout.ValueInt64Pointer()
-	}
-	device.LcmIDleTimeoutOverride = model.LcmIDleTimeoutOverride.ValueBool()
-	if !model.LcmNightModeBegins.IsNull() {
-		device.LcmNightModeBegins = model.LcmNightModeBegins.ValueString()
-	}
-	if !model.LcmNightModeEnds.IsNull() {
-		device.LcmNightModeEnds = model.LcmNightModeEnds.ValueString()
+	if lcm, ok, d := util.ObjectAs[deviceLcmModel](ctx, model.Lcm); ok {
+		if !lcm.Brightness.IsNull() && !lcm.Brightness.IsUnknown() {
+			device.LcmBrightness = lcm.Brightness.ValueInt64Pointer()
+		}
+		device.LcmBrightnessOverride = lcm.BrightnessOverride.ValueBool()
+		if !lcm.IdleTimeout.IsNull() && !lcm.IdleTimeout.IsUnknown() {
+			device.LcmIDleTimeout = util.DurationUnitsPtr(lcm.IdleTimeout, time.Second)
+		}
+		device.LcmIDleTimeoutOverride = lcm.IdleTimeoutOverride.ValueBool()
+		if nm, ok, d := util.ObjectAs[deviceLcmNightModeModel](ctx, lcm.NightMode); ok {
+			if !nm.Begins.IsNull() {
+				device.LcmNightModeBegins = nm.Begins.ValueString()
+			}
+			if !nm.Ends.IsNull() {
+				device.LcmNightModeEnds = nm.Ends.ValueString()
+			}
+		} else {
+			diags.Append(d...)
+		}
+	} else {
+		diags.Append(d...)
 	}
 
 	// Outlet settings
@@ -1680,6 +2563,19 @@ func (r *deviceResource) modelToAPIDevice(
 	// Management
 	if !model.MgmtNetworkID.IsNull() {
 		device.MgmtNetworkID = model.MgmtNetworkID.ValueString()
+	}
+
+	// Etherlighting. Unknown leaves map to their zero value, which `omitempty`
+	// keeps off the wire.
+	if el, ok, d := util.ObjectAs[deviceEtherlightingModel](ctx, model.Etherlighting); ok {
+		device.EtherLighting = &unifi.DeviceEtherLighting{
+			Mode:       el.Mode.ValueString(),
+			Brightness: int64PointerIfKnown(el.Brightness),
+			Behavior:   el.Behavior.ValueString(),
+			LedMode:    el.LedMode.ValueString(),
+		}
+	} else {
+		diags.Append(d...)
 	}
 
 	// Convert config network
@@ -1725,6 +2621,389 @@ func (r *deviceResource) modelToAPIDevice(
 	return device, diags
 }
 
+// mergePortOverridesByIndex overlays the user-declared port overrides onto the
+// device's current overrides, keyed by port_idx. The UniFi PUT replaces the whole
+// port_overrides array, so to manage only a subset of ports without clobbering the
+// rest (#266) we start from what the controller already has and replace just the
+// declared ports. Ports present only in the current set are preserved; ports
+// declared but not yet present are appended. Declared order is preserved for the
+// appended entries so the result is deterministic.
+// carryUnwritableFields copies forward the fields the provider structurally cannot
+// write, so that declaring a port does not silently DELETE them.
+//
+// op_mode is the case that bites. It is only ever sent when it is not "switch"
+// (see modelToAPIPortOverride), because UDM gateways reject it on update (#213),
+// and DevicePortOverrides.OpMode is `json:"op_mode,omitempty"`. A port carrying
+// op_mode:"switch" on the controller therefore produces a declared entry with
+// OpMode == "", which differs from the current entry — and since UpdateDevice PUTs
+// getDeviceDiff(existing, target), which compares port_overrides as a single JSON
+// value, that one difference sends the ENTIRE array. The endpoint full-replaces it
+// with a copy that has been round-tripped through DevicePortOverrides, so every
+// port on the device loses every field at its zero value (omitempty drops "",
+// [] and nil pointers; the booleans are *bool since #567, so an explicit false
+// survives but an unset one is still dropped).
+//
+// The fields DevicePortOverrides models but the port_override schema does not
+// expose are the same problem without the op_mode special case: a declared entry
+// never carries them, so any controller-side value (multicast_router_mode
+// "NONE", link_debounce_auto, a qos_profile, …) makes the
+// declared entry differ, sends the whole array, and deletes the field on every
+// port. They are copied over unconditionally, since config cannot set them.
+// Test_carryUnwritableFields_coversEveryUnexposedField fails when go-unifi grows a
+// field that is neither in the schema nor carried here.
+//
+// Carrying the controller's value forward keeps the marshalled entry identical, so
+// the diff stays empty and nothing is written. No value is ever sourced from
+// config, so a user-supplied op_mode still cannot reach a gateway.
+func carryUnwritableFields(
+	current, declared unifi.DevicePortOverrides,
+) unifi.DevicePortOverrides {
+	if declared.OpMode == "" && current.OpMode != "" {
+		declared.OpMode = current.OpMode
+	}
+
+	// tagged_networkconf_ids is configurable, but only managed when set. When
+	// config leaves it null the declared entry has a nil slice, and sending the
+	// port without it would silently delete the port's tagged networks on the
+	// controller, so keep the controller's value. When config sets the same
+	// networks in a different order, keep the controller's order so the entry
+	// marshals identically and no write is triggered.
+	switch {
+	case declared.TaggedNetworkIDs == nil:
+		declared.TaggedNetworkIDs = current.TaggedNetworkIDs
+	case sameStringSet(declared.TaggedNetworkIDs, current.TaggedNetworkIDs):
+		declared.TaggedNetworkIDs = current.TaggedNetworkIDs
+	}
+
+	// stp_edge_state is configurable, but only managed when set, the same way:
+	// config leaving it null must not delete the port's edge mode.
+	if declared.StpEdgeState == "" {
+		declared.StpEdgeState = current.StpEdgeState
+	}
+
+	declared.EeeEnabled = current.EeeEnabled
+	declared.LdMode = current.LdMode
+	declared.LdStatus = current.LdStatus
+	declared.LinkDebounce = current.LinkDebounce
+	declared.LinkDebounceAuto = current.LinkDebounceAuto
+	declared.MulticastRouterMode = current.MulticastRouterMode
+	declared.PrecisionTimeProtocolEnabled = current.PrecisionTimeProtocolEnabled
+	declared.QOSProfile = current.QOSProfile
+	declared.RoutedNetworkID = current.RoutedNetworkID
+	declared.SdWANUnderlayPort = current.SdWANUnderlayPort
+	declared.SdWANUnderlayPortNetworkID = current.SdWANUnderlayPortNetworkID
+	declared.StablePortEnabled = current.StablePortEnabled
+	declared.StpBpduGuardEnabled = current.StpBpduGuardEnabled
+	declared.StpUplink = current.StpUplink
+	declared.TrustedPortMAC = current.TrustedPortMAC
+	declared.UnitID = current.UnitID
+	return declared
+}
+
+// sameStringSet reports whether a and b contain the same distinct strings,
+// ignoring order and duplicates.
+func sameStringSet(a, b []string) bool {
+	as := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		as[v] = struct{}{}
+	}
+	bs := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		bs[v] = struct{}{}
+	}
+	if len(as) != len(bs) {
+		return false
+	}
+	for v := range as {
+		if _, ok := bs[v]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// stringSetFromAPI converts an API string list into a sorted, de-duplicated
+// types.Set of strings. An empty list becomes a typed null when emptyAsNull is
+// set, and a known empty set otherwise.
+func stringSetFromAPI(ids []string, emptyAsNull bool) (types.Set, diag.Diagnostics) {
+	if len(ids) == 0 {
+		if emptyAsNull {
+			return types.SetNull(types.StringType), nil
+		}
+		return types.SetValueMust(types.StringType, []attr.Value{}), nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	sorted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		sorted = append(sorted, id)
+	}
+	sort.Strings(sorted)
+	vals := make([]attr.Value, len(sorted))
+	for i, id := range sorted {
+		vals[i] = types.StringValue(id)
+	}
+	return types.SetValue(types.StringType, vals)
+}
+
+// resolvePortOverridesForUpdate selects the port_overrides array to send in the
+// update PUT. The UniFi PUT treats port_overrides as a full-replace array, so:
+//
+//   - When config declares at least one port_override block, the declared blocks
+//     are merged (by port_idx) onto the device's current overrides (#266) so
+//     undeclared ports keep their existing controller-side config — partial
+//     management of just the declared ports.
+//   - When config declares zero port_override blocks (e.g. gateways/APs, or a
+//     switch only touched for name/LED/radio), the controller's current overrides
+//     are echoed unchanged. Skipping this — sending nil — marshals to
+//     `port_overrides: null`, which UDM/Dream Machine gateways reject with
+//     api.err.InvalidPayload (400), and would otherwise wipe every live override
+//     the switch actually has (#438).
+//
+// mergePortOverridesByIndex already returns `current` unchanged when `declared` is
+// empty, so both cases collapse to one call.
+func resolvePortOverridesForUpdate(
+	currentDevice, deviceReq *unifi.Device,
+) []unifi.DevicePortOverrides {
+	return mergePortOverridesByIndex(currentDevice.PortOverrides, deviceReq.PortOverrides)
+}
+
+func mergePortOverridesByIndex(
+	current, declared []unifi.DevicePortOverrides,
+) []unifi.DevicePortOverrides {
+	if len(declared) == 0 {
+		return current
+	}
+
+	declaredByIdx := make(map[int64]int, len(declared))
+	for i, po := range declared {
+		if po.PortIDX != nil {
+			declaredByIdx[*po.PortIDX] = i
+		}
+	}
+
+	merged := make([]unifi.DevicePortOverrides, 0, len(current)+len(declared))
+	used := make([]bool, len(declared))
+	for _, po := range current {
+		if po.PortIDX != nil {
+			if i, ok := declaredByIdx[*po.PortIDX]; ok {
+				merged = append(merged, carryUnwritableFields(po, declared[i]))
+				used[i] = true
+				continue
+			}
+		}
+		merged = append(merged, po)
+	}
+	// Append declared ports not already merged: newly-managed ports, or any entry
+	// without a port_idx (which we cannot key on).
+	for i, po := range declared {
+		if !used[i] {
+			merged = append(merged, po)
+		}
+	}
+	return merged
+}
+
+// reconcilePortOverrides rebuilds the port_override Set from the API response,
+// but only for ports and fields that the user explicitly configured. This lets
+// Terraform detect drift (e.g. tagged VLANs not applied) without the phantom
+// drift caused by computed fields the API adds for every port.
+// reconcilePortOverride rebuilds one declared port override from the
+// controller's entry for the same index: attributes the configuration sets
+// take the controller's value so drift is visible, attributes left unknown
+// are resolved from the controller, and everything else keeps the prior
+// value. Shared by the port_override block and unifi_device_port.
+func reconcilePortOverride(
+	pm portOverrideModel,
+	apiPO unifi.DevicePortOverrides,
+) (portOverrideModel, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	// Build a new model seeded from the prior (user config), then update
+	// only the fields that were explicitly set (non-null in prior) with
+	// the actual API value so drift is visible.
+	updated := pm
+
+	if !pm.Name.IsNull() {
+		if apiPO.Name == "" {
+			updated.Name = types.StringNull()
+		} else {
+			updated.Name = types.StringValue(apiPO.Name)
+		}
+	}
+	if !pm.NativeNetworkID.IsNull() {
+		// #410: an explicit native_networkconf_id = "" clears the port's
+		// native network on the controller and round-trips back as "" in
+		// the API response. Surface that as a known empty string (not
+		// null) so the explicit override round-trips instead of drifting
+		// back to "unset" on every plan; mirrors the #383 fix applied to
+		// unifi_port_profile.
+		updated.NativeNetworkID = types.StringValue(apiPO.NATiveNetworkID)
+	}
+	if !pm.Forward.IsNull() {
+		if apiPO.Forward == "" {
+			updated.Forward = types.StringNull()
+		} else {
+			updated.Forward = types.StringValue(apiPO.Forward)
+		}
+	}
+	if !pm.TaggedVLANMgmt.IsNull() {
+		if apiPO.TaggedVLANMgmt == "" {
+			updated.TaggedVLANMgmt = types.StringNull()
+		} else {
+			updated.TaggedVLANMgmt = types.StringValue(apiPO.TaggedVLANMgmt)
+		}
+	}
+	if !pm.ExcludedNetworkIDs.IsNull() {
+		if len(apiPO.ExcludedNetworkIDs) > 0 {
+			sorted := make([]string, len(apiPO.ExcludedNetworkIDs))
+			copy(sorted, apiPO.ExcludedNetworkIDs)
+			sort.Strings(sorted)
+			vals := make([]attr.Value, len(sorted))
+			for i, id := range sorted {
+				vals[i] = types.StringValue(id)
+			}
+			setVal, setDiags := types.SetValue(types.StringType, vals)
+			diags.Append(setDiags...)
+			updated.ExcludedNetworkIDs = setVal
+		} else {
+			emptySet, setDiags := types.SetValue(types.StringType, []attr.Value{})
+			diags.Append(setDiags...)
+			updated.ExcludedNetworkIDs = emptySet
+		}
+	}
+	if !pm.TaggedNetworkIDs.IsNull() && !pm.TaggedNetworkIDs.IsUnknown() {
+		// Configured: surface the controller's value as a set (order and
+		// duplicates are irrelevant, so the controller reordering the
+		// list cannot cause a perpetual diff). An empty controller value
+		// reads back as an empty set so `tagged_networkconf_ids = []`
+		// round-trips, and a non-empty config that the controller did not
+		// apply shows up as drift.
+		setVal, setDiags := stringSetFromAPI(apiPO.TaggedNetworkIDs, false)
+		diags.Append(setDiags...)
+		updated.TaggedNetworkIDs = setVal
+	}
+	if !pm.PortProfileID.IsNull() {
+		if apiPO.PortProfileID == "" {
+			updated.PortProfileID = types.StringNull()
+		} else {
+			updated.PortProfileID = types.StringValue(apiPO.PortProfileID)
+		}
+	}
+	if !pm.StpEdgeState.IsNull() {
+		if apiPO.StpEdgeState == "" {
+			updated.StpEdgeState = types.StringNull()
+		} else {
+			updated.StpEdgeState = types.StringValue(apiPO.StpEdgeState)
+		}
+	}
+
+	// The guards above only resolve fields the user explicitly configured.
+	// Optional+Computed attributes left unset (e.g. flow_control_enabled,
+	// full_duplex, lldpmed_notify_enabled) plan as unknown and fall through
+	// every guard untouched, which the framework rejects as "unknown after
+	// apply". Resolve anything still unknown from the API response.
+	apiModel, modelDiags := apiPortOverrideToModel(apiPO)
+	diags.Append(modelDiags...)
+	if diags.HasError() {
+		return pm, diags
+	}
+	resolveUnknownPortOverrideAttrs(&updated, apiModel)
+
+	return updated, diags
+}
+
+func (r *deviceResource) reconcilePortOverrides(
+	ctx context.Context,
+	prior types.Set,
+	apiOverrides []unifi.DevicePortOverrides,
+) (types.Set, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	// Build a map from port index → API port override for fast lookup.
+	apiByIndex := make(map[int64]unifi.DevicePortOverrides, len(apiOverrides))
+	for _, po := range apiOverrides {
+		if po.PortIDX != nil {
+			apiByIndex[*po.PortIDX] = po
+		}
+	}
+
+	// Iterate over the user-configured (prior) port overrides and rebuild each
+	// one using values from the API response for the same port index.
+	var priorModels []portOverrideModel
+	diags.Append(prior.ElementsAs(ctx, &priorModels, false)...)
+	if diags.HasError() {
+		return prior, diags
+	}
+
+	elements := make([]attr.Value, 0, len(priorModels))
+	for _, pm := range priorModels {
+		idx := pm.Index.ValueInt64()
+		apiPO, found := apiByIndex[idx]
+		if !found {
+			// Port not in API response — keep prior value unchanged.
+			objVal, objDiags := types.ObjectValueFrom(ctx, pm.AttributeTypes(), pm)
+			diags.Append(objDiags...)
+			elements = append(elements, objVal)
+			continue
+		}
+
+		updated, elemDiags := reconcilePortOverride(pm, apiPO)
+		diags.Append(elemDiags...)
+		if diags.HasError() {
+			return prior, diags
+		}
+
+		objVal, objDiags := types.ObjectValueFrom(ctx, updated.AttributeTypes(), updated)
+		diags.Append(objDiags...)
+		elements = append(elements, objVal)
+	}
+
+	if diags.HasError() {
+		return prior, diags
+	}
+
+	setValue, setDiags := types.SetValue(
+		types.ObjectType{AttrTypes: portOverrideAttrTypes()},
+		elements,
+	)
+	diags.Append(setDiags...)
+	if diags.HasError() {
+		return prior, diags
+	}
+	return setValue, diags
+}
+
+// resolveUnknownPortOverrideAttrs fills any attribute in dst that is still
+// unknown with the corresponding value from src. An unknown attribute means
+// it was Optional+Computed and left out of config, so it plans as unknown and
+// is neither "configured" nor "absent" from the guards' point of view — it
+// needs its own resolution rather than a share of either branch.
+//
+// Nested feature-group objects (dot1x, stormctrl, …) are resolved attribute by
+// attribute: a wholly unknown object takes the API object, while a declared
+// object only has its unknown sub-attributes filled in.
+func resolveUnknownPortOverrideAttrs(dst *portOverrideModel, src portOverrideModel) {
+	ctx := context.Background()
+	dstVal := reflect.ValueOf(dst).Elem()
+	srcVal := reflect.ValueOf(src)
+	for i := 0; i < dstVal.NumField(); i++ {
+		field := dstVal.Field(i)
+		if obj, ok := field.Interface().(types.Object); ok {
+			if srcObj, ok := srcVal.Field(i).Interface().(types.Object); ok {
+				field.Set(reflect.ValueOf(util.ResolveUnknownObject(ctx, obj, srcObj)))
+			}
+			continue
+		}
+		if v, ok := field.Interface().(attr.Value); ok && v.IsUnknown() {
+			field.Set(srcVal.Field(i))
+		}
+	}
+}
+
 func (r *deviceResource) portOverridesToFramework(
 	ctx context.Context,
 	pos []unifi.DevicePortOverrides,
@@ -1739,185 +3018,10 @@ func (r *deviceResource) portOverridesToFramework(
 
 	elements := make([]attr.Value, 0, len(pos))
 	for _, po := range pos {
-		model := portOverrideModel{
-			Index: types.Int64PointerValue(po.PortIDX),
-		}
-
-		// String attributes
-		if po.Name == "" {
-			model.Name = types.StringNull()
-		} else {
-			model.Name = types.StringValue(po.Name)
-		}
-
-		if po.PortProfileID == "" {
-			model.PortProfileID = types.StringNull()
-		} else {
-			model.PortProfileID = types.StringValue(po.PortProfileID)
-		}
-
-		if po.OpMode == "" {
-			model.OpMode = types.StringValue("switch")
-		} else {
-			model.OpMode = types.StringValue(po.OpMode)
-		}
-
-		if po.PoeMode == "" {
-			model.PoeMode = types.StringNull()
-		} else {
-			model.PoeMode = types.StringValue(po.PoeMode)
-		}
-
-		if po.Dot1XCtrl == "" {
-			model.Dot1XCtrl = types.StringNull()
-		} else {
-			model.Dot1XCtrl = types.StringValue(po.Dot1XCtrl)
-		}
-
-		if po.FecMode == "" {
-			model.FecMode = types.StringNull()
-		} else {
-			model.FecMode = types.StringValue(po.FecMode)
-		}
-
-		if po.Forward == "" {
-			model.Forward = types.StringNull()
-		} else {
-			model.Forward = types.StringValue(po.Forward)
-		}
-
-		if po.NATiveNetworkID == "" {
-			model.NativeNetworkID = types.StringNull()
-		} else {
-			model.NativeNetworkID = types.StringValue(po.NATiveNetworkID)
-		}
-
-		if po.SettingPreference == "" {
-			model.SettingPreference = types.StringNull()
-		} else {
-			model.SettingPreference = types.StringValue(po.SettingPreference)
-		}
-
-		if po.StormctrlType == "" {
-			model.StormctrlType = types.StringNull()
-		} else {
-			model.StormctrlType = types.StringValue(po.StormctrlType)
-		}
-
-		if po.TaggedVLANMgmt == "" {
-			model.TaggedVLANMgmt = types.StringNull()
-		} else {
-			model.TaggedVLANMgmt = types.StringValue(po.TaggedVLANMgmt)
-		}
-
-		if po.VoiceNetworkID == "" {
-			model.VoiceNetworkID = types.StringNull()
-		} else {
-			model.VoiceNetworkID = types.StringValue(po.VoiceNetworkID)
-		}
-
-		// Boolean attributes
-		model.Autoneg = types.BoolValue(po.Autoneg)
-		model.EgressRateLimitKbpsEnabled = types.BoolValue(po.EgressRateLimitKbpsEnabled)
-		model.FlowControlEnabled = types.BoolValue(po.FlowControlEnabled)
-		model.FullDuplex = types.BoolValue(po.FullDuplex)
-		model.Isolation = types.BoolValue(po.Isolation)
-		model.LldpmedEnabled = types.BoolValue(po.LldpmedEnabled)
-		model.LldpmedNotifyEnabled = types.BoolValue(po.LldpmedNotifyEnabled)
-		model.PortKeepaliveEnabled = types.BoolValue(po.PortKeepaliveEnabled)
-		model.PortSecurityEnabled = types.BoolValue(po.PortSecurityEnabled)
-		model.StormctrlBroadcastEnabled = types.BoolValue(po.StormctrlBroadcastastEnabled)
-		model.StormctrlMcastEnabled = types.BoolValue(po.StormctrlMcastEnabled)
-		model.StormctrlUcastEnabled = types.BoolValue(po.StormctrlUcastEnabled)
-		model.StpPortMode = types.BoolValue(po.StpPortMode)
-
-		// Int64 attributes
-		model.Dot1XIDleTimeout = types.Int64PointerValue(po.Dot1XIDleTimeout)
-
-		model.EgressRateLimitKbps = types.Int64PointerValue(po.EgressRateLimitKbps)
-
-		model.LagIdx = types.Int64PointerValue(po.LagIdx)
-
-		model.MirrorPortIDX = types.Int64PointerValue(po.MirrorPortIDX)
-
-		model.PriorityQueue1Level = types.Int64PointerValue(po.PriorityQueue1Level)
-
-		model.PriorityQueue2Level = types.Int64PointerValue(po.PriorityQueue2Level)
-		model.PriorityQueue3Level = types.Int64PointerValue(po.PriorityQueue3Level)
-		model.PriorityQueue4Level = types.Int64PointerValue(po.PriorityQueue4Level)
-		model.Speed = types.Int64PointerValue(po.Speed)
-
-		model.StormctrlBroadcastLevel = types.Int64PointerValue(po.StormctrlBroadcastastLevel)
-
-		model.StormctrlBroadcastRate = types.Int64PointerValue(po.StormctrlBroadcastastRate)
-
-		model.StormctrlMcastLevel = types.Int64PointerValue(po.StormctrlMcastLevel)
-
-		model.StormctrlMcastRate = types.Int64PointerValue(po.StormctrlMcastRate)
-
-		model.StormctrlUcastLevel = types.Int64PointerValue(po.StormctrlUcastLevel)
-
-		model.StormctrlUcastRate = types.Int64PointerValue(po.StormctrlUcastRate)
-
-		// List attributes
-		if len(po.AggregateMembers) == 0 {
-			model.AggregateMembers = types.ListNull(types.Int64Type)
-		} else {
-			aggrMemberValues := make([]attr.Value, 0, len(po.AggregateMembers))
-			for _, member := range po.AggregateMembers {
-				aggrMemberValues = append(aggrMemberValues, types.Int64Value(member))
-			}
-			listVal, listDiags := types.ListValue(types.Int64Type, aggrMemberValues)
-			diags.Append(listDiags...)
-			if diags.HasError() {
-				continue
-			}
-			model.AggregateMembers = listVal
-		}
-
-		if len(po.ExcludedNetworkIDs) == 0 {
-			model.ExcludedNetworkIDs = types.ListNull(types.StringType)
-		} else {
-			excludedValues := make([]attr.Value, 0, len(po.ExcludedNetworkIDs))
-			for _, id := range po.ExcludedNetworkIDs {
-				excludedValues = append(excludedValues, types.StringValue(id))
-			}
-			listVal, listDiags := types.ListValue(types.StringType, excludedValues)
-			diags.Append(listDiags...)
-			if diags.HasError() {
-				continue
-			}
-			model.ExcludedNetworkIDs = listVal
-		}
-
-		if len(po.MulticastRouterNetworkIDs) == 0 {
-			model.MulticastRouterNetworkIDs = types.ListNull(types.StringType)
-		} else {
-			multicastValues := make([]attr.Value, 0, len(po.MulticastRouterNetworkIDs))
-			for _, id := range po.MulticastRouterNetworkIDs {
-				multicastValues = append(multicastValues, types.StringValue(id))
-			}
-			listVal, listDiags := types.ListValue(types.StringType, multicastValues)
-			diags.Append(listDiags...)
-			if diags.HasError() {
-				continue
-			}
-			model.MulticastRouterNetworkIDs = listVal
-		}
-
-		if len(po.PortSecurityMACAddress) == 0 {
-			model.PortSecurityMACAddress = types.ListNull(types.StringType)
-		} else {
-			macValues := make([]attr.Value, 0, len(po.PortSecurityMACAddress))
-			for _, mac := range po.PortSecurityMACAddress {
-				macValues = append(macValues, types.StringValue(mac))
-			}
-			listVal, listDiags := types.ListValue(types.StringType, macValues)
-			diags.Append(listDiags...)
-			if diags.HasError() {
-				continue
-			}
-			model.PortSecurityMACAddress = listVal
+		model, modelDiags := apiPortOverrideToModel(po)
+		diags.Append(modelDiags...)
+		if diags.HasError() {
+			continue
 		}
 
 		// Convert model to object
@@ -1942,6 +3046,403 @@ func (r *deviceResource) portOverridesToFramework(
 	return setValue, diags
 }
 
+// apiPortOverrideToModel converts a single API port override into a fully
+// populated portOverrideModel. Every attribute is resolved to a concrete
+// value (never unknown), which makes this the source of truth for filling in
+// attributes the plan left unknown — see resolveUnknownPortOverrideAttrs.
+func apiPortOverrideToModel(po unifi.DevicePortOverrides) (portOverrideModel, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	ctx := context.Background()
+
+	model := portOverrideModel{
+		Index: types.Int64PointerValue(po.PortIDX),
+	}
+
+	// String attributes
+	if po.Name == "" {
+		model.Name = types.StringNull()
+	} else {
+		model.Name = types.StringValue(po.Name)
+	}
+
+	if po.PortProfileID == "" {
+		model.PortProfileID = types.StringNull()
+	} else {
+		model.PortProfileID = types.StringValue(po.PortProfileID)
+	}
+
+	if po.OpMode == "" {
+		model.OpMode = types.StringNull()
+	} else {
+		model.OpMode = types.StringValue(po.OpMode)
+	}
+
+	if po.PoeMode == "" {
+		model.PoeMode = types.StringNull()
+	} else {
+		model.PoeMode = types.StringValue(po.PoeMode)
+	}
+
+	if po.FecMode == "" {
+		model.FecMode = types.StringNull()
+	} else {
+		model.FecMode = types.StringValue(po.FecMode)
+	}
+
+	if po.Forward == "" {
+		model.Forward = types.StringNull()
+	} else {
+		model.Forward = types.StringValue(po.Forward)
+	}
+
+	if po.NATiveNetworkID == "" {
+		model.NativeNetworkID = types.StringNull()
+	} else {
+		model.NativeNetworkID = types.StringValue(po.NATiveNetworkID)
+	}
+
+	if po.SettingPreference == "" {
+		model.SettingPreference = types.StringNull()
+	} else {
+		model.SettingPreference = types.StringValue(po.SettingPreference)
+	}
+
+	if po.TaggedVLANMgmt == "" {
+		model.TaggedVLANMgmt = types.StringNull()
+	} else {
+		model.TaggedVLANMgmt = types.StringValue(po.TaggedVLANMgmt)
+	}
+
+	if po.VoiceNetworkID == "" {
+		model.VoiceNetworkID = types.StringNull()
+	} else {
+		model.VoiceNetworkID = types.StringValue(po.VoiceNetworkID)
+	}
+
+	if po.StpEdgeState == "" {
+		model.StpEdgeState = types.StringNull()
+	} else {
+		model.StpEdgeState = types.StringValue(po.StpEdgeState)
+	}
+
+	// Boolean attributes
+	model.Autoneg = types.BoolPointerValue(po.Autoneg)
+	model.FlowControlEnabled = types.BoolPointerValue(po.FlowControlEnabled)
+	model.FullDuplex = types.BoolPointerValue(po.FullDuplex)
+	model.Isolation = types.BoolPointerValue(po.Isolation)
+	model.PortKeepaliveEnabled = types.BoolPointerValue(po.PortKeepaliveEnabled)
+	model.StpPortMode = types.BoolPointerValue(po.StpPortMode)
+
+	// Nested feature groups
+	var d diag.Diagnostics
+	model.Dot1X, d = portDot1xObject(ctx, po.Dot1XCtrl, po.Dot1XIDleTimeout)
+	diags.Append(d...)
+	model.EgressRateLimit, d = portEgressRateLimitObject(
+		ctx, po.EgressRateLimitKbpsEnabled, po.EgressRateLimitKbps)
+	diags.Append(d...)
+	model.Lldpmed, d = portLldpmedObject(ctx, po.LldpmedEnabled, po.LldpmedNotifyEnabled)
+	diags.Append(d...)
+	model.Stormctrl, d = portStormctrlObject(ctx, portStormctrlAPI{
+		Type:         po.StormctrlType,
+		BcastEnabled: po.StormctrlBroadcastastEnabled,
+		BcastLevel:   po.StormctrlBroadcastastLevel,
+		BcastRate:    po.StormctrlBroadcastastRate,
+		McastEnabled: po.StormctrlMcastEnabled,
+		McastLevel:   po.StormctrlMcastLevel,
+		McastRate:    po.StormctrlMcastRate,
+		UcastEnabled: po.StormctrlUcastEnabled,
+		UcastLevel:   po.StormctrlUcastLevel,
+		UcastRate:    po.StormctrlUcastRate,
+	})
+	diags.Append(d...)
+	if diags.HasError() {
+		return model, diags
+	}
+
+	// Int64 attributes
+	model.MirrorPortIDX = types.Int64PointerValue(po.MirrorPortIDX)
+
+	model.PriorityQueue1Level = types.Int64PointerValue(po.PriorityQueue1Level)
+
+	model.PriorityQueue2Level = types.Int64PointerValue(po.PriorityQueue2Level)
+	model.PriorityQueue3Level = types.Int64PointerValue(po.PriorityQueue3Level)
+	model.PriorityQueue4Level = types.Int64PointerValue(po.PriorityQueue4Level)
+	model.Speed = types.Int64PointerValue(po.Speed)
+
+	// List attributes
+	if len(po.AggregateMembers) == 0 {
+		model.AggregateMembers = types.ListNull(types.Int64Type)
+	} else {
+		aggrMemberValues := make([]attr.Value, 0, len(po.AggregateMembers))
+		for _, member := range po.AggregateMembers {
+			aggrMemberValues = append(aggrMemberValues, types.Int64Value(member))
+		}
+		listVal, listDiags := types.ListValue(types.Int64Type, aggrMemberValues)
+		diags.Append(listDiags...)
+		if diags.HasError() {
+			return model, diags
+		}
+		model.AggregateMembers = listVal
+	}
+
+	if len(po.ExcludedNetworkIDs) == 0 {
+		model.ExcludedNetworkIDs = types.SetNull(types.StringType)
+	} else {
+		sortedExcluded := make([]string, len(po.ExcludedNetworkIDs))
+		copy(sortedExcluded, po.ExcludedNetworkIDs)
+		sort.Strings(sortedExcluded)
+		excludedValues := make([]attr.Value, 0, len(sortedExcluded))
+		for _, id := range sortedExcluded {
+			excludedValues = append(excludedValues, types.StringValue(id))
+		}
+		setVal, setDiags := types.SetValue(types.StringType, excludedValues)
+		diags.Append(setDiags...)
+		if diags.HasError() {
+			return model, diags
+		}
+		model.ExcludedNetworkIDs = setVal
+	}
+
+	// #235: this must always be a typed value. Leaving it as the zero-value
+	// types.Set makes ObjectValueFrom fail with a "!!! MISSING TYPE !!!" Value
+	// Conversion Error. An empty/absent API value maps to a typed null.
+	taggedSet, taggedDiags := stringSetFromAPI(po.TaggedNetworkIDs, true)
+	diags.Append(taggedDiags...)
+	if diags.HasError() {
+		return model, diags
+	}
+	model.TaggedNetworkIDs = taggedSet
+
+	if len(po.MulticastRouterNetworkIDs) == 0 {
+		model.MulticastRouterNetworkIDs = types.SetNull(types.StringType)
+	} else {
+		multicastValues := make([]attr.Value, 0, len(po.MulticastRouterNetworkIDs))
+		for _, id := range po.MulticastRouterNetworkIDs {
+			multicastValues = append(multicastValues, types.StringValue(id))
+		}
+		setVal, setDiags := types.SetValue(types.StringType, multicastValues)
+		diags.Append(setDiags...)
+		if diags.HasError() {
+			return model, diags
+		}
+		model.MulticastRouterNetworkIDs = setVal
+	}
+
+	macList := types.ListNull(types.StringType)
+	if len(po.PortSecurityMACAddress) > 0 {
+		macValues := make([]attr.Value, 0, len(po.PortSecurityMACAddress))
+		for _, mac := range po.PortSecurityMACAddress {
+			macValues = append(macValues, types.StringValue(mac))
+		}
+		listVal, listDiags := types.ListValue(types.StringType, macValues)
+		diags.Append(listDiags...)
+		if diags.HasError() {
+			return model, diags
+		}
+		macList = listVal
+	}
+	model.PortSecurity, d = types.ObjectValueFrom(ctx, devicePortSecurityAttrTypes(),
+		devicePortSecurityModel{
+			Enabled:    types.BoolPointerValue(po.PortSecurityEnabled),
+			MACAddress: macList,
+		})
+	diags.Append(d...)
+
+	return model, diags
+}
+
+// portOverrideModelToAPI converts one declared port override into its API
+// form. Unset optional attributes stay at their zero value so omitempty drops
+// them from the request; carryUnwritableFields then keeps the controller's
+// value for the fields that must survive a write.
+func portOverrideModelToAPI(
+	ctx context.Context,
+	model portOverrideModel,
+) (unifi.DevicePortOverrides, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	po := unifi.DevicePortOverrides{
+		PortIDX: model.Index.ValueInt64Pointer(),
+	}
+
+	// String attributes
+	if !model.Name.IsNull() {
+		po.Name = model.Name.ValueString()
+	}
+	if !model.PortProfileID.IsNull() {
+		po.PortProfileID = model.PortProfileID.ValueString()
+	}
+	// op_mode is only written when the port runs in a non-default mode
+	// (aggregate/mirror). Sending op_mode on a PUT for gateway devices
+	// (UDM) is rejected — see #213 — but those ports never use
+	// aggregate/mirror, so they stay at the "switch" default and we skip
+	// it. Writing it for the non-default cases is required to form an
+	// SFP+ link aggregation (#177), which otherwise never engages because
+	// aggregate_members is sent without ever switching op_mode.
+	if !model.OpMode.IsNull() && !model.OpMode.IsUnknown() &&
+		model.OpMode.ValueString() != "" && model.OpMode.ValueString() != "switch" {
+		po.OpMode = model.OpMode.ValueString()
+	}
+	if !model.PoeMode.IsNull() {
+		po.PoeMode = model.PoeMode.ValueString()
+	}
+	if !model.FecMode.IsNull() {
+		po.FecMode = model.FecMode.ValueString()
+	}
+	if !model.Forward.IsNull() {
+		po.Forward = model.Forward.ValueString()
+	}
+	if !model.NativeNetworkID.IsNull() {
+		po.NATiveNetworkID = model.NativeNetworkID.ValueString()
+	}
+	if !model.SettingPreference.IsNull() {
+		po.SettingPreference = model.SettingPreference.ValueString()
+	}
+	if !model.TaggedVLANMgmt.IsNull() {
+		po.TaggedVLANMgmt = model.TaggedVLANMgmt.ValueString()
+	}
+	if !model.VoiceNetworkID.IsNull() {
+		po.VoiceNetworkID = model.VoiceNetworkID.ValueString()
+	}
+	if !model.StpEdgeState.IsNull() {
+		po.StpEdgeState = model.StpEdgeState.ValueString()
+	}
+
+	// Boolean attributes
+	po.Autoneg = util.ConvertBoolToAPIValue(model.Autoneg)
+	po.FlowControlEnabled = util.ConvertBoolToAPIValue(model.FlowControlEnabled)
+	po.FullDuplex = util.ConvertBoolToAPIValue(model.FullDuplex)
+	po.Isolation = util.ConvertBoolToAPIValue(model.Isolation)
+	po.PortKeepaliveEnabled = util.ConvertBoolToAPIValue(model.PortKeepaliveEnabled)
+	po.StpPortMode = util.ConvertBoolToAPIValue(model.StpPortMode)
+
+	// Nested feature groups. A null/unknown group contributes nothing,
+	// exactly as its flat attributes did when unset.
+	if dot1x, ok, d := util.ObjectAs[portDot1xModel](ctx, model.Dot1X); ok {
+		if !dot1x.Ctrl.IsNull() {
+			po.Dot1XCtrl = dot1x.Ctrl.ValueString()
+		}
+		if !dot1x.IdleTimeout.IsNull() {
+			po.Dot1XIDleTimeout = util.DurationUnitsPtr(dot1x.IdleTimeout, time.Second)
+		}
+	} else {
+		diags.Append(d...)
+	}
+	if erl, ok, d := util.ObjectAs[portEgressRateLimitModel](
+		ctx,
+		model.EgressRateLimit,
+	); ok {
+		po.EgressRateLimitKbpsEnabled = util.ConvertBoolToAPIValue(erl.Enabled)
+		if !erl.Kbps.IsNull() {
+			po.EgressRateLimitKbps = erl.Kbps.ValueInt64Pointer()
+		}
+	} else {
+		diags.Append(d...)
+	}
+	if lldp, ok, d := util.ObjectAs[portLldpmedModel](ctx, model.Lldpmed); ok {
+		po.LldpmedEnabled = util.ConvertBoolToAPIValue(lldp.Enabled)
+		po.LldpmedNotifyEnabled = util.ConvertBoolToAPIValue(lldp.NotifyEnabled)
+	} else {
+		diags.Append(d...)
+	}
+	if ps, ok, d := util.ObjectAs[devicePortSecurityModel](ctx, model.PortSecurity); ok {
+		po.PortSecurityEnabled = util.ConvertBoolToAPIValue(ps.Enabled)
+		if !ps.MACAddress.IsNull() && !ps.MACAddress.IsUnknown() {
+			var macAddresses []string
+			diags.Append(ps.MACAddress.ElementsAs(ctx, &macAddresses, true)...)
+			if diags.HasError() {
+				return po, diags
+			}
+			po.PortSecurityMACAddress = macAddresses
+		}
+	} else {
+		diags.Append(d...)
+	}
+	sc, d := portStormctrlFromObject(ctx, model.Stormctrl)
+	diags.Append(d...)
+	po.StormctrlType = sc.Type
+	po.StormctrlBroadcastastEnabled = sc.BcastEnabled
+	po.StormctrlBroadcastastLevel = sc.BcastLevel
+	po.StormctrlBroadcastastRate = sc.BcastRate
+	po.StormctrlMcastEnabled = sc.McastEnabled
+	po.StormctrlMcastLevel = sc.McastLevel
+	po.StormctrlMcastRate = sc.McastRate
+	po.StormctrlUcastEnabled = sc.UcastEnabled
+	po.StormctrlUcastLevel = sc.UcastLevel
+	po.StormctrlUcastRate = sc.UcastRate
+	if diags.HasError() {
+		return po, diags
+	}
+
+	// Int64 attributes
+	if !model.MirrorPortIDX.IsNull() {
+		po.MirrorPortIDX = model.MirrorPortIDX.ValueInt64Pointer()
+	}
+	if !model.PriorityQueue1Level.IsNull() {
+		po.PriorityQueue1Level = model.PriorityQueue1Level.ValueInt64Pointer()
+	}
+	if !model.PriorityQueue2Level.IsNull() {
+		po.PriorityQueue2Level = model.PriorityQueue2Level.ValueInt64Pointer()
+	}
+	if !model.PriorityQueue3Level.IsNull() {
+		po.PriorityQueue3Level = model.PriorityQueue3Level.ValueInt64Pointer()
+	}
+	if !model.PriorityQueue4Level.IsNull() {
+		po.PriorityQueue4Level = model.PriorityQueue4Level.ValueInt64Pointer()
+	}
+	if !model.Speed.IsNull() {
+		po.Speed = model.Speed.ValueInt64Pointer()
+	}
+
+	// List attributes
+	if !model.AggregateMembers.IsNull() {
+		var aggrMembers []int64
+		diags.Append(model.AggregateMembers.ElementsAs(ctx, &aggrMembers, true)...)
+		if diags.HasError() {
+			return po, diags
+		}
+		po.AggregateMembers = aggrMembers
+	}
+
+	if !model.ExcludedNetworkIDs.IsNull() {
+		var excludedIDs []string
+		diags.Append(model.ExcludedNetworkIDs.ElementsAs(ctx, &excludedIDs, true)...)
+		if diags.HasError() {
+			return po, diags
+		}
+		po.ExcludedNetworkIDs = excludedIDs
+	}
+
+	if !model.TaggedNetworkIDs.IsNull() && !model.TaggedNetworkIDs.IsUnknown() {
+		// Always a non-nil slice when configured, even if empty: a nil
+		// slice means "not managed" to carryUnwritableFields, which
+		// would then keep the controller's tagged networks. An empty
+		// slice is dropped by omitempty, which clears them.
+		taggedIDs := []string{}
+		diags.Append(model.TaggedNetworkIDs.ElementsAs(ctx, &taggedIDs, false)...)
+		if diags.HasError() {
+			return po, diags
+		}
+		if taggedIDs == nil {
+			taggedIDs = []string{}
+		}
+		po.TaggedNetworkIDs = taggedIDs
+	}
+
+	if !model.MulticastRouterNetworkIDs.IsNull() {
+		var multicastIDs []string
+		diags.Append(
+			model.MulticastRouterNetworkIDs.ElementsAs(ctx, &multicastIDs, true)...,
+		)
+		if diags.HasError() {
+			return po, diags
+		}
+		po.MulticastRouterNetworkIDs = multicastIDs
+	}
+
+	return po, diags
+}
+
 func (r *deviceResource) frameworkToPortOverrides(
 	ctx context.Context,
 	portOverrideSet types.Set,
@@ -1959,158 +3460,12 @@ func (r *deviceResource) frameworkToPortOverrides(
 				return nil, diags
 			}
 
-			idx := model.Index.ValueInt64()
-			po := unifi.DevicePortOverrides{
-				PortIDX: model.Index.ValueInt64Pointer(),
+			po, poDiags := portOverrideModelToAPI(ctx, model)
+			diags.Append(poDiags...)
+			if diags.HasError() {
+				return nil, diags
 			}
-
-			// String attributes
-			if !model.Name.IsNull() {
-				po.Name = model.Name.ValueString()
-			}
-			if !model.PortProfileID.IsNull() {
-				po.PortProfileID = model.PortProfileID.ValueString()
-			}
-			if !model.OpMode.IsNull() {
-				po.OpMode = model.OpMode.ValueString()
-			}
-			if !model.PoeMode.IsNull() {
-				po.PoeMode = model.PoeMode.ValueString()
-			}
-			if !model.Dot1XCtrl.IsNull() {
-				po.Dot1XCtrl = model.Dot1XCtrl.ValueString()
-			}
-			if !model.FecMode.IsNull() {
-				po.FecMode = model.FecMode.ValueString()
-			}
-			if !model.Forward.IsNull() {
-				po.Forward = model.Forward.ValueString()
-			}
-			if !model.NativeNetworkID.IsNull() {
-				po.NATiveNetworkID = model.NativeNetworkID.ValueString()
-			}
-			if !model.SettingPreference.IsNull() {
-				po.SettingPreference = model.SettingPreference.ValueString()
-			}
-			if !model.StormctrlType.IsNull() {
-				po.StormctrlType = model.StormctrlType.ValueString()
-			}
-			if !model.TaggedVLANMgmt.IsNull() {
-				po.TaggedVLANMgmt = model.TaggedVLANMgmt.ValueString()
-			}
-			if !model.VoiceNetworkID.IsNull() {
-				po.VoiceNetworkID = model.VoiceNetworkID.ValueString()
-			}
-
-			// Boolean attributes
-			po.Autoneg = model.Autoneg.ValueBool()
-			po.EgressRateLimitKbpsEnabled = model.EgressRateLimitKbpsEnabled.ValueBool()
-			po.FlowControlEnabled = model.FlowControlEnabled.ValueBool()
-			po.FullDuplex = model.FullDuplex.ValueBool()
-			po.Isolation = model.Isolation.ValueBool()
-			po.LldpmedEnabled = model.LldpmedEnabled.ValueBool()
-			po.LldpmedNotifyEnabled = model.LldpmedNotifyEnabled.ValueBool()
-			po.PortKeepaliveEnabled = model.PortKeepaliveEnabled.ValueBool()
-			po.PortSecurityEnabled = model.PortSecurityEnabled.ValueBool()
-			po.StormctrlBroadcastastEnabled = model.StormctrlBroadcastEnabled.ValueBool()
-			po.StormctrlMcastEnabled = model.StormctrlMcastEnabled.ValueBool()
-			po.StormctrlUcastEnabled = model.StormctrlUcastEnabled.ValueBool()
-			po.StpPortMode = model.StpPortMode.ValueBool()
-
-			// Int64 attributes
-			if !model.Dot1XIDleTimeout.IsNull() {
-				po.Dot1XIDleTimeout = model.Dot1XIDleTimeout.ValueInt64Pointer()
-			}
-			if !model.EgressRateLimitKbps.IsNull() {
-				po.EgressRateLimitKbps = model.EgressRateLimitKbps.ValueInt64Pointer()
-			}
-			if !model.LagIdx.IsNull() {
-				po.LagIdx = model.LagIdx.ValueInt64Pointer()
-			}
-			if !model.MirrorPortIDX.IsNull() {
-				po.MirrorPortIDX = model.MirrorPortIDX.ValueInt64Pointer()
-			}
-			if !model.PriorityQueue1Level.IsNull() {
-				po.PriorityQueue1Level = model.PriorityQueue1Level.ValueInt64Pointer()
-			}
-			if !model.PriorityQueue2Level.IsNull() {
-				po.PriorityQueue2Level = model.PriorityQueue2Level.ValueInt64Pointer()
-			}
-			if !model.PriorityQueue3Level.IsNull() {
-				po.PriorityQueue3Level = model.PriorityQueue3Level.ValueInt64Pointer()
-			}
-			if !model.PriorityQueue4Level.IsNull() {
-				po.PriorityQueue4Level = model.PriorityQueue4Level.ValueInt64Pointer()
-			}
-			if !model.Speed.IsNull() {
-				po.Speed = model.Speed.ValueInt64Pointer()
-			}
-			if !model.StormctrlBroadcastLevel.IsNull() {
-				po.StormctrlBroadcastastLevel = model.StormctrlBroadcastLevel.ValueInt64Pointer()
-			}
-			if !model.StormctrlBroadcastRate.IsNull() {
-				po.StormctrlBroadcastastRate = model.StormctrlBroadcastRate.ValueInt64Pointer()
-			}
-			if !model.StormctrlMcastLevel.IsNull() {
-				po.StormctrlMcastLevel = model.StormctrlMcastLevel.ValueInt64Pointer()
-			}
-			if !model.StormctrlMcastRate.IsNull() {
-				po.StormctrlMcastRate = model.StormctrlMcastRate.ValueInt64Pointer()
-			}
-			if !model.StormctrlUcastLevel.IsNull() {
-				po.StormctrlUcastLevel = model.StormctrlUcastLevel.ValueInt64Pointer()
-			}
-			if !model.StormctrlUcastRate.IsNull() {
-				po.StormctrlUcastRate = model.StormctrlUcastRate.ValueInt64Pointer()
-			}
-
-			// List attributes
-			if !model.AggregateMembers.IsNull() {
-				var aggrMembers []int64
-				diags.Append(model.AggregateMembers.ElementsAs(ctx, &aggrMembers, true)...)
-				if diags.HasError() {
-					return nil, diags
-				}
-				po.AggregateMembers = aggrMembers
-			}
-
-			if !model.ExcludedNetworkIDs.IsNull() {
-				var excludedIDs []string
-				diags.Append(model.ExcludedNetworkIDs.ElementsAs(ctx, &excludedIDs, true)...)
-				if diags.HasError() {
-					return nil, diags
-				}
-				po.ExcludedNetworkIDs = excludedIDs
-			}
-
-			if !model.MulticastRouterNetworkIDs.IsNull() {
-				var multicastIDs []string
-				diags.Append(
-					model.MulticastRouterNetworkIDs.ElementsAs(ctx, &multicastIDs, true)...)
-				if diags.HasError() {
-					return nil, diags
-				}
-				po.MulticastRouterNetworkIDs = multicastIDs
-			}
-
-			if !model.PortSecurityMACAddress.IsNull() {
-				var macAddresses []string
-				diags.Append(model.PortSecurityMACAddress.ElementsAs(ctx, &macAddresses, true)...)
-				if diags.HasError() {
-					return nil, diags
-				}
-				po.PortSecurityMACAddress = macAddresses
-			}
-
-			// SetNestedBlock has a known framework bug where Computed attributes
-			// can get default values instead of config values when set element
-			// hashes change. Ensure op_mode is consistent with aggregate_members
-			// to prevent silently destroying LAG groups.
-			if len(po.AggregateMembers) > 0 && po.OpMode != "aggregate" {
-				po.OpMode = "aggregate"
-			}
-
-			overrideMap[idx] = po
+			overrideMap[model.Index.ValueInt64()] = po
 		} else {
 			diags.Append(
 				diag.NewErrorDiagnostic(
@@ -2129,8 +3484,12 @@ func (r *deviceResource) frameworkToPortOverrides(
 	return pos, diags
 }
 
-func (r *deviceResource) waitForDeviceState(
+// waitForDeviceState polls the device at mac until it reaches targetState or
+// the timeout elapses. It is package level because unifi_device_port and the
+// port action share it with unifi_device.
+func waitForDeviceState(
 	ctx context.Context,
+	client *Client,
 	site, mac string,
 	targetState unifi.DeviceState,
 	pendingStates []unifi.DeviceState,
@@ -2148,7 +3507,7 @@ func (r *deviceResource) waitForDeviceState(
 		Pending: pending,
 		Target:  []string{targetState.String()},
 		Refresh: func() (any, string, error) {
-			device, err := r.client.GetDeviceByMAC(ctx, site, mac)
+			device, err := client.GetDeviceByMAC(ctx, site, mac)
 
 			if _, ok := err.(*unifi.NotFoundError); ok {
 				err = nil
@@ -2184,6 +3543,16 @@ func (r *deviceResource) waitForDeviceState(
 	return nil, err
 }
 
+// deviceLockKey is the key of a device's lock (Client.lockDevice): the cleaned
+// MAC when known, which is how unifi_device_port and the port action key it,
+// and the controller ID otherwise.
+func deviceLockKey(mac, id string) string {
+	if mac != "" {
+		return cleanMAC(mac)
+	}
+	return id
+}
+
 // cleanMAC normalizes MAC address format.
 func cleanMAC(mac string) string {
 	mac = strings.ReplaceAll(mac, "-", ":")
@@ -2194,51 +3563,43 @@ func cleanMAC(mac string) string {
 // portOverrideAttrTypes returns the attribute types for port override objects.
 func portOverrideAttrTypes() map[string]attr.Type {
 	return map[string]attr.Type{
-		"index":                            types.Int64Type,
-		"name":                             types.StringType,
-		"port_profile_id":                  types.StringType,
-		"op_mode":                          types.StringType,
-		"poe_mode":                         types.StringType,
-		"aggregate_members":                types.ListType{ElemType: types.Int64Type},
-		"autoneg":                          types.BoolType,
-		"dot1x_ctrl":                       types.StringType,
-		"dot1x_idle_timeout":               types.Int64Type,
-		"egress_rate_limit_kbps":           types.Int64Type,
-		"egress_rate_limit_kbps_enabled":   types.BoolType,
-		"excluded_networkconf_ids":         types.ListType{ElemType: types.StringType},
+		"index":             types.Int64Type,
+		"name":              types.StringType,
+		"port_profile_id":   types.StringType,
+		"op_mode":           types.StringType,
+		"poe_mode":          types.StringType,
+		"aggregate_members": types.ListType{ElemType: types.Int64Type},
+		"autoneg":           types.BoolType,
+		"dot1x":             types.ObjectType{AttrTypes: portDot1xAttrTypes()},
+		"egress_rate_limit": types.ObjectType{
+			AttrTypes: portEgressRateLimitAttrTypes(),
+		},
+		"excluded_networkconf_ids":         types.SetType{ElemType: types.StringType},
 		"fec_mode":                         types.StringType,
 		"flow_control_enabled":             types.BoolType,
 		"forward":                          types.StringType,
 		"full_duplex":                      types.BoolType,
 		"isolation":                        types.BoolType,
-		"lag_idx":                          types.Int64Type,
-		"lldpmed_enabled":                  types.BoolType,
-		"lldpmed_notify_enabled":           types.BoolType,
+		"lldpmed":                          types.ObjectType{AttrTypes: portLldpmedAttrTypes()},
 		"mirror_port_idx":                  types.Int64Type,
-		"multicast_router_networkconf_ids": types.ListType{ElemType: types.StringType},
+		"multicast_router_networkconf_ids": types.SetType{ElemType: types.StringType},
 		"native_networkconf_id":            types.StringType,
 		"port_keepalive_enabled":           types.BoolType,
-		"port_security_enabled":            types.BoolType,
-		"port_security_mac_address":        types.ListType{ElemType: types.StringType},
-		"priority_queue1_level":            types.Int64Type,
-		"priority_queue2_level":            types.Int64Type,
-		"priority_queue3_level":            types.Int64Type,
-		"priority_queue4_level":            types.Int64Type,
-		"setting_preference":               types.StringType,
-		"speed":                            types.Int64Type,
-		"stormctrl_bcast_enabled":          types.BoolType,
-		"stormctrl_bcast_level":            types.Int64Type,
-		"stormctrl_bcast_rate":             types.Int64Type,
-		"stormctrl_mcast_enabled":          types.BoolType,
-		"stormctrl_mcast_level":            types.Int64Type,
-		"stormctrl_mcast_rate":             types.Int64Type,
-		"stormctrl_type":                   types.StringType,
-		"stormctrl_ucast_enabled":          types.BoolType,
-		"stormctrl_ucast_level":            types.Int64Type,
-		"stormctrl_ucast_rate":             types.Int64Type,
-		"stp_port_mode":                    types.BoolType,
-		"tagged_vlan_mgmt":                 types.StringType,
-		"voice_networkconf_id":             types.StringType,
+		"port_security": types.ObjectType{
+			AttrTypes: devicePortSecurityAttrTypes(),
+		},
+		"priority_queue1_level":  types.Int64Type,
+		"priority_queue2_level":  types.Int64Type,
+		"priority_queue3_level":  types.Int64Type,
+		"priority_queue4_level":  types.Int64Type,
+		"setting_preference":     types.StringType,
+		"speed":                  types.Int64Type,
+		"stormctrl":              types.ObjectType{AttrTypes: portStormctrlAttrTypes()},
+		"stp_edge_state":         types.StringType,
+		"stp_port_mode":          types.BoolType,
+		"tagged_networkconf_ids": types.SetType{ElemType: types.StringType},
+		"tagged_vlan_mgmt":       types.StringType,
+		"voice_networkconf_id":   types.StringType,
 	}
 }
 
@@ -2350,17 +3711,21 @@ func (r *deviceResource) radioTableToFramework(
 	elements := make([]attr.Value, 0, len(radios))
 	for _, radio := range radios {
 		model := radioTableModel{
-			Radio:                  stringOrNull(radio.Radio),
-			Channel:                stringOrNull(radio.Channel),
-			Ht:                     types.Int64PointerValue(radio.Ht),
-			TxPower:                stringOrNull(radio.TxPower),
-			TxPowerMode:            stringOrNull(radio.TxPowerMode),
-			MinRssiEnabled:         types.BoolValue(radio.MinRssiEnabled),
-			MinRssi:                types.Int64PointerValue(radio.MinRssi),
-			AntennaGain:            types.Int64PointerValue(radio.AntennaGain),
-			AntennaID:              types.Int64PointerValue(radio.AntennaID),
-			AssistedRoamingEnabled: types.BoolValue(radio.AssistedRoamingEnabled),
-			AssistedRoamingRssi:    types.Int64PointerValue(radio.AssistedRoamingRssi),
+			Radio:          stringOrNull(radio.Radio),
+			Channel:        stringOrNull(radio.Channel),
+			Ht:             types.Int64PointerValue(radio.Ht),
+			TxPower:        stringOrNull(radio.TxPower),
+			TxPowerMode:    stringOrNull(radio.TxPowerMode),
+			MinRssiEnabled: types.BoolValue(radio.MinRssiEnabled),
+			MinRssi:        types.Int64PointerValue(radio.MinRssi),
+			AntennaGain:    types.Int64PointerValue(radio.AntennaGain),
+			AntennaID:      types.Int64PointerValue(radio.AntennaID),
+			// Deprecated no-ops: UniFi removed 802.11k assisted roaming from the
+			// radio table (absent from the API and from the firmware's own
+			// field definitions as of Network 10.6), so there is nothing to
+			// report. Read restores the configured value from prior state.
+			AssistedRoamingEnabled: types.BoolNull(),
+			AssistedRoamingRssi:    types.Int64Null(),
 			Dfs:                    types.BoolValue(radio.Dfs),
 			HardNoiseFloorEnabled:  types.BoolValue(radio.HardNoiseFloorEnabled),
 			LoadbalanceEnabled:     types.BoolValue(radio.LoadbalanceEnabled),
@@ -2427,6 +3792,97 @@ func (r *deviceResource) outletOverridesToFramework(
 	return listVal, diags
 }
 
+// ledToFramework builds the `led` object from the API response. The controller
+// frequently does not echo LED overrides back, so an empty API value keeps the
+// known value already in prior (config/state); only unknowns resolve to null.
+func (r *deviceResource) ledToFramework(
+	ctx context.Context,
+	device *unifi.Device,
+	prior types.Object,
+) (types.Object, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	cur := deviceLedModel{
+		Override:   types.StringUnknown(),
+		Color:      types.StringUnknown(),
+		Brightness: types.Int64Unknown(),
+	}
+	if prior.IsNull() {
+		cur = deviceLedModel{
+			Override:   types.StringNull(),
+			Color:      types.StringNull(),
+			Brightness: types.Int64Null(),
+		}
+	} else if !prior.IsUnknown() {
+		diags.Append(prior.As(ctx, &cur, basetypes.ObjectAsOptions{})...)
+		if diags.HasError() {
+			return prior, diags
+		}
+	}
+
+	if device.LedOverride != "" {
+		cur.Override = types.StringValue(device.LedOverride)
+	} else if cur.Override.IsUnknown() {
+		cur.Override = types.StringNull()
+	}
+	if device.LedOverrideColor != "" {
+		cur.Color = types.StringValue(device.LedOverrideColor)
+	} else if cur.Color.IsUnknown() {
+		cur.Color = types.StringNull()
+	}
+	if device.LedOverrideColorBrightness != nil {
+		cur.Brightness = types.Int64PointerValue(device.LedOverrideColorBrightness)
+	} else if cur.Brightness.IsUnknown() {
+		cur.Brightness = types.Int64Null()
+	}
+
+	obj, d := types.ObjectValueFrom(ctx, deviceLedAttrTypes(), cur)
+	diags.Append(d...)
+	return obj, diags
+}
+
+// lcmToFramework builds the `lcm` object (with its nested `night_mode`) from
+// the API response.
+func (r *deviceResource) lcmToFramework(
+	ctx context.Context,
+	device *unifi.Device,
+) (types.Object, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	nightMode, d := types.ObjectValueFrom(ctx, deviceLcmNightModeAttrTypes(),
+		deviceLcmNightModeModel{
+			Begins: stringOrNull(device.LcmNightModeBegins),
+			Ends:   stringOrNull(device.LcmNightModeEnds),
+		})
+	diags.Append(d...)
+	if diags.HasError() {
+		return types.ObjectNull(deviceLcmAttrTypes()), diags
+	}
+	obj, d := types.ObjectValueFrom(ctx, deviceLcmAttrTypes(), deviceLcmModel{
+		Brightness:          types.Int64PointerValue(device.LcmBrightness),
+		BrightnessOverride:  types.BoolValue(device.LcmBrightnessOverride),
+		IdleTimeout:         util.DurationPtrValue(device.LcmIDleTimeout, time.Second),
+		IdleTimeoutOverride: types.BoolValue(device.LcmIDleTimeoutOverride),
+		NightMode:           nightMode,
+	})
+	diags.Append(d...)
+	return obj, diags
+}
+
+// etherlightingToFramework builds the `etherlighting` object from the API response.
+func (r *deviceResource) etherlightingToFramework(
+	ctx context.Context,
+	el *unifi.DeviceEtherLighting,
+) (types.Object, diag.Diagnostics) {
+	if el == nil {
+		return types.ObjectNull(deviceEtherlightingAttrTypes()), nil
+	}
+	return types.ObjectValueFrom(ctx, deviceEtherlightingAttrTypes(), deviceEtherlightingModel{
+		Mode:       stringOrNull(el.Mode),
+		Brightness: types.Int64PointerValue(el.Brightness),
+		Behavior:   stringOrNull(el.Behavior),
+		LedMode:    stringOrNull(el.LedMode),
+	})
+}
+
 // frameworkToConfigNetwork converts Framework types to API ConfigNetwork.
 func (r *deviceResource) frameworkToConfigNetwork(
 	ctx context.Context,
@@ -2458,7 +3914,310 @@ func (r *deviceResource) frameworkToConfigNetwork(
 	return cn, diags
 }
 
+// resolveUnknown keeps the planned value unless the practitioner left it
+// undeclared (Unknown), in which case the applied controller value is used.
+func resolveUnknown[T attr.Value](planned, applied T) T {
+	if planned.IsUnknown() {
+		return applied
+	}
+	return planned
+}
+
+// carryDeprecatedAssistedRoaming copies the deprecated assisted_roaming_*
+// leaves from prior state onto a freshly read radio_table, matching entries by
+// radio band. Controller v10 moved assisted roaming to the WLAN, so these are
+// config-only echoes until they are removed.
+func carryDeprecatedAssistedRoaming(
+	ctx context.Context,
+	prior, next types.List,
+) (types.List, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	if prior.IsNull() || prior.IsUnknown() || next.IsNull() || next.IsUnknown() {
+		return next, diags
+	}
+
+	var priorModels, nextModels []radioTableModel
+	diags.Append(prior.ElementsAs(ctx, &priorModels, false)...)
+	diags.Append(next.ElementsAs(ctx, &nextModels, false)...)
+	if diags.HasError() {
+		return next, diags
+	}
+
+	priorByRadio := make(map[string]radioTableModel, len(priorModels))
+	for _, p := range priorModels {
+		priorByRadio[p.Radio.ValueString()] = p
+	}
+	for i := range nextModels {
+		p, ok := priorByRadio[nextModels[i].Radio.ValueString()]
+		if !ok {
+			continue
+		}
+		nextModels[i].AssistedRoamingEnabled = p.AssistedRoamingEnabled
+		nextModels[i].AssistedRoamingRssi = p.AssistedRoamingRssi
+	}
+
+	out, d := types.ListValueFrom(ctx, next.ElementType(ctx), nextModels)
+	diags.Append(d...)
+	if diags.HasError() {
+		return next, diags
+	}
+	return out, diags
+}
+
+// reconcileRadioTableWithPlan resolves the post-apply radio_table state
+// against the planned value. setResourceData replaces the model's radio_table
+// with the controller's full, device-ordered table; when the practitioner
+// declared radio_table, Terraform's post-apply consistency check requires the
+// applied value to preserve every known planned element (count, order, and
+// declared sub-values), so a device that reports its radios in a different
+// order — or with more radios than were declared — would fail the apply.
+// Keep the planned list shape and resolve only the Unknown sub-attributes
+// (the ones the practitioner left undeclared) from the controller's entry for
+// the same radio band. The next Read converges state with the controller,
+// mirroring how port_override and the LED overrides are handled (#337, #427).
+func (r *deviceResource) reconcileRadioTableWithPlan(
+	ctx context.Context,
+	planned types.List,
+	actual types.List,
+) (types.List, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	if planned.IsNull() || planned.IsUnknown() {
+		return actual, diags
+	}
+
+	// Decode the controller's applied entries, indexed by radio band.
+	actualByRadio := map[string]radioTableModel{}
+	var actualModels []radioTableModel
+	if !actual.IsNull() && !actual.IsUnknown() {
+		for _, elem := range actual.Elements() {
+			obj, ok := elem.(types.Object)
+			if !ok {
+				continue
+			}
+			var m radioTableModel
+			diags.Append(obj.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+			if diags.HasError() {
+				return actual, diags
+			}
+			actualModels = append(actualModels, m)
+			if radio := m.Radio.ValueString(); radio != "" {
+				actualByRadio[radio] = m
+			}
+		}
+	}
+
+	plannedElements := planned.Elements()
+	elements := make([]attr.Value, 0, len(plannedElements))
+	for i, elem := range plannedElements {
+		obj, ok := elem.(types.Object)
+		if !ok {
+			continue
+		}
+		var p radioTableModel
+		diags.Append(obj.As(ctx, &p, basetypes.ObjectAsOptions{})...)
+		if diags.HasError() {
+			return actual, diags
+		}
+
+		// Prefer the applied entry for the same radio band; fall back to the
+		// same index. The zero radioTableModel is all-null, so a radio the
+		// controller did not report resolves its undeclared fields to null.
+		a, found := actualByRadio[p.Radio.ValueString()]
+		if !found && i < len(actualModels) {
+			a = actualModels[i]
+		}
+
+		resolved := radioTableModel{
+			Radio:          resolveUnknown(p.Radio, a.Radio),
+			Channel:        resolveUnknown(p.Channel, a.Channel),
+			Ht:             resolveUnknown(p.Ht, a.Ht),
+			TxPower:        resolveUnknown(p.TxPower, a.TxPower),
+			TxPowerMode:    resolveUnknown(p.TxPowerMode, a.TxPowerMode),
+			MinRssiEnabled: resolveUnknown(p.MinRssiEnabled, a.MinRssiEnabled),
+			MinRssi:        resolveUnknown(p.MinRssi, a.MinRssi),
+			AntennaGain:    resolveUnknown(p.AntennaGain, a.AntennaGain),
+			AntennaID:      resolveUnknown(p.AntennaID, a.AntennaID),
+			AssistedRoamingEnabled: resolveUnknown(
+				p.AssistedRoamingEnabled,
+				a.AssistedRoamingEnabled,
+			),
+			AssistedRoamingRssi: resolveUnknown(p.AssistedRoamingRssi, a.AssistedRoamingRssi),
+			Dfs:                 resolveUnknown(p.Dfs, a.Dfs),
+			HardNoiseFloorEnabled: resolveUnknown(
+				p.HardNoiseFloorEnabled,
+				a.HardNoiseFloorEnabled,
+			),
+			LoadbalanceEnabled: resolveUnknown(p.LoadbalanceEnabled, a.LoadbalanceEnabled),
+			Maxsta:             resolveUnknown(p.Maxsta, a.Maxsta),
+			Name:               resolveUnknown(p.Name, a.Name),
+			SensLevel:          resolveUnknown(p.SensLevel, a.SensLevel),
+			SensLevelEnabled:   resolveUnknown(p.SensLevelEnabled, a.SensLevelEnabled),
+			VwireEnabled:       resolveUnknown(p.VwireEnabled, a.VwireEnabled),
+		}
+
+		objVal, objDiags := types.ObjectValueFrom(ctx, radioTableAttrTypes(), resolved)
+		diags.Append(objDiags...)
+		if diags.HasError() {
+			return actual, diags
+		}
+		elements = append(elements, objVal)
+	}
+
+	listVal, listDiags := types.ListValue(
+		types.ObjectType{AttrTypes: radioTableAttrTypes()},
+		elements,
+	)
+	diags.Append(listDiags...)
+	if diags.HasError() {
+		return actual, diags
+	}
+	return listVal, diags
+}
+
+// int64PointerIfKnown returns the value pointer only for a KNOWN, non-null Int64.
+//
+// A radio_table entry declared with only some sub-fields (e.g. just
+// radio/channel/ht/tx_power_mode) leaves the remaining Optional+Computed
+// sub-attributes Unknown in the plan — not Null. Int64.ValueInt64Pointer()
+// only maps Null to nil; for Unknown it returns a pointer to the Go zero
+// value, so every undeclared numeric sub-field went out on the wire as a
+// literal 0 (`"antenna_gain":0,"min_rssi":0,…`), which controllers reject
+// with api.err.InvalidPayload (400) because 0 is not a legal value for any
+// of them (#427). Treat Unknown exactly like Null: leave the pointer nil so
+// `omitempty` keeps the field off the wire.
+func int64PointerIfKnown(v types.Int64) *int64 {
+	if v.IsNull() || v.IsUnknown() {
+		return nil
+	}
+	return v.ValueInt64Pointer()
+}
+
+// mergeRadioTableFromDevice fills radio_table fields the user left unset from
+// the device's current radio table (entries matched by radio band, falling
+// back to radio name). Two controller behaviors make this necessary (#427):
+//
+//   - every radio_table entry must carry the radio's `name` (wifi0/wifi1/…) —
+//     omitting it fails the whole PUT with api.err.MissingValue, key "radio" —
+//     and the name is hardware-assigned, so requiring it in configuration
+//     would be hostile;
+//   - hardware-derived fields (antenna_gain, antenna_id, ht, channel,
+//     tx_power_mode) are validated against the device, so echoing the
+//     device's own current values is always safe, while zero values are not.
+//
+// Only fields the user did NOT declare (nil pointer / empty string) are
+// filled; declared values always win. Fields absent from the device stay
+// unset and therefore off the wire — firmwares differ in which fields exist
+// (#427: min_rssi exists on 8.7.x but not 8.6.x). The gated RSSI-style
+// fields (min_rssi, sens_level, assisted_roaming_rssi, maxsta) are
+// deliberately never merged: sanitizeRadioForUpdate owns those (#378), and
+// re-adding them behind the user's back could reintroduce the exact
+// InvalidPayload this fixes.
+func mergeRadioTableFromDevice(target, current []unifi.DeviceRadioTable) {
+	findCurrent := func(radio, name string) *unifi.DeviceRadioTable {
+		for i := range current {
+			if radio != "" && current[i].Radio == radio {
+				return &current[i]
+			}
+			if radio == "" && name != "" && current[i].Name == name {
+				return &current[i]
+			}
+		}
+		return nil
+	}
+
+	for i := range target {
+		cur := findCurrent(target[i].Radio, target[i].Name)
+		if cur == nil {
+			continue
+		}
+		t := &target[i]
+		if t.Name == "" {
+			t.Name = cur.Name
+		}
+		if t.Channel == "" {
+			t.Channel = cur.Channel
+		}
+		if t.Ht == nil {
+			t.Ht = cur.Ht
+		}
+		if t.TxPowerMode == "" {
+			t.TxPowerMode = cur.TxPowerMode
+		}
+		if t.TxPower == "" {
+			t.TxPower = cur.TxPower
+		}
+		if t.AntennaGain == nil {
+			t.AntennaGain = cur.AntennaGain
+		}
+		if t.AntennaID == nil {
+			t.AntennaID = cur.AntennaID
+		}
+	}
+}
+
 // frameworkToRadioTable converts Framework types to API RadioTable.
+// sanitizeRadioForUpdate drops numeric radio fields whose zero/out-of-range values
+// the controller rejects with api.err.InvalidPayload (400) on UDM/Dream Machine
+// gateways (#150/#177, same class as #303). Leaving the pointer nil lets `omitempty`
+// drop the JSON key entirely. Valid ranges (from the go-unifi schema, low..high):
+// min_rssi -90..-67 (only when enabled), maxsta 1..200, sens_level -90..-50 (only
+// when enabled), assisted_roaming_rssi -80..-60 (only when enabled).
+//
+// When a field is ENABLED but its declared value is out of range, the value is
+// still dropped (the controller would reject the whole request otherwise) but a
+// warning diagnostic is returned so the silent no-op is visible to the user
+// instead of their configured value just quietly failing to apply (review
+// feedback on PR #378: "user-provided configuration can be silently ignored").
+// Disabled fields, or fields simply left unset, drop silently as before — that's
+// the normal/expected case, not something worth warning about.
+func sanitizeRadioForUpdate(radioName string, radio *unifi.DeviceRadioTable) diag.Diagnostics {
+	var diags diag.Diagnostics
+	// Ranges are the go-unifi schema regexes: min_rssi [-90,-67], maxsta [1,200],
+	// sens_level [-90,-50], assisted_roaming_rssi [-80,-60].
+	inRange := func(v *int64, lo, hi int64) bool { return v != nil && *v >= lo && *v <= hi }
+	warnDropped := func(field string, v int64, lo, hi int64) {
+		diags.AddWarning(
+			"Radio field out of range — not applied",
+			fmt.Sprintf(
+				"radio %q: %s=%d is outside the controller's valid range [%d,%d] and was dropped "+
+					"from the update (the controller rejects out-of-range values with "+
+					"api.err.InvalidPayload). The declared value will not take effect — adjust it "+
+					"to be within range.",
+				radioName, field, v, lo, hi,
+			),
+		)
+	}
+
+	if radio.MinRssiEnabled && radio.MinRssi != nil && !inRange(radio.MinRssi, -90, -67) {
+		warnDropped("min_rssi", *radio.MinRssi, -90, -67)
+	}
+	if !radio.MinRssiEnabled || !inRange(radio.MinRssi, -90, -67) {
+		radio.MinRssi = nil
+	}
+	// maxsta has no "enabled" flag — it's Optional+Computed with UseStateForUnknown,
+	// so a controller-reported 0 flows back on EVERY update of a device where the
+	// user never configured maxsta at all (0 is the controller's "unset" sentinel,
+	// not a declared value) — the original pre-existing test already expected 0 to
+	// drop silently. Warning on that would fire on unrelated updates for users who
+	// never touched maxsta — only warn for a genuinely declared, non-zero,
+	// out-of-range value (review feedback on PR #378).
+	if radio.Maxsta != nil && *radio.Maxsta != 0 && !inRange(radio.Maxsta, 1, 200) {
+		warnDropped("maxsta", *radio.Maxsta, 1, 200)
+	}
+	if !inRange(radio.Maxsta, 1, 200) {
+		radio.Maxsta = nil
+	}
+	if radio.SensLevelEnabled && radio.SensLevel != nil && !inRange(radio.SensLevel, -90, -50) {
+		warnDropped("sens_level", *radio.SensLevel, -90, -50)
+	}
+	if !radio.SensLevelEnabled || !inRange(radio.SensLevel, -90, -50) {
+		radio.SensLevel = nil
+	}
+
+	return diags
+}
+
 func (r *deviceResource) frameworkToRadioTable(
 	ctx context.Context,
 	radioList types.List,
@@ -2485,26 +4244,26 @@ func (r *deviceResource) frameworkToRadioTable(
 		}
 
 		radio := unifi.DeviceRadioTable{
-			Radio:                  model.Radio.ValueString(),
-			Channel:                model.Channel.ValueString(),
-			Ht:                     model.Ht.ValueInt64Pointer(),
-			TxPower:                model.TxPower.ValueString(),
-			TxPowerMode:            model.TxPowerMode.ValueString(),
-			MinRssiEnabled:         model.MinRssiEnabled.ValueBool(),
-			MinRssi:                model.MinRssi.ValueInt64Pointer(),
-			AntennaGain:            model.AntennaGain.ValueInt64Pointer(),
-			AntennaID:              model.AntennaID.ValueInt64Pointer(),
-			AssistedRoamingEnabled: model.AssistedRoamingEnabled.ValueBool(),
-			AssistedRoamingRssi:    model.AssistedRoamingRssi.ValueInt64Pointer(),
-			Dfs:                    model.Dfs.ValueBool(),
-			HardNoiseFloorEnabled:  model.HardNoiseFloorEnabled.ValueBool(),
-			LoadbalanceEnabled:     model.LoadbalanceEnabled.ValueBool(),
-			Maxsta:                 model.Maxsta.ValueInt64Pointer(),
-			Name:                   model.Name.ValueString(),
-			SensLevel:              model.SensLevel.ValueInt64Pointer(),
-			SensLevelEnabled:       model.SensLevelEnabled.ValueBool(),
-			VwireEnabled:           model.VwireEnabled.ValueBool(),
+			Radio:                 model.Radio.ValueString(),
+			Channel:               model.Channel.ValueString(),
+			Ht:                    int64PointerIfKnown(model.Ht),
+			TxPower:               model.TxPower.ValueString(),
+			TxPowerMode:           model.TxPowerMode.ValueString(),
+			MinRssiEnabled:        model.MinRssiEnabled.ValueBool(),
+			MinRssi:               int64PointerIfKnown(model.MinRssi),
+			AntennaGain:           int64PointerIfKnown(model.AntennaGain),
+			AntennaID:             int64PointerIfKnown(model.AntennaID),
+			Dfs:                   model.Dfs.ValueBool(),
+			HardNoiseFloorEnabled: model.HardNoiseFloorEnabled.ValueBool(),
+			LoadbalanceEnabled:    model.LoadbalanceEnabled.ValueBool(),
+			Maxsta:                int64PointerIfKnown(model.Maxsta),
+			Name:                  model.Name.ValueString(),
+			SensLevel:             int64PointerIfKnown(model.SensLevel),
+			SensLevelEnabled:      model.SensLevelEnabled.ValueBool(),
+			VwireEnabled:          model.VwireEnabled.ValueBool(),
 		}
+
+		diags.Append(sanitizeRadioForUpdate(radio.Radio, &radio)...)
 
 		radios = append(radios, radio)
 	}
@@ -2549,4 +4308,188 @@ func (r *deviceResource) frameworkToOutletOverrides(
 	}
 
 	return outlets, diags
+}
+
+// ---------------------------------------------------------------------------
+// List resource
+// ---------------------------------------------------------------------------
+
+// deviceListToModel populates the model's schema fields directly from the API
+// struct for listing. It reuses the existing setResourceData flatten (which
+// relies on nil-safe configNetwork/radioTable/outletOverrides helpers) for a
+// faithful representation, then nulls out the write-only plan-only flags and
+// the large port_override set — listing does not need full per-port detail.
+func (r *deviceResource) deviceListToModel(
+	ctx context.Context,
+	api *unifi.Device,
+	model *deviceResourceModel,
+	site string,
+) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	r.setResourceData(ctx, &diags, api, model, site)
+
+	// port_override is a Set where every field contributes to identity; the API
+	// returns all ports with all fields. A faithful-but-sparse listing sets it
+	// null rather than reproducing the full controller-managed detail.
+	model.PortOverride = types.SetNull(
+		types.ObjectType{AttrTypes: portOverrideAttrTypes()},
+	)
+
+	// Write-only plan flags are never returned by the API.
+	model.AllowAdoption = types.BoolNull()
+	model.ForgetOnDestroy = types.BoolNull()
+
+	return diags
+}
+
+// ListResourceConfigSchema implements [list.ListResource].
+func (r *deviceResource) ListResourceConfigSchema(
+	_ context.Context,
+	_ list.ListResourceSchemaRequest,
+	resp *list.ListResourceSchemaResponse,
+) {
+	resp.Schema = listschema.Schema{
+		MarkdownDescription: "List devices in a site.",
+		Attributes: map[string]listschema.Attribute{
+			"site": listschema.StringAttribute{
+				MarkdownDescription: "The name of the site to list devices from.",
+				Optional:            true,
+			},
+		},
+		Blocks: map[string]listschema.Block{
+			"filter": listschema.ListNestedBlock{
+				NestedObject: listschema.NestedBlockObject{
+					Attributes: map[string]listschema.Attribute{
+						"name": listschema.StringAttribute{
+							MarkdownDescription: "The name of the filter to apply. Supported values are: `name`, `mac`, `model`, `type`.",
+							Required:            true,
+						},
+						"value": listschema.StringAttribute{
+							MarkdownDescription: "The value to filter by.",
+							Required:            true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// List implements [list.ListResource].
+func (r *deviceResource) List(
+	ctx context.Context,
+	req list.ListRequest,
+	stream *list.ListResultsStream,
+) {
+	var config deviceListConfigModel
+
+	diags := req.Config.Get(ctx, &config)
+	if diags.HasError() {
+		stream.Results = list.ListResultsStreamDiagnostics(diags)
+		return
+	}
+
+	site := config.Site.ValueString()
+	if site == "" {
+		site = r.client.Site
+	}
+
+	// Process filter blocks.
+	var filters []deviceListFilterModel
+	if !config.Filter.IsNull() && !config.Filter.IsUnknown() {
+		config.Filter.ElementsAs(ctx, &filters, false)
+	}
+
+	postFilters := make(map[string]string)
+	for _, f := range filters {
+		postFilters[f.Name.ValueString()] = f.Value.ValueString()
+	}
+
+	devices, err := r.client.ListDevice(ctx, site)
+	if err != nil {
+		var d diag.Diagnostics
+		d.AddError("Error Listing Devices", "Could not list devices: "+err.Error())
+		stream.Results = list.ListResultsStreamDiagnostics(d)
+		return
+	}
+
+	stream.Results = func(push func(list.ListResult) bool) {
+		for _, device := range devices {
+			// Apply name filter.
+			if val, ok := postFilters["name"]; ok {
+				if device.Name != val {
+					continue
+				}
+			}
+
+			// Apply mac filter.
+			if val, ok := postFilters["mac"]; ok {
+				if device.MAC != val {
+					continue
+				}
+			}
+
+			// Apply model filter.
+			if val, ok := postFilters["model"]; ok {
+				if device.Model != val {
+					continue
+				}
+			}
+
+			// Apply type filter.
+			if val, ok := postFilters["type"]; ok {
+				if device.Type != val {
+					continue
+				}
+			}
+
+			result := req.NewListResult(ctx)
+
+			// Display name: prefer name, fall back to MAC.
+			if device.Name != "" {
+				result.DisplayName = device.Name
+			} else {
+				result.DisplayName = device.MAC
+			}
+
+			// Set identity (the device MAC, matching IdentitySchema).
+			result.Diagnostics.Append(
+				result.Identity.SetAttribute(
+					ctx,
+					path.Root("mac"),
+					hwtypes.NewMACAddressValue(device.MAC),
+				)...,
+			)
+
+			// Convert to model.
+			d := device
+			var model deviceResourceModel
+			result.Diagnostics.Append(r.deviceListToModel(ctx, &d, &model, site)...)
+			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
+				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
+			}
+
+			if !push(result) {
+				return
+			}
+		}
+	}
+}
+
+// reassertAsyncApplied puts back the planned values of the attributes the
+// controller applies to access points asynchronously. The immediate
+// post-update read can still report the old value, which would conflict with
+// the plan and fail the apply with "inconsistent result after apply" although
+// the change was accepted; the next refresh reconciles state once the AP has
+// applied it. LED overrides behave this way (#337), and so does
+// bandsteering_mode: measured on a U6+ with Network 10.6.106, the read right
+// after the PUT still returned the old mode, the controller a minute later the
+// new one.
+func reassertAsyncApplied(ctx context.Context, read, planned *deviceResourceModel) {
+	read.Led = util.OverlayKnownObject(ctx, planned.Led, read.Led)
+	if !planned.BandsteeringMode.IsNull() && !planned.BandsteeringMode.IsUnknown() {
+		read.BandsteeringMode = planned.BandsteeringMode
+	}
 }

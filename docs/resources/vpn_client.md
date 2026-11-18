@@ -50,6 +50,33 @@ resource "unifi_vpn_client" "wireguard_manual" {
   }
 }
 
+variable "wireguard_private_key" {
+  type      = string
+  sensitive = true
+  ephemeral = true
+}
+
+resource "unifi_vpn_client" "wireguard_write_only" {
+  name          = "my-write-only-wireguard"
+  enabled       = true
+  subnet        = "10.0.2.2/24"
+  default_route = false
+  pull_dns      = true
+
+  wireguard = {
+    private_key_wo         = var.wireguard_private_key
+    private_key_wo_version = 1
+    interface              = "wan"
+    dns_servers            = ["1.1.1.1"]
+
+    peer = {
+      ip         = "203.0.113.1"
+      port       = 51820
+      public_key = "your_peer_public_key_here"
+    }
+  }
+}
+
 resource "unifi_vpn_client" "wireguard_with_psk" {
   name          = "secure-wireguard"
   enabled       = true
@@ -84,10 +111,12 @@ resource "unifi_vpn_client" "wireguard_with_psk" {
 
 ### Optional
 
-- `default_route` (Boolean) Specifies whether to use the VPN as the default route.
-- `enabled` (Boolean) Specifies whether the VPN client is enabled.
-- `pull_dns` (Boolean) Specifies whether to pull DNS servers from the VPN.
+- `default_route` (Boolean) Specifies whether to use the VPN as the default route. Taken from the controller when not set (a new client gets `false`), so adopting a client that carries the default route does not drop it (#544).
+- `enabled` (Boolean) Specifies whether the VPN client is enabled. A new client is created enabled; an existing one keeps the controller's value when this is not set, so adopting a disabled tunnel does not re-enable it (#544).
+- `ipv6_subnet` (String) The local IPv6 address for the WireGuard tunnel in CIDR notation (e.g., `2001:db8::2/64`). In file mode it defaults to the IPv6 entry of the configuration's `Address` line. When not configured, the controller's value is kept, so an address set in the UI survives updates made through Terraform.
+- `pull_dns` (Boolean) Specifies whether to pull DNS servers from the VPN. Taken from the controller when not set (a new client gets `false`) (#544).
 - `site` (String) The name of the site to associate the VPN client with.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 
 ### Read-Only
 
@@ -96,18 +125,17 @@ resource "unifi_vpn_client" "wireguard_with_psk" {
 <a id="nestedatt--wireguard"></a>
 ### Nested Schema for `wireguard`
 
-Required:
-
-- `private_key` (String, Sensitive) WireGuard private key for this client.
-
 Optional:
 
 - `configuration` (Attributes) File-based WireGuard configuration. Provide a complete WireGuard .conf file. (see [below for nested schema](#nestedatt--wireguard--configuration))
 - `dns_servers` (List of String) DNS servers for the WireGuard interface. Required for manual mode. Must specify 1-2 DNS server addresses.
-- `interface` (String) WAN interface to use for the VPN connection (e.g., `wan`, `wan2`).
+- `interface` (String) WAN interface to use for the VPN connection (e.g., `wan`, `wan2`). Defaults to `wan` for a new client; an existing client keeps the controller's value when this is not set, so adopting a tunnel on `wan2` does not move it (#544).
 - `peer` (Attributes) Manual WireGuard peer configuration. Specify peer endpoint and public key. (see [below for nested schema](#nestedatt--wireguard--peer))
 - `preshared_key` (String, Sensitive) WireGuard preshared key. Required when preshared_key_enabled is true.
-- `preshared_key_enabled` (Boolean) Specifies whether to use a preshared key for additional security.
+- `preshared_key_enabled` (Boolean) Specifies whether to use a preshared key for additional security. Taken from the controller when not set (a new client gets `false`, or `true` when the configuration file carries a preshared key) (#544).
+- `private_key` (String, Sensitive) WireGuard private key for this client. Stored in state; use `private_key_wo` to avoid persisting the secret.
+- `private_key_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) Write-only equivalent of `private_key` (Terraform 1.11+). Used at apply time but never written to state. Mutually exclusive with `private_key`.
+- `private_key_wo_version` (Number) Version counter for `private_key_wo`. Increment this value to trigger a private key update.
 
 <a id="nestedatt--wireguard--configuration"></a>
 ### Nested Schema for `wireguard.configuration`
@@ -127,11 +155,23 @@ Required:
 - `port` (Number) WireGuard peer endpoint port.
 - `public_key` (String, Sensitive) WireGuard peer public key.
 
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+
 ## Import
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # Import a VPN client by ID

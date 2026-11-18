@@ -3,7 +3,9 @@ package unifi
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/datasource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -27,6 +29,8 @@ type portProfileDataSourceModel struct {
 	Forward              types.String `tfsdk:"forward"`
 	NativeNetworkconfID  types.String `tfsdk:"native_networkconf_id"`
 	TaggedNetworkconfIDs types.Set    `tfsdk:"tagged_networkconf_ids"`
+
+	Timeouts timeouts.Value `tfsdk:"timeouts"`
 }
 
 func (d *portProfileDataSource) Metadata(
@@ -59,6 +63,20 @@ func (d *portProfileDataSource) Schema(
 				MarkdownDescription: "The name of the port profile to look up.",
 				Required:            true,
 			},
+			"forward": schema.StringAttribute{
+				MarkdownDescription: "The forwarding mode of the port profile. One of `all`, `native`, `customize` or `disabled`.",
+				Computed:            true,
+			},
+			"native_networkconf_id": schema.StringAttribute{
+				MarkdownDescription: "The ID of the native (untagged) network for the port profile.",
+				Computed:            true,
+			},
+			"tagged_networkconf_ids": schema.SetAttribute{
+				MarkdownDescription: "The IDs of the tagged (VLAN) networks for the port profile.",
+				Computed:            true,
+				ElementType:         types.StringType,
+			},
+			"timeouts": timeouts.Attributes(ctx),
 		},
 	}
 }
@@ -99,6 +117,14 @@ func (d *portProfileDataSource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
 	site := data.Site.ValueString()
 	if site == "" {
 		site = d.client.Site
@@ -134,6 +160,22 @@ func (d *portProfileDataSource) Read(
 	data.ID = types.StringValue(portProfile.ID)
 	data.Site = types.StringValue(site)
 	data.Name = types.StringValue(portProfile.Name)
+
+	if portProfile.Forward == "" {
+		data.Forward = types.StringValue("native")
+	} else {
+		data.Forward = types.StringValue(portProfile.Forward)
+	}
+
+	if portProfile.NATiveNetworkID != "" {
+		data.NativeNetworkconfID = types.StringValue(portProfile.NATiveNetworkID)
+	} else {
+		data.NativeNetworkconfID = types.StringNull()
+	}
+
+	// tagged_networkconf_ids has no corresponding go-unifi field; tagged VLANs are
+	// managed via tagged_vlan_mgmt + excluded_networkconf_ids instead.
+	data.TaggedNetworkconfIDs = types.SetNull(types.StringType)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }

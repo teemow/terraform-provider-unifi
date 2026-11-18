@@ -2,30 +2,46 @@ package unifi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework-timetypes/timetypes"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	ui "github.com/ubiquiti-community/go-unifi/unifi"
 	"github.com/ubiquiti-community/go-unifi/unifi/settings"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 )
 
 var (
-	_ resource.Resource                = &settingResource{}
-	_ resource.ResourceWithImportState = &settingResource{}
+	_ resource.Resource                 = &settingResource{}
+	_ resource.ResourceWithImportState  = &settingResource{}
+	_ resource.ResourceWithUpgradeState = &settingResource{}
+	_ resource.ResourceWithModifyPlan   = &settingResource{}
+	_ resource.ResourceWithIdentity     = &settingResource{}
 )
 
 func NewSettingResource() resource.Resource {
@@ -36,6 +52,13 @@ type settingResource struct {
 	client *Client
 }
 
+// settingIdentityModel describes the resource identity data model. Site
+// settings are a per-site singleton (the resource id is the site name), so
+// the site name is their natural key.
+type settingIdentityModel struct {
+	Site types.String `tfsdk:"site"`
+}
+
 type sshKeyModel struct {
 	Name    types.String `tfsdk:"name"`
 	Type    types.String `tfsdk:"type"`
@@ -43,18 +66,48 @@ type sshKeyModel struct {
 	Comment types.String `tfsdk:"comment"`
 }
 
+// settingMgmtSSHModel is the `mgmt.ssh` nested object.
+type settingMgmtSSHModel struct {
+	Enabled             types.Bool   `tfsdk:"enabled"`
+	Keys                types.List   `tfsdk:"keys"`
+	Username            types.String `tfsdk:"username"`
+	Password            types.String `tfsdk:"password"`
+	AuthPasswordEnabled types.Bool   `tfsdk:"auth_password_enabled"`
+}
+
+// settingMgmtAutoUpgradeModel is the `mgmt.auto_upgrade` nested object.
+type settingMgmtAutoUpgradeModel struct {
+	Enabled types.Bool  `tfsdk:"enabled"`
+	Hour    types.Int64 `tfsdk:"hour"`
+}
+
 type settingMgmtModel struct {
-	AutoUpgrade types.Bool `tfsdk:"auto_upgrade"`
-	SSHEnabled  types.Bool `tfsdk:"ssh_enabled"`
-	SSHKeys     types.List `tfsdk:"ssh_keys"`
+	AutoUpgrade            types.Object `tfsdk:"auto_upgrade"`
+	SSH                    types.Object `tfsdk:"ssh"`
+	AdvancedFeatureEnabled types.Bool   `tfsdk:"advanced_feature_enabled"`
+	DebugToolsEnabled      types.Bool   `tfsdk:"debug_tools_enabled"`
+	DirectConnectEnabled   types.Bool   `tfsdk:"direct_connect_enabled"`
+	UnifiIdpEnabled        types.Bool   `tfsdk:"unifi_idp_enabled"`
+	WifimanEnabled         types.Bool   `tfsdk:"wifiman_enabled"`
 }
 
 type settingRadiusModel struct {
-	AccountingEnabled     types.Bool   `tfsdk:"accounting_enabled"`
-	AcctPort              types.Int64  `tfsdk:"acct_port"`
-	AuthPort              types.Int64  `tfsdk:"auth_port"`
-	InterimUpdateInterval types.Int64  `tfsdk:"interim_update_interval"`
-	Secret                types.String `tfsdk:"secret"`
+	AccountingEnabled     types.Bool           `tfsdk:"accounting_enabled"`
+	AcctPort              types.Int64          `tfsdk:"acct_port"`
+	AuthPort              types.Int64          `tfsdk:"auth_port"`
+	InterimUpdateInterval timetypes.GoDuration `tfsdk:"interim_update_interval"`
+	Secret                types.String         `tfsdk:"secret"`
+}
+
+// settingSnmpModel is the `snmp` block: v1/v2c community and one v3 user.
+type settingSnmpModel struct {
+	Enabled           types.Bool   `tfsdk:"enabled"`
+	Community         types.String `tfsdk:"community"`
+	EnabledV3         types.Bool   `tfsdk:"enabled_v3"`
+	Username          types.String `tfsdk:"username"`
+	Password          types.String `tfsdk:"password"`
+	PasswordWO        types.String `tfsdk:"password_wo"`
+	PasswordWOVersion types.Int64  `tfsdk:"password_wo_version"`
 }
 
 type dnsVerificationModel struct {
@@ -64,53 +117,605 @@ type dnsVerificationModel struct {
 	SettingPreference  types.String `tfsdk:"setting_preference"`
 }
 
+// settingUsgTCPModel is the `usg.tcp` nested object (conntrack timeouts).
+type settingUsgTCPModel struct {
+	CloseTimeout       timetypes.GoDuration `tfsdk:"close_timeout"`
+	CloseWaitTimeout   timetypes.GoDuration `tfsdk:"close_wait_timeout"`
+	EstablishedTimeout timetypes.GoDuration `tfsdk:"established_timeout"`
+	FinWaitTimeout     timetypes.GoDuration `tfsdk:"fin_wait_timeout"`
+	LastAckTimeout     timetypes.GoDuration `tfsdk:"last_ack_timeout"`
+	SynRecvTimeout     timetypes.GoDuration `tfsdk:"syn_recv_timeout"`
+	SynSentTimeout     timetypes.GoDuration `tfsdk:"syn_sent_timeout"`
+	TimeWaitTimeout    timetypes.GoDuration `tfsdk:"time_wait_timeout"`
+}
+
+// settingUsgUDPModel is the `usg.udp` nested object (conntrack timeouts).
+type settingUsgUDPModel struct {
+	OtherTimeout  timetypes.GoDuration `tfsdk:"other_timeout"`
+	StreamTimeout timetypes.GoDuration `tfsdk:"stream_timeout"`
+}
+
+// settingUsgUPnPModel is the `usg.upnp` nested object.
+type settingUsgUPnPModel struct {
+	Enabled       types.Bool   `tfsdk:"enabled"`
+	NATPmpEnabled types.Bool   `tfsdk:"nat_pmp_enabled"`
+	SecureMode    types.Bool   `tfsdk:"secure_mode"`
+	WANInterface  types.String `tfsdk:"wan_interface"`
+}
+
+// settingUsgGeoIPFilteringModel is the `usg.geo_ip_filtering` nested object
+// (Region Blocking).
+type settingUsgGeoIPFilteringModel struct {
+	Block            types.String `tfsdk:"block"`
+	Countries        types.String `tfsdk:"countries"`
+	Enabled          types.Bool   `tfsdk:"enabled"`
+	TrafficDirection types.String `tfsdk:"traffic_direction"`
+}
+
+// settingUsgOffloadModel is the `usg.offload` nested object.
+type settingUsgOffloadModel struct {
+	Accounting types.Bool `tfsdk:"accounting"`
+	L2Blocking types.Bool `tfsdk:"l2_blocking"`
+	Sch        types.Bool `tfsdk:"sch"`
+}
+
 type settingUSGModel struct {
-	BroadcastPing                  types.Bool   `tfsdk:"broadcast_ping"`
-	DNSVerification                types.Object `tfsdk:"dns_verification"`
-	FtpModule                      types.Bool   `tfsdk:"ftp_module"`
-	GeoIPFilteringBlock            types.String `tfsdk:"geo_ip_filtering_block"`
-	GeoIPFilteringCountries        types.String `tfsdk:"geo_ip_filtering_countries"`
-	GeoIPFilteringEnabled          types.Bool   `tfsdk:"geo_ip_filtering_enabled"`
-	GeoIPFilteringTrafficDirection types.String `tfsdk:"geo_ip_filtering_traffic_direction"`
-	GreModule                      types.Bool   `tfsdk:"gre_module"`
-	H323Module                     types.Bool   `tfsdk:"h323_module"`
-	ICMPTimeout                    types.Int64  `tfsdk:"icmp_timeout"`
-	MssClamp                       types.String `tfsdk:"mss_clamp"`
-	OffloadAccounting              types.Bool   `tfsdk:"offload_accounting"`
-	OffloadL2Blocking              types.Bool   `tfsdk:"offload_l2_blocking"`
-	OffloadSch                     types.Bool   `tfsdk:"offload_sch"`
-	OtherTimeout                   types.Int64  `tfsdk:"other_timeout"`
-	PptpModule                     types.Bool   `tfsdk:"pptp_module"`
-	ReceiveRedirects               types.Bool   `tfsdk:"receive_redirects"`
-	SendRedirects                  types.Bool   `tfsdk:"send_redirects"`
-	SipModule                      types.Bool   `tfsdk:"sip_module"`
-	SynCookies                     types.Bool   `tfsdk:"syn_cookies"`
-	TCPCloseTimeout                types.Int64  `tfsdk:"tcp_close_timeout"`
-	TCPCloseWaitTimeout            types.Int64  `tfsdk:"tcp_close_wait_timeout"`
-	TCPEstablishedTimeout          types.Int64  `tfsdk:"tcp_established_timeout"`
-	TCPFinWaitTimeout              types.Int64  `tfsdk:"tcp_fin_wait_timeout"`
-	TCPLastAckTimeout              types.Int64  `tfsdk:"tcp_last_ack_timeout"`
-	TCPSynRecvTimeout              types.Int64  `tfsdk:"tcp_syn_recv_timeout"`
-	TCPSynSentTimeout              types.Int64  `tfsdk:"tcp_syn_sent_timeout"`
-	TCPTimeWaitTimeout             types.Int64  `tfsdk:"tcp_time_wait_timeout"`
-	TFTPModule                     types.Bool   `tfsdk:"tftp_module"`
-	TimeoutSettingPreference       types.String `tfsdk:"timeout_setting_preference"`
-	UDPOtherTimeout                types.Int64  `tfsdk:"udp_other_timeout"`
-	UDPStreamTimeout               types.Int64  `tfsdk:"udp_stream_timeout"`
-	UnbindWANMonitors              types.Bool   `tfsdk:"unbind_wan_monitors"`
-	UPnPEnabled                    types.Bool   `tfsdk:"upnp_enabled"`
-	UPnPNATPmpEnabled              types.Bool   `tfsdk:"upnp_nat_pmp_enabled"`
-	UPnPSecureMode                 types.Bool   `tfsdk:"upnp_secure_mode"`
-	UPnPWANInterface               types.String `tfsdk:"upnp_wan_interface"`
+	BroadcastPing            types.Bool           `tfsdk:"broadcast_ping"`
+	DNSVerification          types.Object         `tfsdk:"dns_verification"`
+	FtpModule                types.Bool           `tfsdk:"ftp_module"`
+	GeoIPFiltering           types.Object         `tfsdk:"geo_ip_filtering"`
+	GreModule                types.Bool           `tfsdk:"gre_module"`
+	H323Module               types.Bool           `tfsdk:"h323_module"`
+	ICMPTimeout              timetypes.GoDuration `tfsdk:"icmp_timeout"`
+	MssClamp                 types.String         `tfsdk:"mss_clamp"`
+	Offload                  types.Object         `tfsdk:"offload"`
+	OtherTimeout             timetypes.GoDuration `tfsdk:"other_timeout"`
+	PptpModule               types.Bool           `tfsdk:"pptp_module"`
+	ReceiveRedirects         types.Bool           `tfsdk:"receive_redirects"`
+	SendRedirects            types.Bool           `tfsdk:"send_redirects"`
+	SipModule                types.Bool           `tfsdk:"sip_module"`
+	SynCookies               types.Bool           `tfsdk:"syn_cookies"`
+	TCP                      types.Object         `tfsdk:"tcp"`
+	TFTPModule               types.Bool           `tfsdk:"tftp_module"`
+	TimeoutSettingPreference types.String         `tfsdk:"timeout_setting_preference"`
+	UDP                      types.Object         `tfsdk:"udp"`
+	UnbindWANMonitors        types.Bool           `tfsdk:"unbind_wan_monitors"`
+	UPnP                     types.Object         `tfsdk:"upnp"`
+}
+
+type settingDohCustomServerModel struct {
+	Enabled    types.Bool   `tfsdk:"enabled"`
+	SDNSStamp  types.String `tfsdk:"sdns_stamp"`
+	ServerName types.String `tfsdk:"server_name"`
+}
+
+type settingAutoSpeedtestModel struct {
+	Enabled  types.Bool   `tfsdk:"enabled"`
+	CronExpr types.String `tfsdk:"cron_expr"`
+}
+
+type settingCountryModel struct {
+	Code types.Int64 `tfsdk:"code"`
+}
+
+type settingDpiModel struct {
+	Enabled               types.Bool `tfsdk:"enabled"`
+	FingerprintingEnabled types.Bool `tfsdk:"fingerprinting_enabled"`
+}
+
+type settingLcmModel struct {
+	Enabled     types.Bool  `tfsdk:"enabled"`
+	Brightness  types.Int64 `tfsdk:"brightness"`
+	IdleTimeout types.Int64 `tfsdk:"idle_timeout"`
+	Sync        types.Bool  `tfsdk:"sync"`
+	TouchEvent  types.Bool  `tfsdk:"touch_event"`
+}
+
+type settingNetworkOptimizationModel struct {
+	Enabled types.Bool `tfsdk:"enabled"`
+}
+
+type settingNtpModel struct {
+	NtpServer1        types.String `tfsdk:"ntp_server_1"`
+	NtpServer2        types.String `tfsdk:"ntp_server_2"`
+	NtpServer3        types.String `tfsdk:"ntp_server_3"`
+	NtpServer4        types.String `tfsdk:"ntp_server_4"`
+	SettingPreference types.String `tfsdk:"setting_preference"`
+}
+
+// settingSyslogNetconsoleModel is the `syslog.netconsole` nested object.
+type settingSyslogNetconsoleModel struct {
+	Enabled types.Bool   `tfsdk:"enabled"`
+	Host    types.String `tfsdk:"host"`
+	Port    types.Int64  `tfsdk:"port"`
+}
+
+// settingSyslogThisControllerModel is the `syslog.this_controller` nested
+// object.
+type settingSyslogThisControllerModel struct {
+	Enabled       types.Bool `tfsdk:"enabled"`
+	EncryptedOnly types.Bool `tfsdk:"encrypted_only"`
+}
+
+type settingSyslogModel struct {
+	Enabled        types.Bool   `tfsdk:"enabled"`
+	Contents       types.List   `tfsdk:"contents"`
+	Debug          types.Bool   `tfsdk:"debug"`
+	IP             types.String `tfsdk:"ip"`
+	Port           types.Int64  `tfsdk:"port"`
+	LogAllContents types.Bool   `tfsdk:"log_all_contents"`
+	Netconsole     types.Object `tfsdk:"netconsole"`
+	ThisController types.Object `tfsdk:"this_controller"`
+}
+
+type settingDohModel struct {
+	CustomServers types.List   `tfsdk:"custom_servers"`
+	ServerNames   types.List   `tfsdk:"server_names"`
+	State         types.String `tfsdk:"state"`
+}
+
+type settingIpsHoneypotModel struct {
+	IPAddress types.String `tfsdk:"ip_address"`
+	NetworkID types.String `tfsdk:"network_id"`
+	Version   types.String `tfsdk:"version"`
+}
+
+type settingIpsWhitelistModel struct {
+	Direction types.String `tfsdk:"direction"`
+	Mode      types.String `tfsdk:"mode"`
+	Value     types.String `tfsdk:"value"`
+}
+
+type settingIpsTrackingModel struct {
+	Direction types.String `tfsdk:"direction"`
+	Mode      types.String `tfsdk:"mode"`
+	Value     types.String `tfsdk:"value"`
+}
+
+type settingIpsAlertModel struct {
+	Category  types.String `tfsdk:"category"`
+	Gid       types.Int64  `tfsdk:"gid"`
+	ID        types.Int64  `tfsdk:"id"`
+	Signature types.String `tfsdk:"signature"`
+	Type      types.String `tfsdk:"type"`
+	Tracking  types.List   `tfsdk:"tracking"`
+}
+
+// settingIpsSuppressionModel is the `ips.suppression` nested object.
+type settingIpsSuppressionModel struct {
+	Whitelist types.List `tfsdk:"whitelist"`
+	Alerts    types.List `tfsdk:"alerts"`
+}
+
+type settingIpsModel struct {
+	AdvancedFilteringPreference         types.String `tfsdk:"advanced_filtering_preference"`
+	ContentFilteringBlockingPageEnabled types.Bool   `tfsdk:"content_filtering_blocking_page_enabled"`
+	EnabledCategories                   types.List   `tfsdk:"enabled_categories"`
+	EnabledNetworks                     types.List   `tfsdk:"enabled_networks"`
+	Honeypot                            types.List   `tfsdk:"honeypot"`
+	HoneypotEnabled                     types.Bool   `tfsdk:"honeypot_enabled"`
+	IPSMode                             types.String `tfsdk:"ips_mode"`
+	MemoryOptimized                     types.Bool   `tfsdk:"memory_optimized"`
+	RestrictTorrents                    types.Bool   `tfsdk:"restrict_torrents"`
+	Suppression                         types.Object `tfsdk:"suppression"`
 }
 
 type settingResourceModel struct {
-	ID     types.String `tfsdk:"id"`
-	Site   types.String `tfsdk:"site"`
-	Mgmt   types.Object `tfsdk:"mgmt"`
-	Radius types.Object `tfsdk:"radius"`
-	USG    types.Object `tfsdk:"usg"`
+	ID            types.String   `tfsdk:"id"`
+	Site          types.String   `tfsdk:"site"`
+	AutoSpeedtest types.Object   `tfsdk:"auto_speedtest"`
+	Country       types.Object   `tfsdk:"country"`
+	Dpi           types.Object   `tfsdk:"dpi"`
+	Lcm           types.Object   `tfsdk:"lcm"`
+	NetworkOpt    types.Object   `tfsdk:"network_optimization"`
+	Ntp           types.Object   `tfsdk:"ntp"`
+	Syslog        types.Object   `tfsdk:"syslog"`
+	Doh           types.Object   `tfsdk:"doh"`
+	Ips           types.Object   `tfsdk:"ips"`
+	Mgmt          types.Object   `tfsdk:"mgmt"`
+	Radius        types.Object   `tfsdk:"radius"`
+	Snmp          types.Object   `tfsdk:"snmp"`
+	USG           types.Object   `tfsdk:"usg"`
+	IgmpSnooping  types.Object   `tfsdk:"igmp_snooping"`
+	GlobalSwitch  types.Object   `tfsdk:"global_switch"`
+	Connectivity  types.Object   `tfsdk:"connectivity"`
+	Mdns          types.Object   `tfsdk:"mdns"`
+	RadioAi       types.Object   `tfsdk:"radio_ai"`
+	EtherLighting types.Object   `tfsdk:"etherlighting"`
+	Timeouts      timeouts.Value `tfsdk:"timeouts"`
+
+	// The write-only RADIUS secret sits at the root rather than inside
+	// radius: Terraform rejects a WriteOnly child of a Computed nested
+	// attribute, and radius is Optional+Computed.
+	RadiusSecretWO        types.String `tfsdk:"radius_secret_wo"`
+	RadiusSecretWOVersion types.Int64  `tfsdk:"radius_secret_wo_version"`
 }
+
+// settingRadioAiModel is the nested radio_ai block (Settings > WiFi > Channel
+// AI / nightly channel optimization). The optimizer rewrites the channel of
+// every radio in the bands listed in radios on its schedule, overriding a
+// channel set on the device, so leaving a band out of radios is how a channel
+// is pinned while the others stay optimized. Only the fields set in config are
+// written; the rest are preserved by the partial write.
+type settingRadioAiModel struct {
+	Enabled                     types.Bool   `tfsdk:"enabled"`
+	AutoEnabled                 types.Bool   `tfsdk:"auto_enabled"`
+	CronExpr                    types.String `tfsdk:"cron_expr"`
+	Radios                      types.List   `tfsdk:"radios"`
+	Optimize                    types.List   `tfsdk:"optimize"`
+	ChannelsNg                  types.List   `tfsdk:"channels_ng"`
+	ChannelsNa                  types.List   `tfsdk:"channels_na"`
+	Channels6E                  types.List   `tfsdk:"channels_6e"`
+	ExcludeDevices              types.List   `tfsdk:"exclude_devices"`
+	SettingPreference           types.String `tfsdk:"setting_preference"`
+	AutoChannelPresetsType      types.String `tfsdk:"auto_channel_presets_type"`
+	AutoAdjustChannelsToCountry types.Bool   `tfsdk:"auto_adjust_channels_to_country"`
+	HtModesNg                   types.List   `tfsdk:"ht_modes_ng"`
+	HtModesNa                   types.List   `tfsdk:"ht_modes_na"`
+	HighPriorityDevices         types.List   `tfsdk:"high_priority_devices"`
+	ChannelsBlacklist           types.List   `tfsdk:"channels_blacklist"`
+	RadiosConfiguration         types.List   `tfsdk:"radios_configuration"`
+}
+
+type settingRadioAiBlacklistModel struct {
+	Radio        types.String `tfsdk:"radio"`
+	Channel      types.Int64  `tfsdk:"channel"`
+	ChannelWidth types.Int64  `tfsdk:"channel_width"`
+}
+
+type settingRadioAiRadioConfigModel struct {
+	Radio        types.String `tfsdk:"radio"`
+	ChannelWidth types.Int64  `tfsdk:"channel_width"`
+	Dfs          types.Bool   `tfsdk:"dfs"`
+}
+
+// settingGlobalSwitchModel is the nested global_switch block (Settings > Networks
+// > Global Switch Settings). Current controllers ignore the per-device
+// jumboframe_enabled flag and honor only this site setting. Writes send only
+// the fields present in config and rely on the controller merging the partial
+// payload, which keeps fields not exposed here (ACL isolation, switch
+// exclusions, PoE staging, ...) intact.
+type settingGlobalSwitchModel struct {
+	// Network IDs with Client Device Isolation on (Settings > Networks >
+	// "Device Isolation (ACL)"). This is a switch ACL, so unlike
+	// unifi_wlan.l2_isolation it blocks same-network traffic across access
+	// points rather than within one, and unlike unifi_network.network_isolation
+	// it acts inside a network rather than between networks (#509).
+	AclDeviceIsolation   types.List   `tfsdk:"acl_device_isolation"`
+	StpVersion           types.String `tfsdk:"stp_version"`
+	DHCPSnoop            types.Bool   `tfsdk:"dhcp_snoop"`
+	JumboframeEnabled    types.Bool   `tfsdk:"jumboframe_enabled"`
+	Dot1XPortctrlEnabled types.Bool   `tfsdk:"dot1x_portctrl_enabled"`
+}
+
+// settingConnectivityModel is the nested connectivity block (Settings > WiFi >
+// Wireless Meshing). Besides freeing the standby mesh radio, disabling meshing
+// doubles the per-band SSID budget: with meshing on, APs reserve a hidden
+// backhaul SSID and allow 4 SSIDs per band instead of 8, so a site rebuilt
+// from code can fail to create its fifth WLAN before this toggle is managed
+// (#518). The controller-generated mesh credentials (x_mesh_essid, x_mesh_psk)
+// are deliberately not exposed and are preserved by the partial write.
+type settingConnectivityModel struct {
+	Enabled        types.Bool   `tfsdk:"enabled"`
+	MloMeshEnabled types.Bool   `tfsdk:"mlo_mesh_enabled"`
+	UplinkType     types.String `tfsdk:"uplink_type"`
+	UplinkHost     types.String `tfsdk:"uplink_host"`
+}
+
+type settingEtherLightingModel struct {
+	NetworkOverrides types.List `tfsdk:"network_overrides"`
+	SpeedOverrides   types.List `tfsdk:"speed_overrides"`
+}
+
+type settingEtherLightingNetworkOverrideModel struct {
+	Network types.String `tfsdk:"network"`
+	Color   types.String `tfsdk:"color"`
+}
+
+type settingEtherLightingSpeedOverrideModel struct {
+	Speed types.String `tfsdk:"speed"`
+	Color types.String `tfsdk:"color"`
+}
+
+// settingIgmpSnoopingModel is the nested igmp_snooping block. On UniFi 10.3.x the
+// effective IGMP snooping toggle moved from the per-network object to this site
+// setting (#164). Only the common fields are exposed; advanced querier/flood
+// fields are preserved across updates via a read-modify-write merge.
+type settingIgmpSnoopingModel struct {
+	Enabled    types.Bool `tfsdk:"enabled"`
+	NetworkIDs types.List `tfsdk:"network_ids"`
+}
+
+// Shared attribute-type maps for the doh/ips nested objects and lists. These
+// are referenced from both readSettings and the *SettingToModel conversion
+// helpers, so they live at package level to avoid drift between the two.
+var (
+	autoSpeedtestAttrTypes = map[string]attr.Type{
+		"enabled":   types.BoolType,
+		"cron_expr": types.StringType,
+	}
+	mgmtSSHKeyAttrTypes = map[string]attr.Type{
+		"name":    types.StringType,
+		"type":    types.StringType,
+		"key":     types.StringType,
+		"comment": types.StringType,
+	}
+	mgmtSSHAttrTypes = map[string]attr.Type{
+		"enabled": types.BoolType,
+		"keys": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: mgmtSSHKeyAttrTypes},
+		},
+		"username":              types.StringType,
+		"password":              types.StringType,
+		"auth_password_enabled": types.BoolType,
+	}
+	mgmtAutoUpgradeAttrTypes = map[string]attr.Type{
+		"enabled": types.BoolType,
+		"hour":    types.Int64Type,
+	}
+	mgmtAttrTypes = map[string]attr.Type{
+		"auto_upgrade":             types.ObjectType{AttrTypes: mgmtAutoUpgradeAttrTypes},
+		"ssh":                      types.ObjectType{AttrTypes: mgmtSSHAttrTypes},
+		"advanced_feature_enabled": types.BoolType,
+		"debug_tools_enabled":      types.BoolType,
+		"direct_connect_enabled":   types.BoolType,
+		"unifi_idp_enabled":        types.BoolType,
+		"wifiman_enabled":          types.BoolType,
+	}
+	countryAttrTypes = map[string]attr.Type{
+		"code": types.Int64Type,
+	}
+	dpiAttrTypes = map[string]attr.Type{
+		"enabled":                types.BoolType,
+		"fingerprinting_enabled": types.BoolType,
+	}
+	lcmAttrTypes = map[string]attr.Type{
+		"enabled":      types.BoolType,
+		"brightness":   types.Int64Type,
+		"idle_timeout": types.Int64Type,
+		"sync":         types.BoolType,
+		"touch_event":  types.BoolType,
+	}
+	networkOptimizationAttrTypes = map[string]attr.Type{
+		"enabled": types.BoolType,
+	}
+	ntpAttrTypes = map[string]attr.Type{
+		"ntp_server_1":       types.StringType,
+		"ntp_server_2":       types.StringType,
+		"ntp_server_3":       types.StringType,
+		"ntp_server_4":       types.StringType,
+		"setting_preference": types.StringType,
+	}
+	syslogNetconsoleAttrTypes = map[string]attr.Type{
+		"enabled": types.BoolType,
+		"host":    types.StringType,
+		"port":    types.Int64Type,
+	}
+	syslogThisControllerAttrTypes = map[string]attr.Type{
+		"enabled":        types.BoolType,
+		"encrypted_only": types.BoolType,
+	}
+	syslogAttrTypes = map[string]attr.Type{
+		"enabled":          types.BoolType,
+		"contents":         types.ListType{ElemType: types.StringType},
+		"debug":            types.BoolType,
+		"ip":               types.StringType,
+		"port":             types.Int64Type,
+		"log_all_contents": types.BoolType,
+		"netconsole":       types.ObjectType{AttrTypes: syslogNetconsoleAttrTypes},
+		"this_controller":  types.ObjectType{AttrTypes: syslogThisControllerAttrTypes},
+	}
+	dohCustomServerAttrTypes = map[string]attr.Type{
+		"enabled":     types.BoolType,
+		"sdns_stamp":  types.StringType,
+		"server_name": types.StringType,
+	}
+	dohAttrTypes = map[string]attr.Type{
+		"state":        types.StringType,
+		"server_names": types.ListType{ElemType: types.StringType},
+		"custom_servers": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: dohCustomServerAttrTypes},
+		},
+	}
+	ipsHoneypotAttrTypes = map[string]attr.Type{
+		"ip_address": types.StringType,
+		"network_id": types.StringType,
+		"version":    types.StringType,
+	}
+	ipsWhitelistAttrTypes = map[string]attr.Type{
+		"direction": types.StringType,
+		"mode":      types.StringType,
+		"value":     types.StringType,
+	}
+	ipsTrackingAttrTypes = map[string]attr.Type{
+		"direction": types.StringType,
+		"mode":      types.StringType,
+		"value":     types.StringType,
+	}
+	ipsAlertAttrTypes = map[string]attr.Type{
+		"category":  types.StringType,
+		"gid":       types.Int64Type,
+		"id":        types.Int64Type,
+		"signature": types.StringType,
+		"type":      types.StringType,
+		"tracking":  types.ListType{ElemType: types.ObjectType{AttrTypes: ipsTrackingAttrTypes}},
+	}
+	ipsSuppressionAttrTypes = map[string]attr.Type{
+		"whitelist": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: ipsWhitelistAttrTypes},
+		},
+		"alerts": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: ipsAlertAttrTypes},
+		},
+	}
+	ipsAttrTypes = map[string]attr.Type{
+		"advanced_filtering_preference":           types.StringType,
+		"content_filtering_blocking_page_enabled": types.BoolType,
+		"enabled_categories":                      types.ListType{ElemType: types.StringType},
+		"enabled_networks":                        types.ListType{ElemType: types.StringType},
+		"honeypot_enabled":                        types.BoolType,
+		"honeypot": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: ipsHoneypotAttrTypes},
+		},
+		"ips_mode":          types.StringType,
+		"memory_optimized":  types.BoolType,
+		"restrict_torrents": types.BoolType,
+		"suppression":       types.ObjectType{AttrTypes: ipsSuppressionAttrTypes},
+	}
+	igmpSnoopingAttrTypes = map[string]attr.Type{
+		"enabled":     types.BoolType,
+		"network_ids": types.ListType{ElemType: types.StringType},
+	}
+	radiusAttrTypes = map[string]attr.Type{
+		"accounting_enabled":      types.BoolType,
+		"acct_port":               types.Int64Type,
+		"auth_port":               types.Int64Type,
+		"interim_update_interval": timetypes.GoDurationType{},
+		"secret":                  types.StringType,
+	}
+	usgDNSVerificationAttrTypes = map[string]attr.Type{
+		"domain":               types.StringType,
+		"primary_dns_server":   types.StringType,
+		"secondary_dns_server": types.StringType,
+		"setting_preference":   types.StringType,
+	}
+	usgTCPAttrTypes = map[string]attr.Type{
+		"close_timeout":       timetypes.GoDurationType{},
+		"close_wait_timeout":  timetypes.GoDurationType{},
+		"established_timeout": timetypes.GoDurationType{},
+		"fin_wait_timeout":    timetypes.GoDurationType{},
+		"last_ack_timeout":    timetypes.GoDurationType{},
+		"syn_recv_timeout":    timetypes.GoDurationType{},
+		"syn_sent_timeout":    timetypes.GoDurationType{},
+		"time_wait_timeout":   timetypes.GoDurationType{},
+	}
+	usgUDPAttrTypes = map[string]attr.Type{
+		"other_timeout":  timetypes.GoDurationType{},
+		"stream_timeout": timetypes.GoDurationType{},
+	}
+	usgUPnPAttrTypes = map[string]attr.Type{
+		"enabled":         types.BoolType,
+		"nat_pmp_enabled": types.BoolType,
+		"secure_mode":     types.BoolType,
+		"wan_interface":   types.StringType,
+	}
+	usgGeoIPFilteringAttrTypes = map[string]attr.Type{
+		"block":             types.StringType,
+		"countries":         types.StringType,
+		"enabled":           types.BoolType,
+		"traffic_direction": types.StringType,
+	}
+	usgOffloadAttrTypes = map[string]attr.Type{
+		"accounting":  types.BoolType,
+		"l2_blocking": types.BoolType,
+		"sch":         types.BoolType,
+	}
+	usgAttrTypes = map[string]attr.Type{
+		"broadcast_ping":             types.BoolType,
+		"dns_verification":           types.ObjectType{AttrTypes: usgDNSVerificationAttrTypes},
+		"ftp_module":                 types.BoolType,
+		"geo_ip_filtering":           types.ObjectType{AttrTypes: usgGeoIPFilteringAttrTypes},
+		"gre_module":                 types.BoolType,
+		"h323_module":                types.BoolType,
+		"icmp_timeout":               timetypes.GoDurationType{},
+		"mss_clamp":                  types.StringType,
+		"offload":                    types.ObjectType{AttrTypes: usgOffloadAttrTypes},
+		"other_timeout":              timetypes.GoDurationType{},
+		"pptp_module":                types.BoolType,
+		"receive_redirects":          types.BoolType,
+		"send_redirects":             types.BoolType,
+		"sip_module":                 types.BoolType,
+		"syn_cookies":                types.BoolType,
+		"tcp":                        types.ObjectType{AttrTypes: usgTCPAttrTypes},
+		"tftp_module":                types.BoolType,
+		"timeout_setting_preference": types.StringType,
+		"udp":                        types.ObjectType{AttrTypes: usgUDPAttrTypes},
+		"unbind_wan_monitors":        types.BoolType,
+		"upnp":                       types.ObjectType{AttrTypes: usgUPnPAttrTypes},
+	}
+	globalSwitchAttrTypes = map[string]attr.Type{
+		"acl_device_isolation":   types.ListType{ElemType: types.StringType},
+		"stp_version":            types.StringType,
+		"dhcp_snoop":             types.BoolType,
+		"jumboframe_enabled":     types.BoolType,
+		"dot1x_portctrl_enabled": types.BoolType,
+	}
+
+	connectivityAttrTypes = map[string]attr.Type{
+		"enabled":          types.BoolType,
+		"mlo_mesh_enabled": types.BoolType,
+		"uplink_type":      types.StringType,
+		"uplink_host":      types.StringType,
+	}
+
+	radioAiBlacklistAttrTypes = map[string]attr.Type{
+		"radio":         types.StringType,
+		"channel":       types.Int64Type,
+		"channel_width": types.Int64Type,
+	}
+
+	radioAiRadioConfigAttrTypes = map[string]attr.Type{
+		"radio":         types.StringType,
+		"channel_width": types.Int64Type,
+		"dfs":           types.BoolType,
+	}
+
+	radioAiAttrTypes = map[string]attr.Type{
+		"enabled":                         types.BoolType,
+		"auto_enabled":                    types.BoolType,
+		"cron_expr":                       types.StringType,
+		"radios":                          types.ListType{ElemType: types.StringType},
+		"optimize":                        types.ListType{ElemType: types.StringType},
+		"channels_ng":                     types.ListType{ElemType: types.Int64Type},
+		"channels_na":                     types.ListType{ElemType: types.Int64Type},
+		"channels_6e":                     types.ListType{ElemType: types.Int64Type},
+		"exclude_devices":                 types.ListType{ElemType: types.StringType},
+		"setting_preference":              types.StringType,
+		"auto_channel_presets_type":       types.StringType,
+		"auto_adjust_channels_to_country": types.BoolType,
+		"ht_modes_ng":                     types.ListType{ElemType: types.Int64Type},
+		"ht_modes_na":                     types.ListType{ElemType: types.Int64Type},
+		"high_priority_devices":           types.ListType{ElemType: types.StringType},
+		"channels_blacklist": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: radioAiBlacklistAttrTypes},
+		},
+		"radios_configuration": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: radioAiRadioConfigAttrTypes},
+		},
+	}
+
+	snmpAttrTypes = map[string]attr.Type{
+		"enabled":             types.BoolType,
+		"community":           types.StringType,
+		"enabled_v3":          types.BoolType,
+		"username":            types.StringType,
+		"password":            types.StringType,
+		"password_wo":         types.StringType,
+		"password_wo_version": types.Int64Type,
+	}
+
+	etherLightingNetworkOverrideAttrTypes = map[string]attr.Type{
+		"network": types.StringType,
+		"color":   types.StringType,
+	}
+	etherLightingSpeedOverrideAttrTypes = map[string]attr.Type{
+		"speed": types.StringType,
+		"color": types.StringType,
+	}
+	etherLightingAttrTypes = map[string]attr.Type{
+		"network_overrides": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: etherLightingNetworkOverrideAttrTypes},
+		},
+		"speed_overrides": types.ListType{
+			ElemType: types.ObjectType{AttrTypes: etherLightingSpeedOverrideAttrTypes},
+		},
+	}
+)
+
+var etherLightingColorValidator = stringvalidator.RegexMatches(
+	regexp.MustCompile(`^[0-9A-Fa-f]{6}$`),
+	"must be a 6-digit hex color without the leading `#`, e.g. `ff0000`",
+)
 
 func (r *settingResource) Metadata(
 	ctx context.Context,
@@ -120,12 +725,33 @@ func (r *settingResource) Metadata(
 	resp.TypeName = req.ProviderTypeName + "_setting"
 }
 
+// IdentitySchema implements [resource.ResourceWithIdentity].
+func (r *settingResource) IdentitySchema(
+	_ context.Context,
+	_ resource.IdentitySchemaRequest,
+	resp *resource.IdentitySchemaResponse,
+) {
+	resp.IdentitySchema = identityschema.Schema{
+		Attributes: map[string]identityschema.Attribute{
+			"site": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+		},
+	}
+}
+
 func (r *settingResource) Schema(
 	ctx context.Context,
 	req resource.SchemaRequest,
 	resp *resource.SchemaResponse,
 ) {
 	resp.Schema = schema.Schema{
+		// v1: radius.interim_update_interval and the usg conntrack timeouts
+		// changed from Int64 (seconds) to GoDuration strings.
+		// v2: prefixed usg/mgmt/syslog/ips attributes moved into nested
+		// objects (usg.tcp, mgmt.ssh, syslog.netconsole, ips.suppression, ...).
+		// See UpgradeState.
+		Version:             2,
 		MarkdownDescription: "Manages settings for a UniFi site. Configure only the settings you need by providing the corresponding nested object.",
 
 		Attributes: map[string]schema.Attribute{
@@ -145,6 +771,499 @@ func (r *settingResource) Schema(
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
+			"auto_speedtest": schema.SingleNestedAttribute{
+				MarkdownDescription: "Periodic automated internet speed test settings.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether periodic automated speed tests are enabled. Taken from the controller when not set (#544).",
+						Optional:            true,
+						Computed:            true,
+					},
+					"cron_expr": schema.StringAttribute{
+						MarkdownDescription: "Cron expression controlling when the speed test runs (e.g. `0 * * * *`).",
+						Optional:            true,
+						Computed:            true,
+					},
+				},
+			},
+			"country": schema.SingleNestedAttribute{
+				MarkdownDescription: "Regulatory country settings.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"code": schema.Int64Attribute{
+						MarkdownDescription: "Regulatory country code (ISO 3166-1 numeric).",
+						Required:            true,
+					},
+				},
+			},
+			"dpi": schema.SingleNestedAttribute{
+				MarkdownDescription: "Deep Packet Inspection (DPI) settings.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether DPI is enabled. Taken from the controller when not set, so declaring the `dpi` block for one attribute no longer turns deep packet inspection off (#544).",
+						Optional:            true,
+						Computed:            true,
+					},
+					"fingerprinting_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether device fingerprinting is enabled.",
+						Optional:            true,
+						Computed:            true,
+					},
+				},
+			},
+			"lcm": schema.SingleNestedAttribute{
+				MarkdownDescription: "LCD/display (LCM) settings for devices with a screen.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether the device display is enabled.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"brightness": schema.Int64Attribute{
+						MarkdownDescription: "Display brightness (1-100).",
+						Optional:            true,
+						Computed:            true,
+						Validators:          []validator.Int64{int64validator.Between(1, 100)},
+					},
+					"idle_timeout": schema.Int64Attribute{
+						MarkdownDescription: "Seconds of inactivity before the display turns off (10-3600).",
+						Optional:            true,
+						Computed:            true,
+						Validators:          []validator.Int64{int64validator.Between(10, 3600)},
+					},
+					"sync": schema.BoolAttribute{
+						MarkdownDescription: "Sync display settings across devices. Taken from the controller when not set (#544).",
+						Optional:            true,
+						Computed:            true,
+					},
+					"touch_event": schema.BoolAttribute{
+						MarkdownDescription: "Whether touch events on the display are enabled.",
+						Optional:            true,
+						Computed:            true,
+					},
+				},
+			},
+			"network_optimization": schema.SingleNestedAttribute{
+				MarkdownDescription: "Automated network optimization settings.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether automated network optimization is enabled.",
+						Optional:            true,
+						Computed:            true,
+					},
+				},
+			},
+			"ntp": schema.SingleNestedAttribute{
+				MarkdownDescription: "NTP (time server) settings.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"setting_preference": schema.StringAttribute{
+						MarkdownDescription: "Configuration mode: `auto` or `manual`.",
+						Optional:            true,
+						Computed:            true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("auto", "manual"),
+						},
+					},
+					"ntp_server_1": schema.StringAttribute{
+						MarkdownDescription: "Primary NTP server.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"ntp_server_2": schema.StringAttribute{
+						MarkdownDescription: "Second NTP server.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"ntp_server_3": schema.StringAttribute{
+						MarkdownDescription: "Third NTP server.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"ntp_server_4": schema.StringAttribute{
+						MarkdownDescription: "Fourth NTP server.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+				},
+			},
+			"syslog": schema.SingleNestedAttribute{
+				MarkdownDescription: "Remote syslog (rsyslogd) settings.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether remote syslog is enabled. Taken from the controller when not set, so declaring the `syslog` block to manage its server address no longer disables logging (#544).",
+						Optional:            true,
+						Computed:            true,
+					},
+					"ip": schema.StringAttribute{
+						MarkdownDescription: "Remote syslog server IP address.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"port": schema.Int64Attribute{
+						MarkdownDescription: "Remote syslog server port (1-65535).",
+						Optional:            true,
+						Computed:            true,
+						Validators:          []validator.Int64{int64validator.Between(1, 65535)},
+					},
+					"contents": schema.ListAttribute{
+						MarkdownDescription: "Logged facilities (e.g. `device`, `client`, `firewall_default_policy`, `triggers`, `updates`, `admin_activity`, `critical`, `security_detections`, `vpn`).",
+						Optional:            true,
+						Computed:            true,
+						ElementType:         types.StringType,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"log_all_contents": schema.BoolAttribute{
+						MarkdownDescription: "Log all available facilities. Taken from the controller when not set (#544).",
+						Optional:            true,
+						Computed:            true,
+					},
+					"debug": schema.BoolAttribute{
+						MarkdownDescription: "Enable debug logging.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"this_controller": schema.SingleNestedAttribute{
+						MarkdownDescription: "Forwarding of this controller's own events to the remote syslog server.",
+						Optional:            true,
+						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"enabled": schema.BoolAttribute{
+								MarkdownDescription: "Also log this controller's events.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"encrypted_only": schema.BoolAttribute{
+								MarkdownDescription: "Only send this controller's logs over an encrypted channel.",
+								Optional:            true,
+								Computed:            true,
+							},
+						},
+					},
+					"netconsole": schema.SingleNestedAttribute{
+						MarkdownDescription: "Netconsole logging settings.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.Object{
+							objectplanmodifier.UseStateForUnknown(),
+						},
+						Attributes: map[string]schema.Attribute{
+							"enabled": schema.BoolAttribute{
+								MarkdownDescription: "Whether netconsole logging is enabled. Defaults to `false` when `syslog` is configured and this is not set.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"host": schema.StringAttribute{
+								MarkdownDescription: "Netconsole host.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"port": schema.Int64Attribute{
+								MarkdownDescription: "Netconsole port (1-65535).",
+								Optional:            true,
+								Computed:            true,
+								Validators: []validator.Int64{
+									int64validator.Between(1, 65535),
+								},
+							},
+						},
+					},
+				},
+			},
+			"doh": schema.SingleNestedAttribute{
+				MarkdownDescription: "Encrypted DNS (DNS-over-HTTPS) settings.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"state": schema.StringAttribute{
+						MarkdownDescription: "Encrypted DNS state: off, auto, manual, or custom.",
+						Optional:            true,
+						Computed:            true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("off", "auto", "manual", "custom"),
+						},
+					},
+					"server_names": schema.ListAttribute{
+						MarkdownDescription: "Predefined DNS provider names (e.g. \"cloudflare\", \"google\").",
+						Optional:            true,
+						Computed:            true,
+						ElementType:         types.StringType,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"custom_servers": schema.ListNestedAttribute{
+						MarkdownDescription: "Custom DNS servers specified via DNS stamp.",
+						Optional:            true,
+						Computed:            true,
+						NestedObject: schema.NestedAttributeObject{
+							Attributes: map[string]schema.Attribute{
+								"enabled": schema.BoolAttribute{
+									MarkdownDescription: "Enable this custom server. Defaults to true.",
+									Optional:            true,
+									Computed:            true,
+									// Kept (#544): an element of a list the configuration
+									// writes out in full, so it only applies to a server
+									// the configuration itself declares.
+									Default: booldefault.StaticBool(true),
+								},
+								"sdns_stamp": schema.StringAttribute{
+									MarkdownDescription: "DNS stamp (sdns://) for the custom resolver.",
+									Required:            true,
+								},
+								"server_name": schema.StringAttribute{
+									MarkdownDescription: "Human-readable name for this custom server.",
+									Required:            true,
+								},
+							},
+						},
+					},
+				},
+			},
+			"ips": schema.SingleNestedAttribute{
+				MarkdownDescription: "Intrusion Prevention System (IPS/IDS) and threat management settings. Basic IDS/IPS uses the built-in Emerging Threats ruleset and is free. A UniFi CyberSecure subscription adds enhanced threat intelligence from Proofpoint and Cloudflare on top of the base ruleset.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"ips_mode": schema.StringAttribute{
+						MarkdownDescription: "IPS operating mode: ids (detect only), ips (detect and block), ipsInline, or disabled.",
+						Optional:            true,
+						Computed:            true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("ids", "ips", "ipsInline", "disabled"),
+						},
+					},
+					"enabled_categories": schema.ListAttribute{
+						MarkdownDescription: "Emerging Threats ruleset categories to enable (e.g. \"emerging-malware\", \"tor\", \"phishing\").",
+						Optional:            true,
+						Computed:            true,
+						ElementType:         types.StringType,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"enabled_networks": schema.ListAttribute{
+						MarkdownDescription: "Network IDs to apply IPS inspection to.",
+						Optional:            true,
+						Computed:            true,
+						ElementType:         types.StringType,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"honeypot_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable honeypot to detect internal port scans.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"honeypot": schema.ListNestedAttribute{
+						MarkdownDescription: "Honeypot IP addresses per network.",
+						Optional:            true,
+						Computed:            true,
+						NestedObject: schema.NestedAttributeObject{
+							Attributes: map[string]schema.Attribute{
+								"ip_address": schema.StringAttribute{
+									MarkdownDescription: "IP address to use as a honeypot.",
+									Required:            true,
+								},
+								"network_id": schema.StringAttribute{
+									MarkdownDescription: "Network ID this honeypot IP belongs to.",
+									Required:            true,
+								},
+								"version": schema.StringAttribute{
+									MarkdownDescription: "IP version: v4 or v6.",
+									Required:            true,
+									Validators: []validator.String{
+										stringvalidator.OneOf("v4", "v6"),
+									},
+								},
+							},
+						},
+					},
+					"restrict_torrents": schema.BoolAttribute{
+						MarkdownDescription: "Block BitTorrent traffic.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"content_filtering_blocking_page_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Show a blocking page when content filtering blocks a request.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"memory_optimized": schema.BoolAttribute{
+						MarkdownDescription: "Use memory-optimized IPS ruleset (reduced rule set for low-memory devices).",
+						Optional:            true,
+						Computed:            true,
+					},
+					"advanced_filtering_preference": schema.StringAttribute{
+						MarkdownDescription: "Advanced filtering mode: manual or disabled.",
+						Optional:            true,
+						Computed:            true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("manual", "disabled"),
+						},
+					},
+					"suppression": schema.SingleNestedAttribute{
+						MarkdownDescription: "IPS suppression: signature alert suppression entries and whitelisted sources/destinations.",
+						Optional:            true,
+						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"alerts": schema.ListNestedAttribute{
+								MarkdownDescription: "IPS signature alert suppression entries — silence specific signatures or categories.",
+								Optional:            true,
+								Computed:            true,
+								NestedObject: schema.NestedAttributeObject{
+									Attributes: map[string]schema.Attribute{
+										"category": schema.StringAttribute{
+											MarkdownDescription: "Alert suppression signature category.",
+											Optional:            true,
+											Computed:            true,
+										},
+										"gid": schema.Int64Attribute{
+											MarkdownDescription: "Signature Generator ID (GID).",
+											Optional:            true,
+											Computed:            true,
+										},
+										"id": schema.Int64Attribute{
+											MarkdownDescription: "Signature ID.",
+											Optional:            true,
+											Computed:            true,
+										},
+										"signature": schema.StringAttribute{
+											MarkdownDescription: "Suppression signature name.",
+											Optional:            true,
+											Computed:            true,
+										},
+										"type": schema.StringAttribute{
+											MarkdownDescription: "Suppression type: `all` (everywhere) or `track` (only the tracked sources/destinations).",
+											Optional:            true,
+											Computed:            true,
+											Validators: []validator.String{
+												stringvalidator.OneOf("all", "track"),
+											},
+										},
+										"tracking": schema.ListNestedAttribute{
+											MarkdownDescription: "Tracking specifications (used when `type` is `track`).",
+											Optional:            true,
+											Computed:            true,
+											NestedObject: schema.NestedAttributeObject{
+												Attributes: map[string]schema.Attribute{
+													"direction": schema.StringAttribute{
+														MarkdownDescription: "Match direction: both, src, or dest.",
+														Required:            true,
+														Validators: []validator.String{
+															stringvalidator.OneOf(
+																"both",
+																"src",
+																"dest",
+															),
+														},
+													},
+													"mode": schema.StringAttribute{
+														MarkdownDescription: "Match mode: ip, subnet, or network.",
+														Required:            true,
+														Validators: []validator.String{
+															stringvalidator.OneOf(
+																"ip",
+																"subnet",
+																"network",
+															),
+														},
+													},
+													"value": schema.StringAttribute{
+														MarkdownDescription: "IP address, CIDR subnet, or network ID to match.",
+														Required:            true,
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+							"whitelist": schema.ListNestedAttribute{
+								MarkdownDescription: "IPS suppression whitelist entries — sources/destinations to exclude from inspection.",
+								Optional:            true,
+								Computed:            true,
+								NestedObject: schema.NestedAttributeObject{
+									Attributes: map[string]schema.Attribute{
+										"direction": schema.StringAttribute{
+											MarkdownDescription: "Match direction: both, src, or dest.",
+											Required:            true,
+											Validators: []validator.String{
+												stringvalidator.OneOf("both", "src", "dest"),
+											},
+										},
+										"mode": schema.StringAttribute{
+											MarkdownDescription: "Match mode: ip, subnet, or network.",
+											Required:            true,
+											Validators: []validator.String{
+												stringvalidator.OneOf("ip", "subnet", "network"),
+											},
+										},
+										"value": schema.StringAttribute{
+											MarkdownDescription: "IP address, CIDR subnet, or network ID to whitelist.",
+											Required:            true,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
 			"mgmt": schema.SingleNestedAttribute{
 				MarkdownDescription: "Management settings.",
 				Optional:            true,
@@ -153,39 +1272,102 @@ func (r *settingResource) Schema(
 					objectplanmodifier.UseStateForUnknown(),
 				},
 				Attributes: map[string]schema.Attribute{
-					"auto_upgrade": schema.BoolAttribute{
-						MarkdownDescription: "Automatically upgrade device firmware.",
+					"auto_upgrade": schema.SingleNestedAttribute{
+						MarkdownDescription: "Automatic device firmware upgrade settings.",
+						Optional:            true,
+						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"enabled": schema.BoolAttribute{
+								MarkdownDescription: "Automatically upgrade device firmware.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"hour": schema.Int64Attribute{
+								MarkdownDescription: "Hour of day (0-23) for automatic firmware upgrades.",
+								Optional:            true,
+								Computed:            true,
+								Validators: []validator.Int64{
+									int64validator.Between(0, 23),
+								},
+							},
+						},
+					},
+					"advanced_feature_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable advanced features.",
 						Optional:            true,
 						Computed:            true,
 					},
-					"ssh_enabled": schema.BoolAttribute{
-						MarkdownDescription: "Enable SSH authentication.",
+					"debug_tools_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable debug tools.",
 						Optional:            true,
 						Computed:            true,
 					},
-					"ssh_keys": schema.ListNestedAttribute{
-						MarkdownDescription: "SSH keys.",
+					"direct_connect_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable Direct Connect (remote access).",
 						Optional:            true,
 						Computed:            true,
-						NestedObject: schema.NestedAttributeObject{
-							Attributes: map[string]schema.Attribute{
-								"name": schema.StringAttribute{
-									MarkdownDescription: "Name of SSH key.",
-									Required:            true,
-								},
-								"type": schema.StringAttribute{
-									MarkdownDescription: "Type of SSH key, e.g. ssh-rsa.",
-									Required:            true,
-								},
-								"key": schema.StringAttribute{
-									MarkdownDescription: "Public SSH key.",
-									Optional:            true,
-									Computed:            true,
-								},
-								"comment": schema.StringAttribute{
-									MarkdownDescription: "Comment.",
-									Optional:            true,
-									Computed:            true,
+					},
+					"unifi_idp_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable the UniFi Identity Provider.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"wifiman_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable WiFiman.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"ssh": schema.SingleNestedAttribute{
+						MarkdownDescription: "Device SSH access settings.",
+						Optional:            true,
+						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"enabled": schema.BoolAttribute{
+								MarkdownDescription: "Enable SSH authentication.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"username": schema.StringAttribute{
+								MarkdownDescription: "SSH username for device access.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"password": schema.StringAttribute{
+								MarkdownDescription: "SSH password for device access. Sensitive — the controller " +
+									"stores only a hash, so this value is kept from configuration and not read back.",
+								Optional:  true,
+								Sensitive: true,
+							},
+							"auth_password_enabled": schema.BoolAttribute{
+								MarkdownDescription: "Allow SSH password authentication (in addition to keys).",
+								Optional:            true,
+								Computed:            true,
+							},
+							"keys": schema.ListNestedAttribute{
+								MarkdownDescription: "SSH keys.",
+								Optional:            true,
+								Computed:            true,
+								NestedObject: schema.NestedAttributeObject{
+									Attributes: map[string]schema.Attribute{
+										"name": schema.StringAttribute{
+											MarkdownDescription: "Name of SSH key.",
+											Required:            true,
+										},
+										"type": schema.StringAttribute{
+											MarkdownDescription: "Type of SSH key, e.g. ssh-rsa.",
+											Required:            true,
+										},
+										"key": schema.StringAttribute{
+											MarkdownDescription: "Public SSH key.",
+											Optional:            true,
+											Computed:            true,
+										},
+										"comment": schema.StringAttribute{
+											MarkdownDescription: "Comment.",
+											Optional:            true,
+											Computed:            true,
+										},
+									},
 								},
 							},
 						},
@@ -196,6 +1378,9 @@ func (r *settingResource) Schema(
 				MarkdownDescription: "RADIUS settings.",
 				Optional:            true,
 				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 				Attributes: map[string]schema.Attribute{
 					"accounting_enabled": schema.BoolAttribute{
 						MarkdownDescription: "Enable RADIUS accounting.",
@@ -218,19 +1403,19 @@ func (r *settingResource) Schema(
 							int64validator.Between(1, 65535),
 						},
 					},
-					"interim_update_interval": schema.Int64Attribute{
-						MarkdownDescription: "Interim update interval in seconds.",
-						Optional:            true,
-						Computed:            true,
-						Validators: []validator.Int64{
-							int64validator.Between(60, 86400),
-						},
+					"interim_update_interval": schema.StringAttribute{
+						MarkdownDescription: "Interim update interval, as a Go duration string " +
+							"(e.g. `1h`, `3600s`).",
+						CustomType: timetypes.GoDurationType{},
+						Optional:   true,
+						Computed:   true,
 					},
 					"secret": schema.StringAttribute{
-						MarkdownDescription: "RADIUS shared secret.",
-						Optional:            true,
-						Computed:            true,
-						Sensitive:           true,
+						MarkdownDescription: "RADIUS shared secret. Stored in state; use " +
+							"the root-level `radius_secret_wo` to avoid persisting the secret.",
+						Optional:  true,
+						Computed:  true,
+						Sensitive: true,
 						Validators: []validator.String{
 							stringvalidator.LengthBetween(1, 48),
 							stringvalidator.RegexMatches(
@@ -241,10 +1426,122 @@ func (r *settingResource) Schema(
 					},
 				},
 			},
+			"radius_secret_wo": schema.StringAttribute{
+				MarkdownDescription: "Write-only equivalent of `radius.secret` (Terraform " +
+					"1.11+). Used at apply time but never written to state. It sits at the " +
+					"root rather than inside `radius` because Terraform does not allow a " +
+					"write-only attribute inside a computed nested attribute. Requires the " +
+					"`radius` block (`radius = {}` is enough) and is mutually exclusive " +
+					"with `radius.secret`. Because nothing is stored, a secret changed " +
+					"outside Terraform produces no diff; increment `radius_secret_wo_version` " +
+					"to send a new value.",
+				Optional:  true,
+				Sensitive: true,
+				WriteOnly: true,
+				Validators: []validator.String{
+					stringvalidator.LengthBetween(1, 48),
+					stringvalidator.RegexMatches(
+						regexp.MustCompile(`^[^\\\ "']+$`),
+						"must not contain backslashes, spaces, single quotes, or double quotes",
+					),
+					stringvalidator.ConflictsWith(path.MatchRoot("radius").AtName("secret")),
+					stringvalidator.AlsoRequires(path.MatchRoot("radius")),
+				},
+			},
+			"radius_secret_wo_version": schema.Int64Attribute{
+				MarkdownDescription: "Version counter for `radius_secret_wo`. Increment " +
+					"this value to trigger a RADIUS secret update.",
+				Optional: true,
+				Validators: []validator.Int64{
+					int64validator.AtLeast(1),
+					int64validator.AlsoRequires(path.MatchRoot("radius_secret_wo")),
+				},
+			},
+			"snmp": schema.SingleNestedAttribute{
+				MarkdownDescription: "SNMP agent settings (Settings > System > SNMP): " +
+					"a v1/v2c community and a single SNMPv3 user. Only configured SNMP settings are read; import does not populate this attribute.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable SNMP v1/v2c.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"community": schema.StringAttribute{
+						MarkdownDescription: "SNMP v1/v2c community string.",
+						Optional:            true,
+						Computed:            true,
+						Sensitive:           true,
+						Validators: []validator.String{
+							stringvalidator.LengthBetween(1, 256),
+						},
+					},
+					"enabled_v3": schema.BoolAttribute{
+						MarkdownDescription: "Enable SNMPv3.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"username": schema.StringAttribute{
+						MarkdownDescription: "SNMPv3 username.",
+						Optional:            true,
+						Computed:            true,
+						Validators: []validator.String{
+							stringvalidator.RegexMatches(
+								regexp.MustCompile(`^[a-zA-Z0-9_-]{1,30}$`),
+								"must be 1-30 characters of letters, digits, underscores, or hyphens",
+							),
+						},
+					},
+					"password": schema.StringAttribute{
+						MarkdownDescription: "SNMPv3 password, stored in state. The configured value is preserved on read because controllers may omit or mask the password. External password changes are not detected. Mutually exclusive with `password_wo`.",
+						Optional:            true,
+						Sensitive:           true,
+						Validators: []validator.String{
+							stringvalidator.ConflictsWith(
+								path.MatchRoot("snmp").AtName("password_wo"),
+							),
+							stringvalidator.LengthBetween(8, 32),
+							stringvalidator.RegexMatches(
+								regexp.MustCompile(`^[^'"]+$`),
+								"must not contain single or double quotes",
+							),
+						},
+					},
+					"password_wo": schema.StringAttribute{
+						MarkdownDescription: "Write-only SNMPv3 password (Terraform 1.11+), never stored in plan or state; accepts ephemeral values. Mutually exclusive with `password`. Set `password_wo_version` and change it to rotate this password. Changing only this value does not trigger an update. External password changes are not detected.",
+						Optional:            true,
+						Sensitive:           true,
+						WriteOnly:           true,
+						Validators: []validator.String{
+							stringvalidator.LengthBetween(8, 32),
+							stringvalidator.RegexMatches(
+								regexp.MustCompile(`^[^'"]+$`),
+								"must not contain single or double quotes",
+							),
+							stringvalidator.AlsoRequires(
+								path.MatchRoot("snmp").AtName("password_wo_version"),
+							),
+						},
+					},
+					"password_wo_version": schema.Int64Attribute{
+						MarkdownDescription: "Positive version for `password_wo`. Required with `password_wo`; change it whenever the write-only password should be applied. The version is stored in state. An unchanged version preserves the controller password during other updates.",
+						Optional:            true,
+						Validators: []validator.Int64{
+							int64validator.AtLeast(1),
+							int64validator.AlsoRequires(
+								path.MatchRoot("snmp").AtName("password_wo"),
+							),
+						},
+					},
+				},
+			},
 			"usg": schema.SingleNestedAttribute{
 				MarkdownDescription: "USG settings.",
 				Optional:            true,
 				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 				Attributes: map[string]schema.Attribute{
 					"broadcast_ping": schema.BoolAttribute{
 						MarkdownDescription: "Enable broadcast ping.",
@@ -283,25 +1580,32 @@ func (r *settingResource) Schema(
 						Optional:            true,
 						Computed:            true,
 					},
-					"geo_ip_filtering_block": schema.StringAttribute{
-						MarkdownDescription: "Geo IP filtering action: block or allow.",
+					"geo_ip_filtering": schema.SingleNestedAttribute{
+						MarkdownDescription: "Geo IP filtering (Region Blocking) settings.",
 						Optional:            true,
 						Computed:            true,
-					},
-					"geo_ip_filtering_countries": schema.StringAttribute{
-						MarkdownDescription: "Comma-separated list of country codes for geo IP filtering.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"geo_ip_filtering_enabled": schema.BoolAttribute{
-						MarkdownDescription: "Enable geo IP filtering.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"geo_ip_filtering_traffic_direction": schema.StringAttribute{
-						MarkdownDescription: "Geo IP filtering traffic direction: both, ingress, or egress.",
-						Optional:            true,
-						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"block": schema.StringAttribute{
+								MarkdownDescription: "Geo IP filtering action: block or allow.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"countries": schema.StringAttribute{
+								MarkdownDescription: "Comma-separated list of country codes for geo IP filtering.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"enabled": schema.BoolAttribute{
+								MarkdownDescription: "Enable geo IP filtering.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"traffic_direction": schema.StringAttribute{
+								MarkdownDescription: "Geo IP filtering traffic direction: both, ingress, or egress.",
+								Optional:            true,
+								Computed:            true,
+							},
+						},
 					},
 					"gre_module": schema.BoolAttribute{
 						MarkdownDescription: "Enable GRE module.",
@@ -313,8 +1617,9 @@ func (r *settingResource) Schema(
 						Optional:            true,
 						Computed:            true,
 					},
-					"icmp_timeout": schema.Int64Attribute{
-						MarkdownDescription: "ICMP connection timeout in seconds.",
+					"icmp_timeout": schema.StringAttribute{
+						MarkdownDescription: "ICMP connection timeout, as a Go duration string (e.g. `30s`, `1m`).",
+						CustomType:          timetypes.GoDurationType{},
 						Optional:            true,
 						Computed:            true,
 					},
@@ -323,23 +1628,31 @@ func (r *settingResource) Schema(
 						Optional:            true,
 						Computed:            true,
 					},
-					"offload_accounting": schema.BoolAttribute{
-						MarkdownDescription: "Enable hardware offload for accounting.",
+					"offload": schema.SingleNestedAttribute{
+						MarkdownDescription: "Hardware offload settings.",
 						Optional:            true,
 						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"accounting": schema.BoolAttribute{
+								MarkdownDescription: "Enable hardware offload for accounting.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"l2_blocking": schema.BoolAttribute{
+								MarkdownDescription: "Enable hardware offload for L2 blocking.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"sch": schema.BoolAttribute{
+								MarkdownDescription: "Enable hardware offload for scheduling.",
+								Optional:            true,
+								Computed:            true,
+							},
+						},
 					},
-					"offload_l2_blocking": schema.BoolAttribute{
-						MarkdownDescription: "Enable hardware offload for L2 blocking.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"offload_sch": schema.BoolAttribute{
-						MarkdownDescription: "Enable hardware offload for scheduling.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"other_timeout": schema.Int64Attribute{
-						MarkdownDescription: "Other connections timeout in seconds.",
+					"other_timeout": schema.StringAttribute{
+						MarkdownDescription: "Other connections timeout, as a Go duration string (e.g. `600s`, `10m`).",
+						CustomType:          timetypes.GoDurationType{},
 						Optional:            true,
 						Computed:            true,
 					},
@@ -368,45 +1681,60 @@ func (r *settingResource) Schema(
 						Optional:            true,
 						Computed:            true,
 					},
-					"tcp_close_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP close timeout in seconds.",
+					"tcp": schema.SingleNestedAttribute{
+						MarkdownDescription: "TCP connection tracking timeouts.",
 						Optional:            true,
 						Computed:            true,
-					},
-					"tcp_close_wait_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP close wait timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"tcp_established_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP established connection timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"tcp_fin_wait_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP fin wait timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"tcp_last_ack_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP last ACK timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"tcp_syn_recv_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP SYN received timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"tcp_syn_sent_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP SYN sent timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"tcp_time_wait_timeout": schema.Int64Attribute{
-						MarkdownDescription: "TCP time wait timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"close_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP close timeout, as a Go duration string (e.g. `10s`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"close_wait_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP close wait timeout, as a Go duration string (e.g. `60s`, `1m`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"established_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP established connection timeout, as a Go duration string (e.g. `7440s`, `2h4m`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"fin_wait_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP fin wait timeout, as a Go duration string (e.g. `120s`, `2m`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"last_ack_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP last ACK timeout, as a Go duration string (e.g. `30s`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"syn_recv_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP SYN received timeout, as a Go duration string (e.g. `60s`, `1m`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"syn_sent_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP SYN sent timeout, as a Go duration string (e.g. `120s`, `2m`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"time_wait_timeout": schema.StringAttribute{
+								MarkdownDescription: "TCP time wait timeout, as a Go duration string (e.g. `120s`, `2m`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+						},
 					},
 					"tftp_module": schema.BoolAttribute{
 						MarkdownDescription: "Enable TFTP module.",
@@ -418,45 +1746,845 @@ func (r *settingResource) Schema(
 						Optional:            true,
 						Computed:            true,
 					},
-					"udp_other_timeout": schema.Int64Attribute{
-						MarkdownDescription: "UDP other timeout in seconds.",
+					"udp": schema.SingleNestedAttribute{
+						MarkdownDescription: "UDP connection tracking timeouts.",
 						Optional:            true,
 						Computed:            true,
-					},
-					"udp_stream_timeout": schema.Int64Attribute{
-						MarkdownDescription: "UDP stream timeout in seconds.",
-						Optional:            true,
-						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"other_timeout": schema.StringAttribute{
+								MarkdownDescription: "UDP other timeout, as a Go duration string (e.g. `30s`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+							"stream_timeout": schema.StringAttribute{
+								MarkdownDescription: "UDP stream timeout, as a Go duration string (e.g. `180s`, `3m`).",
+								CustomType:          timetypes.GoDurationType{},
+								Optional:            true,
+								Computed:            true,
+							},
+						},
 					},
 					"unbind_wan_monitors": schema.BoolAttribute{
 						MarkdownDescription: "Unbind WAN monitors.",
 						Optional:            true,
 						Computed:            true,
 					},
-					"upnp_enabled": schema.BoolAttribute{
-						MarkdownDescription: "Enable UPnP.",
+					"upnp": schema.SingleNestedAttribute{
+						MarkdownDescription: "UPnP settings.",
 						Optional:            true,
 						Computed:            true,
-					},
-					"upnp_nat_pmp_enabled": schema.BoolAttribute{
-						MarkdownDescription: "Enable UPnP NAT-PMP.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"upnp_secure_mode": schema.BoolAttribute{
-						MarkdownDescription: "Enable UPnP secure mode.",
-						Optional:            true,
-						Computed:            true,
-					},
-					"upnp_wan_interface": schema.StringAttribute{
-						MarkdownDescription: "UPnP WAN interface (e.g., WAN, WAN2).",
-						Optional:            true,
-						Computed:            true,
+						Attributes: map[string]schema.Attribute{
+							"enabled": schema.BoolAttribute{
+								MarkdownDescription: "Enable UPnP.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"nat_pmp_enabled": schema.BoolAttribute{
+								MarkdownDescription: "Enable UPnP NAT-PMP.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"secure_mode": schema.BoolAttribute{
+								MarkdownDescription: "Enable UPnP secure mode.",
+								Optional:            true,
+								Computed:            true,
+							},
+							"wan_interface": schema.StringAttribute{
+								MarkdownDescription: "UPnP WAN interface (e.g., WAN, WAN2).",
+								Optional:            true,
+								Computed:            true,
+							},
+						},
 					},
 				},
 			},
+			"igmp_snooping": schema.SingleNestedAttribute{
+				MarkdownDescription: "Site-level IGMP snooping setting. On UniFi Network 10.3.x+ the effective IGMP snooping toggle lives here rather than on each network. Advanced querier/flood options configured in the UI are preserved across updates.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether IGMP snooping is enabled for the site.",
+						Optional:            true,
+						Computed:            true,
+					},
+					"network_ids": schema.ListAttribute{
+						MarkdownDescription: "IDs of the networks IGMP snooping applies to.",
+						ElementType:         types.StringType,
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+					},
+				},
+			},
+			"connectivity": schema.SingleNestedAttribute{
+				MarkdownDescription: "Wireless meshing and uplink connectivity " +
+					"(Settings > WiFi > Wireless Meshing). Disabling meshing frees the " +
+					"standby mesh radio and doubles the per-band SSID budget: with " +
+					"meshing on, APs reserve a hidden backhaul SSID and allow 4 SSIDs " +
+					"per band instead of 8. The controller-generated mesh SSID and " +
+					"pre-shared key are not exposed and are preserved across updates, " +
+					"as are any options this block does not model.",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable Wireless Meshing for the site.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"mlo_mesh_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable Multi-Link Operation (MLO) for the " +
+							"mesh backhaul. Requires WiFi 7 hardware.",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"uplink_type": schema.StringAttribute{
+						MarkdownDescription: "How the site reaches the controller: " +
+							"`gateway` or `internet`.",
+						Optional: true,
+						Computed: true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("gateway", "internet"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"uplink_host": schema.StringAttribute{
+						MarkdownDescription: "Host the site uses to verify connectivity " +
+							"when `uplink_type` is `internet`.",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+				},
+			},
+			"mdns": mdnsSchemaAttribute(),
+			"radio_ai": schema.SingleNestedAttribute{
+				MarkdownDescription: "Channel AI, the nightly channel optimization " +
+					"(Settings > WiFi > Channel AI). On its schedule the optimizer " +
+					"rewrites the channel of every radio in the bands listed in " +
+					"`radios`, overriding a channel set on the device, so leaving a " +
+					"band out of `radios` is how its channel is pinned while the " +
+					"others stay optimized. Only the attributes set in config are " +
+					"written; the others keep their controller values.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "The controller's `enabled` flag for " +
+							"Channel AI: run the optimizer on its `cron_expr` schedule.",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"auto_enabled": schema.BoolAttribute{
+						MarkdownDescription: "The controller's `auto_enabled` flag: " +
+							"whether automatic channel optimization is enabled. It is " +
+							"a separate key from `enabled` and is written as given, " +
+							"without changing `enabled`. Left out of the " +
+							"configuration, the controller's value is kept (and not " +
+							"tracked when the controller does not report it).",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"cron_expr": schema.StringAttribute{
+						MarkdownDescription: "When the optimizer runs, as a cron " +
+							"expression in the controller's time zone (e.g. `0 3 * * *`).",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"radios": radioAiStringList(
+						"Bands the optimizer may change: `ng` (2.4 GHz), `na` "+
+							"(5 GHz), `6e` (6 GHz).",
+						stringvalidator.OneOf("ng", "na", "6e"),
+					),
+					"optimize": radioAiStringList(
+						"What the optimizer adjusts: `channel`, `power`.",
+						stringvalidator.OneOf("channel", "power"),
+					),
+					"channels_ng": radioAiChannelList(
+						"2.4 GHz channels the optimizer may choose from.",
+						int64validator.Between(1, 14),
+					),
+					"channels_na": radioAiChannelList(
+						"5 GHz channels the optimizer may choose from. The "+
+							"controller drops the DFS channels (52-144) when the `na` "+
+							"entry of `radios_configuration` has `dfs = false`, so "+
+							"listing them then fails the plan. It may also narrow the "+
+							"list to the site's country (`auto_adjust_channels_to_country`) "+
+							"or the preset (`auto_channel_presets_type` other than "+
+							"`custom`); leave the list out to keep what the controller "+
+							"derives.",
+						int64validator.Between(34, 177),
+					),
+					"channels_6e": radioAiChannelList(
+						"6 GHz channels the optimizer may choose from.",
+						int64validator.Between(1, 233),
+					),
+					"exclude_devices": radioAiStringList(
+						"MAC addresses of devices the optimizer leaves alone.",
+						stringvalidator.RegexMatches(
+							regexp.MustCompile(`^([0-9a-f]{2}:){5}[0-9a-f]{2}$`),
+							"must be a lowercase MAC address",
+						),
+					),
+					"setting_preference": schema.StringAttribute{
+						MarkdownDescription: "`auto` or `manual`.",
+						Optional:            true,
+						Computed:            true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("auto", "manual"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"auto_channel_presets_type": schema.StringAttribute{
+						MarkdownDescription: "Channel preset: `maximum_speed`, " +
+							"`conservative` or `custom` (the `channels_*` lists).",
+						Optional: true,
+						Computed: true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("maximum_speed", "conservative", "custom"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"auto_adjust_channels_to_country": schema.BoolAttribute{
+						MarkdownDescription: "Restrict the channel lists to the site's country.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"ht_modes_ng": radioAiChannelList(
+						"2.4 GHz channel widths (MHz) the optimizer may use: `20`, "+
+							"`40`. Each must be at most the `channel_width` of the "+
+							"`ng` entry of `radios_configuration` (the controller "+
+							"drops wider ones), or the plan fails.",
+						int64validator.OneOf(20, 40),
+					),
+					"ht_modes_na": radioAiChannelList(
+						"5 GHz channel widths (MHz) the optimizer may use: `20`, "+
+							"`40`, `80`, `160`. Each must be at most the "+
+							"`channel_width` of the `na` entry of "+
+							"`radios_configuration` (the controller drops wider "+
+							"ones), or the plan fails.",
+						int64validator.OneOf(20, 40, 80, 160),
+					),
+					"high_priority_devices": radioAiStringList(
+						"MAC addresses of devices the optimizer handles first.",
+						stringvalidator.RegexMatches(
+							regexp.MustCompile(`^([0-9a-f]{2}:){5}[0-9a-f]{2}$`),
+							"must be a lowercase MAC address",
+						),
+					),
+					"channels_blacklist": schema.ListNestedAttribute{
+						MarkdownDescription: "Channels the optimizer must not use.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+						NestedObject: schema.NestedAttributeObject{
+							Attributes: map[string]schema.Attribute{
+								"radio": schema.StringAttribute{
+									MarkdownDescription: "Band: `ng`, `na` or `6e`.",
+									Required:            true,
+									Validators: []validator.String{
+										stringvalidator.OneOf("ng", "na", "6e"),
+									},
+								},
+								"channel": schema.Int64Attribute{
+									MarkdownDescription: "Channel number.",
+									Required:            true,
+								},
+								"channel_width": schema.Int64Attribute{
+									MarkdownDescription: "Channel width in MHz.",
+									Required:            true,
+								},
+							},
+						},
+					},
+					"radios_configuration": schema.ListNestedAttribute{
+						MarkdownDescription: "Per-band channel width and DFS use.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+						NestedObject: schema.NestedAttributeObject{
+							Attributes: map[string]schema.Attribute{
+								"radio": schema.StringAttribute{
+									MarkdownDescription: "Band: `ng`, `na` or `6e`.",
+									Required:            true,
+									Validators: []validator.String{
+										stringvalidator.OneOf("ng", "na", "6e"),
+									},
+								},
+								"channel_width": schema.Int64Attribute{
+									MarkdownDescription: "Channel width in MHz.",
+									Required:            true,
+								},
+								"dfs": schema.BoolAttribute{
+									MarkdownDescription: "Whether DFS channels may be used.",
+									Required:            true,
+								},
+							},
+						},
+					},
+				},
+			},
+			"global_switch": schema.SingleNestedAttribute{
+				MarkdownDescription: "Site-wide switch settings (Settings > Networks > Global Switch Settings). " +
+					"On current controllers jumbo frames are only honored here, not via `unifi_device.jumboframe_enabled`. " +
+					"Options not exposed by this block are preserved across updates.",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"acl_device_isolation": schema.ListAttribute{
+						MarkdownDescription: "Network IDs with Client Device Isolation " +
+							"enabled (Settings > Networks > \"Device Isolation (ACL)\"), " +
+							"which blocks all communication between devices in the same " +
+							"network. This is a switch ACL: it covers same-network " +
+							"traffic across access points, which `unifi_wlan.l2_isolation` " +
+							"(one access point) and `unifi_network.network_isolation` " +
+							"(between networks) do not. The controller only offers it for " +
+							"networks routed by a UniFi gateway or L3 switch, and some " +
+							"switch models do not support ACLs at all - it rejects an " +
+							"unsupported network rather than silently ignoring it.",
+						ElementType: types.StringType,
+						Optional:    true,
+						Computed:    true,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"stp_version": schema.StringAttribute{
+						MarkdownDescription: "Spanning Tree Protocol mode for all switches: `stp`, `rstp`, or `disabled`.",
+						Optional:            true,
+						Computed:            true,
+						Validators: []validator.String{
+							stringvalidator.OneOf("stp", "rstp", "disabled"),
+						},
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"dhcp_snoop": schema.BoolAttribute{
+						MarkdownDescription: "Enable Rogue DHCP Server Detection (DHCP snooping).",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"jumboframe_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable jumbo frames on all switches.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"dot1x_portctrl_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable 802.1X port control.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
+				},
+			},
+			"etherlighting": schema.SingleNestedAttribute{
+				MarkdownDescription: "Site-wide Etherlighting colors for switches with " +
+					"per-port LED lighting. Switches in `speed` mode color each port by " +
+					"its link speed, those in `network` mode by its network; set the mode " +
+					"per switch with `unifi_device`'s `etherlighting` block. Each list " +
+					"replaces the controller's list when set and is left untouched when " +
+					"omitted.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"network_overrides": schema.ListNestedAttribute{
+						MarkdownDescription: "Colors for ports on the given network.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+						NestedObject: schema.NestedAttributeObject{
+							Attributes: map[string]schema.Attribute{
+								"network": schema.StringAttribute{
+									MarkdownDescription: "ID of the network.",
+									Required:            true,
+								},
+								"color": schema.StringAttribute{
+									MarkdownDescription: "6-digit hex color without the leading `#` (e.g. `ff0000`).",
+									Required:            true,
+									Validators: []validator.String{
+										etherLightingColorValidator,
+									},
+								},
+							},
+						},
+					},
+					"speed_overrides": schema.ListNestedAttribute{
+						MarkdownDescription: "Colors for ports linked at the given speed.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.List{
+							listplanmodifier.UseStateForUnknown(),
+						},
+						NestedObject: schema.NestedAttributeObject{
+							Attributes: map[string]schema.Attribute{
+								"speed": schema.StringAttribute{
+									MarkdownDescription: "Link speed: `FE`, `GbE`, `2.5GbE`, `5GbE`, " +
+										"`10GbE`, `25GbE`, `40GbE` or `100GbE`.",
+									Required: true,
+									Validators: []validator.String{
+										stringvalidator.OneOf(
+											"FE", "GbE", "2.5GbE", "5GbE",
+											"10GbE", "25GbE", "40GbE", "100GbE",
+										),
+									},
+								},
+								"color": schema.StringAttribute{
+									MarkdownDescription: "6-digit hex color without the leading `#` (e.g. `ff0000`).",
+									Required:            true,
+									Validators: []validator.String{
+										etherLightingColorValidator,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"timeouts": timeouts.Attributes(
+				ctx,
+				timeouts.Opts{Create: true, Read: true, Update: true, Delete: true},
+			),
 		},
 	}
+}
+
+// settingSyslogThisControllerDefault reproduces the defaults the flat
+// syslog.this_controller / this_controller_encrypted_only leaves had, so an
+// omitted block still sends the same request body.
+func settingSyslogThisControllerDefault() types.Object {
+	return types.ObjectValueMust(syslogThisControllerAttrTypes, map[string]attr.Value{
+		"enabled":        types.BoolValue(false),
+		"encrypted_only": types.BoolValue(false),
+	})
+}
+
+// UpgradeState migrates prior schema versions to the current one:
+//
+//   - v0 -> radius.interim_update_interval and the usg conntrack timeouts
+//     changed from integer seconds to GoDuration strings.
+//   - v1 -> prefixed usg/mgmt/syslog/ips attributes moved into nested objects.
+//
+// Every upgrader targets the current schema, so each one also applies the
+// nesting rewrite.
+func (r *settingResource) UpgradeState(
+	ctx context.Context,
+) map[int64]resource.StateUpgrader {
+	var schemaResp resource.SchemaResponse
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	upgrader := func(rewrite func(state map[string]any)) resource.StateUpgrader {
+		return resource.StateUpgrader{
+			StateUpgrader: func(
+				ctx context.Context,
+				req resource.UpgradeStateRequest,
+				resp *resource.UpgradeStateResponse,
+			) {
+				if req.RawState == nil {
+					return
+				}
+				dv, err := util.UpgradeRawState(
+					schemaType,
+					req.RawState.JSON,
+					func(state map[string]any) {
+						rewrite(state)
+						nestSettingState(state)
+					},
+				)
+				if err != nil {
+					resp.Diagnostics.AddError("Failed to upgrade settings state", err.Error())
+					return
+				}
+				resp.DynamicValue = dv
+			},
+		}
+	}
+
+	conntrack := []string{
+		"icmp_timeout", "other_timeout",
+		"tcp_close_timeout", "tcp_close_wait_timeout", "tcp_established_timeout",
+		"tcp_fin_wait_timeout", "tcp_last_ack_timeout", "tcp_syn_recv_timeout",
+		"tcp_syn_sent_timeout", "tcp_time_wait_timeout",
+		"udp_other_timeout", "udp_stream_timeout",
+	}
+
+	return map[int64]resource.StateUpgrader{
+		0: upgrader(func(state map[string]any) {
+			util.WithObject(state, "radius", func(radius map[string]any) {
+				util.SetDurationField(radius, "interim_update_interval", time.Second)
+			})
+			util.WithObject(state, "usg", func(usg map[string]any) {
+				for _, n := range conntrack {
+					util.SetDurationField(usg, n, time.Second)
+				}
+			})
+		}),
+		// v1 already stores durations as strings; only the nesting applies.
+		1: upgrader(func(map[string]any) {}),
+	}
+}
+
+// nestSettingState rewrites flat v0/v1 setting state into the nested-object
+// layout introduced in schema v2. Keys that are absent are skipped, so it is
+// safe to run on state from any earlier version.
+func nestSettingState(state map[string]any) {
+	util.WithObject(state, "usg", func(usg map[string]any) {
+		util.NestFields(usg, "tcp", map[string]string{
+			"tcp_close_timeout":       "close_timeout",
+			"tcp_close_wait_timeout":  "close_wait_timeout",
+			"tcp_established_timeout": "established_timeout",
+			"tcp_fin_wait_timeout":    "fin_wait_timeout",
+			"tcp_last_ack_timeout":    "last_ack_timeout",
+			"tcp_syn_recv_timeout":    "syn_recv_timeout",
+			"tcp_syn_sent_timeout":    "syn_sent_timeout",
+			"tcp_time_wait_timeout":   "time_wait_timeout",
+		})
+		util.NestFields(usg, "udp", map[string]string{
+			"udp_other_timeout":  "other_timeout",
+			"udp_stream_timeout": "stream_timeout",
+		})
+		util.NestFields(usg, "upnp", map[string]string{
+			"upnp_enabled":         "enabled",
+			"upnp_nat_pmp_enabled": "nat_pmp_enabled",
+			"upnp_secure_mode":     "secure_mode",
+			"upnp_wan_interface":   "wan_interface",
+		})
+		util.NestFields(usg, "geo_ip_filtering", map[string]string{
+			"geo_ip_filtering_block":             "block",
+			"geo_ip_filtering_countries":         "countries",
+			"geo_ip_filtering_enabled":           "enabled",
+			"geo_ip_filtering_traffic_direction": "traffic_direction",
+		})
+		util.NestFields(usg, "offload", map[string]string{
+			"offload_accounting":  "accounting",
+			"offload_l2_blocking": "l2_blocking",
+			"offload_sch":         "sch",
+		})
+	})
+	util.WithObject(state, "mgmt", func(mgmt map[string]any) {
+		util.NestFields(mgmt, "ssh", map[string]string{
+			"ssh_enabled":               "enabled",
+			"ssh_keys":                  "keys",
+			"ssh_username":              "username",
+			"ssh_password":              "password",
+			"ssh_auth_password_enabled": "auth_password_enabled",
+		})
+		util.NestFields(mgmt, "auto_upgrade", map[string]string{
+			"auto_upgrade":      "enabled",
+			"auto_upgrade_hour": "hour",
+		})
+	})
+	util.WithObject(state, "syslog", func(syslog map[string]any) {
+		util.NestFields(syslog, "netconsole", map[string]string{
+			"netconsole_enabled": "enabled",
+			"netconsole_host":    "host",
+			"netconsole_port":    "port",
+		})
+		util.NestFields(syslog, "this_controller", map[string]string{
+			"this_controller":                "enabled",
+			"this_controller_encrypted_only": "encrypted_only",
+		})
+	})
+	util.WithObject(state, "ips", func(ips map[string]any) {
+		util.NestFields(ips, "suppression", map[string]string{
+			"suppression_whitelist": "whitelist",
+			"suppression_alerts":    "alerts",
+		})
+	})
+}
+
+// settingSectionDefaults are the leaf defaults of the setting sections. They
+// are not schema Defaults for the reason given on ModifyPlan, which applies
+// them to a section the configuration sets.
+var settingSectionDefaults = []struct {
+	section  path.Path
+	defaults map[string]attr.Value
+}{
+	{path.Root("auto_speedtest"), map[string]attr.Value{
+		"enabled": types.BoolValue(false),
+	}},
+	{path.Root("dpi"), map[string]attr.Value{
+		"enabled":                types.BoolValue(false),
+		"fingerprinting_enabled": types.BoolValue(false),
+	}},
+	{path.Root("lcm"), map[string]attr.Value{
+		"enabled":     types.BoolValue(true),
+		"sync":        types.BoolValue(false),
+		"touch_event": types.BoolValue(true),
+	}},
+	{path.Root("network_optimization"), map[string]attr.Value{
+		"enabled": types.BoolValue(false),
+	}},
+	{path.Root("syslog"), map[string]attr.Value{
+		"enabled":          types.BoolValue(false),
+		"log_all_contents": types.BoolValue(false),
+		"debug":            types.BoolValue(false),
+		"this_controller":  settingSyslogThisControllerDefault(),
+	}},
+	{path.Root("syslog").AtName("this_controller"), map[string]attr.Value{
+		"enabled":        types.BoolValue(false),
+		"encrypted_only": types.BoolValue(false),
+	}},
+}
+
+// ModifyPlan applies the section leaf defaults (settingSectionDefaults and
+// the flat syslog.netconsole_enabled default for the nested netconsole
+// object) without schema Defaults: the framework applies a leaf Default even
+// when its parent object is null in configuration and then re-plans the
+// default-less Computed attributes as unknown. A section the configuration
+// leaves out is still in the plan when the prior state holds it (an import
+// reads every section), so a Default there would overwrite the controller's
+// value, trip the framework's plan-change gate and be discarded by
+// UseStateForUnknown anyway. As with the flat attributes, a default only
+// applies when its section is configured; an omitted section keeps the
+// controller's values.
+func (r *settingResource) ModifyPlan(
+	ctx context.Context,
+	req resource.ModifyPlanRequest,
+	resp *resource.ModifyPlanResponse,
+) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+
+	r.planGlobalSwitchUnsetUnknown(ctx, req, resp)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Terraform proposes a configured section with every leaf the
+	// configuration leaves out set to null, which differs from a prior state
+	// that holds those leaves (an import reads every section in full), so the
+	// framework re-plans them as unknown. Keep their prior values, as
+	// UseStateForUnknown does for a section the configuration omits entirely.
+	if !req.State.Raw.IsNull() {
+		for name, a := range req.Plan.Schema.GetAttributes() {
+			// The sections; timeouts carries its own object type.
+			if _, ok := a.GetType().(types.ObjectType); !ok {
+				continue
+			}
+			sectionPath := path.Root(name)
+			var plan, config, prior types.Object
+			resp.Diagnostics.Append(resp.Plan.GetAttribute(ctx, sectionPath, &plan)...)
+			resp.Diagnostics.Append(req.Config.GetAttribute(ctx, sectionPath, &config)...)
+			resp.Diagnostics.Append(req.State.GetAttribute(ctx, sectionPath, &prior)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			restored, d := keepPriorUnconfigured(ctx, plan, config, prior)
+			resp.Diagnostics.Append(d...)
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, sectionPath, restored)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+		}
+	}
+
+	var radioAiConfig, radioAiPlan types.Object
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("radio_ai"), &radioAiConfig)...)
+	resp.Diagnostics.Append(resp.Plan.GetAttribute(ctx, path.Root("radio_ai"), &radioAiPlan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(radioAiDfsConflict(ctx, radioAiConfig, radioAiPlan)...)
+	resp.Diagnostics.Append(radioAiHtModeConflict(ctx, radioAiConfig, radioAiPlan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	for _, s := range settingSectionDefaults {
+		var configSection types.Object
+		resp.Diagnostics.Append(req.Config.GetAttribute(ctx, s.section, &configSection)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if configSection.IsNull() || configSection.IsUnknown() {
+			continue
+		}
+		configAttrs := configSection.Attributes()
+		for name, def := range s.defaults {
+			if v, ok := configAttrs[name]; ok && v.IsNull() {
+				resp.Diagnostics.Append(
+					resp.Plan.SetAttribute(ctx, s.section.AtName(name), def)...)
+			}
+		}
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	var configSyslog types.Object
+	var configEnabled types.Bool
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("syslog"), &configSyslog)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(
+		ctx, path.Root("syslog").AtName("netconsole").AtName("enabled"), &configEnabled)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if configSyslog.IsNull() || configSyslog.IsUnknown() || !configEnabled.IsNull() {
+		return
+	}
+
+	ncPath := path.Root("syslog").AtName("netconsole")
+	var planNC types.Object
+	resp.Diagnostics.Append(resp.Plan.GetAttribute(ctx, ncPath, &planNC)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	var attrs map[string]attr.Value
+	if planNC.IsNull() || planNC.IsUnknown() {
+		attrs = map[string]attr.Value{
+			"enabled": types.BoolValue(false),
+			"host":    types.StringUnknown(),
+			"port":    types.Int64Unknown(),
+		}
+	} else {
+		attrs = planNC.Attributes()
+		if v, ok := attrs["enabled"].(types.Bool); ok && !v.IsNull() && !v.IsUnknown() &&
+			!v.ValueBool() {
+			return
+		}
+		attrs["enabled"] = types.BoolValue(false)
+	}
+	obj, d := types.ObjectValue(syslogNetconsoleAttrTypes, attrs)
+	resp.Diagnostics.Append(d...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, ncPath, obj)...)
+}
+
+// keepPriorUnconfigured returns plan with every attribute that is unknown in
+// plan and null in config replaced by its prior value, null included,
+// descending into the nested objects the configuration sets.
+func keepPriorUnconfigured(
+	ctx context.Context,
+	plan, config, prior types.Object,
+) (types.Object, diag.Diagnostics) {
+	if plan.IsNull() || plan.IsUnknown() || config.IsNull() || config.IsUnknown() ||
+		prior.IsNull() || prior.IsUnknown() {
+		return plan, nil
+	}
+	var diags diag.Diagnostics
+	configAttrs := config.Attributes()
+	priorAttrs := prior.Attributes()
+	attrs := plan.Attributes()
+	for name, planned := range attrs {
+		configured, priorValue := configAttrs[name], priorAttrs[name]
+		if configured == nil || priorValue == nil {
+			continue
+		}
+		if planned.IsUnknown() && configured.IsNull() && !priorValue.IsUnknown() {
+			attrs[name] = priorValue
+			continue
+		}
+		plannedObj, ok1 := planned.(types.Object)
+		configuredObj, ok2 := configured.(types.Object)
+		priorObj, ok3 := priorValue.(types.Object)
+		if ok1 && ok2 && ok3 {
+			nested, d := keepPriorUnconfigured(ctx, plannedObj, configuredObj, priorObj)
+			diags.Append(d...)
+			attrs[name] = nested
+		}
+	}
+	obj, d := types.ObjectValue(plan.AttributeTypes(ctx), attrs)
+	diags.Append(d...)
+	return obj, diags
+}
+
+// planGlobalSwitchUnsetUnknown plans the global_switch fields left out of
+// configuration as unknown. Adding the block to a setting whose state has none
+// otherwise leaves them null, and the read-back after the apply then fails as
+// an inconsistent result. Fields the plan already knows are left alone.
+func (r *settingResource) planGlobalSwitchUnsetUnknown(
+	ctx context.Context,
+	req resource.ModifyPlanRequest,
+	resp *resource.ModifyPlanResponse,
+) {
+	gsPath := path.Root("global_switch")
+	var plan types.Object
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, gsPath, &plan)...)
+	if resp.Diagnostics.HasError() || plan.IsNull() || plan.IsUnknown() {
+		return
+	}
+
+	attrs := plan.Attributes()
+	changed := false
+	for name, typ := range plan.AttributeTypes(ctx) {
+		if v, ok := attrs[name]; !ok || !v.IsNull() {
+			continue
+		}
+		unknown, err := typ.ValueFromTerraform(
+			ctx, tftypes.NewValue(typ.TerraformType(ctx), tftypes.UnknownValue))
+		if err != nil {
+			resp.Diagnostics.AddError("Error planning global_switch", err.Error())
+			return
+		}
+		attrs[name] = unknown
+		changed = true
+	}
+	if !changed {
+		return
+	}
+
+	obj, d := types.ObjectValue(plan.AttributeTypes(ctx), attrs)
+	resp.Diagnostics.Append(d...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, gsPath, obj)...)
 }
 
 func (r *settingResource) Configure(
@@ -495,12 +2623,165 @@ func (r *settingResource) Create(
 		return
 	}
 
+	createTimeout, timeoutDiags := data.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
 	site := data.Site.ValueString()
 	if site == "" {
 		site = r.client.Site
 	}
 
 	// Update each configured setting type
+	if !data.AutoSpeedtest.IsNull() && !data.AutoSpeedtest.IsUnknown() {
+		var as settingAutoSpeedtestModel
+		resp.Diagnostics.Append(data.AutoSpeedtest.As(ctx, &as, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.autoSpeedtestModelToSetting(&as)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating Auto Speedtest Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Country.IsNull() && !data.Country.IsUnknown() {
+		var m settingCountryModel
+		resp.Diagnostics.Append(data.Country.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.countryModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating Country Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Dpi.IsNull() && !data.Dpi.IsUnknown() {
+		var m settingDpiModel
+		resp.Diagnostics.Append(data.Dpi.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.dpiModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating DPI Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Lcm.IsNull() && !data.Lcm.IsUnknown() {
+		var m settingLcmModel
+		resp.Diagnostics.Append(data.Lcm.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.lcmModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating LCM Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.NetworkOpt.IsNull() && !data.NetworkOpt.IsUnknown() {
+		var m settingNetworkOptimizationModel
+		resp.Diagnostics.Append(data.NetworkOpt.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.networkOptimizationModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating Network Optimization Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Ntp.IsNull() && !data.Ntp.IsUnknown() {
+		var m settingNtpModel
+		resp.Diagnostics.Append(data.Ntp.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.ntpModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating NTP Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Syslog.IsNull() && !data.Syslog.IsUnknown() {
+		var m settingSyslogModel
+		resp.Diagnostics.Append(data.Syslog.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.syslogModelToSetting(ctx, &m, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating Syslog Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Doh.IsNull() && !data.Doh.IsUnknown() {
+		var doh settingDohModel
+		resp.Diagnostics.Append(data.Doh.As(ctx, &doh, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		setting := r.dohModelToSetting(ctx, &doh, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating DoH Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Ips.IsNull() && !data.Ips.IsUnknown() {
+		var ips settingIpsModel
+		resp.Diagnostics.Append(data.Ips.As(ctx, &ips, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// Read the live document so unmanaged attributes are carried over
+		// rather than written as false (#493).
+		_, currentIps, err := ui.GetSetting[*settings.Ips](r.client.ApiClient, ctx, site)
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading IPS Setting", err.Error())
+			return
+		}
+		setting, suppression := r.ipsModelToSetting(ctx, &ips, &resp.Diagnostics, currentIps)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating IPS Setting", err.Error())
+			return
+		}
+		// Newer controllers store suppression under the standalone
+		// ips_suppression setting and drop the nested field (#381).
+		var suppressionConfig types.Object
+		resp.Diagnostics.Append(req.Config.GetAttribute(
+			ctx, path.Root("ips").AtName("suppression"), &suppressionConfig)...)
+		r.persistIpsSuppression(
+			ctx, site, suppressionConfig, suppression, setting.EnabledNetworks, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
 	if !data.Mgmt.IsNull() && !data.Mgmt.IsUnknown() {
 		var mgmt settingMgmtModel
 		resp.Diagnostics.Append(data.Mgmt.As(ctx, &mgmt, basetypes.ObjectAsOptions{})...)
@@ -508,8 +2789,19 @@ func (r *settingResource) Create(
 			return
 		}
 
-		setting := r.mgmtModelToSetting(ctx, &mgmt)
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		// Read current remote settings as the base so unset fields keep their values.
+		_, currentMgmt, err := ui.GetSetting[*settings.Mgmt](r.client.ApiClient, ctx, site)
+		if err != nil {
+			var notFound *ui.NotFoundError
+			if !errors.As(err, &notFound) {
+				resp.Diagnostics.AddError("Error Reading Mgmt Setting", err.Error())
+				return
+			}
+			currentMgmt = &settings.Mgmt{}
+		}
+
+		setting := r.mgmtModelToSetting(ctx, &mgmt, currentMgmt)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
 			resp.Diagnostics.AddError("Error Creating Mgmt Setting", err.Error())
 			return
 		}
@@ -534,8 +2826,47 @@ func (r *settingResource) Create(
 		}
 
 		setting := r.radiusModelToSetting(ctx, &radius, currentRadius)
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		secretWO := r.readRadiusSecretWO(ctx, req.Config, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if !secretWO.IsNull() && !secretWO.IsUnknown() {
+			setting.Secret = secretWO.ValueString()
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
 			resp.Diagnostics.AddError("Error Creating Radius Setting", err.Error())
+			return
+		}
+	}
+
+	if !data.Snmp.IsNull() && !data.Snmp.IsUnknown() {
+		var snmp settingSnmpModel
+		resp.Diagnostics.Append(data.Snmp.As(ctx, &snmp, basetypes.ObjectAsOptions{})...)
+		r.readSnmpPasswordWO(
+			ctx,
+			req.Config,
+			&snmp,
+			types.ObjectNull(snmpAttrTypes),
+			&resp.Diagnostics,
+		)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// Read current remote settings as the base so unset fields keep their remote values
+		_, currentSnmp, err := ui.GetSetting[*settings.Snmp](r.client.ApiClient, ctx, site)
+		if err != nil {
+			var notFound *ui.NotFoundError
+			if !errors.As(err, &notFound) {
+				resp.Diagnostics.AddError("Error Reading SNMP Setting", err.Error())
+				return
+			}
+			currentSnmp = &settings.Snmp{}
+		}
+
+		setting := r.snmpModelToSetting(ctx, &snmp, currentSnmp)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating SNMP Setting", err.Error())
 			return
 		}
 	}
@@ -547,11 +2878,81 @@ func (r *settingResource) Create(
 			return
 		}
 
-		setting := r.usgModelToSetting(ctx, &usg)
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		// Read the live document so unmanaged attributes are carried over
+		// rather than written as false (#493).
+		_, currentUsg, err := ui.GetSetting[*settings.Usg](r.client.ApiClient, ctx, site)
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading USG Setting", err.Error())
+			return
+		}
+		setting := r.usgModelToSetting(ctx, &usg, currentUsg)
+		if err := r.writeSetting(ctx, site, setting.Usg); err != nil {
 			resp.Diagnostics.AddError("Error Creating USG Setting", err.Error())
 			return
 		}
+		// Newer controllers store Region Blocking under the standalone
+		// usg_geo setting and ignore the usg geo fields (#374).
+		var geoConfig types.Object
+		resp.Diagnostics.Append(req.Config.GetAttribute(
+			ctx, path.Root("usg").AtName("geo_ip_filtering"), &geoConfig)...)
+		r.persistUsgGeoFiltering(ctx, site, geoConfig, &usg, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	if !data.IgmpSnooping.IsNull() && !data.IgmpSnooping.IsUnknown() {
+		var igmp settingIgmpSnoopingModel
+		resp.Diagnostics.Append(data.IgmpSnooping.As(ctx, &igmp, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// Read current remote setting as the base so advanced querier/flood
+		// fields keep their remote values across the update.
+		_, currentIgmp, err := ui.GetSetting[*settings.IgmpSnooping](r.client.ApiClient, ctx, site)
+		if err != nil {
+			var notFound *ui.NotFoundError
+			if !errors.As(err, &notFound) {
+				resp.Diagnostics.AddError("Error Reading IGMP Snooping Setting", err.Error())
+				return
+			}
+			currentIgmp = &settings.IgmpSnooping{}
+		}
+
+		setting := r.igmpSnoopingModelToSetting(ctx, &igmp, currentIgmp, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating IGMP Snooping Setting", err.Error())
+			return
+		}
+	}
+
+	var globalSwitchConfig types.Object
+	resp.Diagnostics.Append(
+		req.Config.GetAttribute(ctx, path.Root("global_switch"), &globalSwitchConfig)...)
+	r.persistGlobalSwitch(ctx, site, globalSwitchConfig, &resp.Diagnostics)
+
+	var connectivityConfig types.Object
+	resp.Diagnostics.Append(
+		req.Config.GetAttribute(ctx, path.Root("connectivity"), &connectivityConfig)...)
+	r.persistConnectivity(ctx, site, connectivityConfig, &resp.Diagnostics)
+
+	var radioAiConfig types.Object
+	resp.Diagnostics.Append(
+		req.Config.GetAttribute(ctx, path.Root("radio_ai"), &radioAiConfig)...)
+	r.persistRadioAi(ctx, site, radioAiConfig, &resp.Diagnostics)
+
+	r.persistMdns(ctx, site, &data, &resp.Diagnostics)
+
+	var etherLightingConfig types.Object
+	resp.Diagnostics.Append(
+		req.Config.GetAttribute(ctx, path.Root("etherlighting"), &etherLightingConfig)...)
+	r.persistEtherLighting(ctx, site, etherLightingConfig, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
 	}
 
 	// Read back the settings
@@ -560,6 +2961,8 @@ func (r *settingResource) Create(
 		return
 	}
 
+	identity := settingIdentityModel{Site: types.StringValue(site)}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -575,7 +2978,31 @@ func (r *settingResource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Read identity, falling back to state for resources created before
+	// identity support (or refreshed from a string import).
+	var identity settingIdentityModel
+	identityStored := req.Identity != nil && !req.Identity.Raw.IsFullyNull()
+	if identityStored {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
 	site := data.Site.ValueString()
+	if site == "" {
+		// Identity-only state (e.g. the refresh right after an identity-based
+		// import of an old state): read the settings of the identity site.
+		site = identity.Site.ValueString()
+	}
 	if site == "" {
 		site = r.client.Site
 	}
@@ -585,6 +3012,13 @@ func (r *settingResource) Read(
 		return
 	}
 
+	// Terraform rejects any modification of a stored identity, so pass a
+	// stored identity through untouched (resp.Identity is pre-populated from
+	// it) and only derive a fresh one from state when none exists yet.
+	if !identityStored {
+		identity = settingIdentityModel{Site: types.StringValue(site)}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -602,27 +3036,217 @@ func (r *settingResource) Update(
 		return
 	}
 
+	updateTimeout, timeoutDiags := plan.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
 	site := state.Site.ValueString()
 	if site == "" {
 		site = r.client.Site
 	}
 
-	// Update each configured setting type
-	if !plan.Mgmt.IsNull() && !plan.Mgmt.IsUnknown() {
+	// Write only the sections the configuration sets. A section can be planned
+	// without being configured: an import reads every section and
+	// UseStateForUnknown carries it forward. Writing it back would rebuild the
+	// document from the model and reset the controller fields it does not
+	// cover.
+	var config settingResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Update each configured setting type that changed (see settingSectionChanged).
+	if !config.AutoSpeedtest.IsNull() && !plan.AutoSpeedtest.IsNull() &&
+		!plan.AutoSpeedtest.IsUnknown() &&
+		settingSectionChanged(plan.AutoSpeedtest, state.AutoSpeedtest) {
+		var as settingAutoSpeedtestModel
+		resp.Diagnostics.Append(plan.AutoSpeedtest.As(ctx, &as, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.autoSpeedtestModelToSetting(&as)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating Auto Speedtest Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.Country.IsNull() && !plan.Country.IsNull() && !plan.Country.IsUnknown() &&
+		settingSectionChanged(plan.Country, state.Country) {
+		var m settingCountryModel
+		resp.Diagnostics.Append(plan.Country.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.countryModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating Country Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.Dpi.IsNull() && !plan.Dpi.IsNull() && !plan.Dpi.IsUnknown() &&
+		settingSectionChanged(plan.Dpi, state.Dpi) {
+		var m settingDpiModel
+		resp.Diagnostics.Append(plan.Dpi.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.dpiModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating DPI Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.Lcm.IsNull() && !plan.Lcm.IsNull() && !plan.Lcm.IsUnknown() &&
+		settingSectionChanged(plan.Lcm, state.Lcm) {
+		var m settingLcmModel
+		resp.Diagnostics.Append(plan.Lcm.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.lcmModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating LCM Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.NetworkOpt.IsNull() && !plan.NetworkOpt.IsNull() && !plan.NetworkOpt.IsUnknown() &&
+		settingSectionChanged(plan.NetworkOpt, state.NetworkOpt) {
+		var m settingNetworkOptimizationModel
+		resp.Diagnostics.Append(plan.NetworkOpt.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.networkOptimizationModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating Network Optimization Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.Ntp.IsNull() && !plan.Ntp.IsNull() && !plan.Ntp.IsUnknown() &&
+		settingSectionChanged(plan.Ntp, state.Ntp) {
+		var m settingNtpModel
+		resp.Diagnostics.Append(plan.Ntp.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.ntpModelToSetting(&m)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating NTP Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.Syslog.IsNull() && !plan.Syslog.IsNull() && !plan.Syslog.IsUnknown() &&
+		settingSectionChanged(plan.Syslog, state.Syslog) {
+		var m settingSyslogModel
+		resp.Diagnostics.Append(plan.Syslog.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		setting := r.syslogModelToSetting(ctx, &m, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating Syslog Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.Doh.IsNull() && !plan.Doh.IsNull() && !plan.Doh.IsUnknown() &&
+		settingSectionChanged(plan.Doh, state.Doh) {
+		var doh settingDohModel
+		resp.Diagnostics.Append(plan.Doh.As(ctx, &doh, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		setting := r.dohModelToSetting(ctx, &doh, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating DoH Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.Ips.IsNull() && !plan.Ips.IsNull() && !plan.Ips.IsUnknown() &&
+		settingSectionChanged(plan.Ips, state.Ips) {
+		var ips settingIpsModel
+		resp.Diagnostics.Append(plan.Ips.As(ctx, &ips, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// Read the live document so unmanaged attributes are carried over
+		// rather than written as false (#493).
+		_, currentIps, err := ui.GetSetting[*settings.Ips](r.client.ApiClient, ctx, site)
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading IPS Setting", err.Error())
+			return
+		}
+		setting, suppression := r.ipsModelToSetting(ctx, &ips, &resp.Diagnostics, currentIps)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating IPS Setting", err.Error())
+			return
+		}
+		// Newer controllers store suppression under the standalone
+		// ips_suppression setting and drop the nested field (#381).
+		var suppressionConfig types.Object
+		resp.Diagnostics.Append(req.Config.GetAttribute(
+			ctx, path.Root("ips").AtName("suppression"), &suppressionConfig)...)
+		r.persistIpsSuppression(
+			ctx, site, suppressionConfig, suppression, setting.EnabledNetworks, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	if !config.Mgmt.IsNull() && !plan.Mgmt.IsNull() && !plan.Mgmt.IsUnknown() &&
+		settingSectionChanged(plan.Mgmt, state.Mgmt) {
 		var mgmt settingMgmtModel
 		resp.Diagnostics.Append(plan.Mgmt.As(ctx, &mgmt, basetypes.ObjectAsOptions{})...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
-		setting := r.mgmtModelToSetting(ctx, &mgmt)
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		// Read current remote settings as the base so unset fields keep their values.
+		_, currentMgmt, err := ui.GetSetting[*settings.Mgmt](r.client.ApiClient, ctx, site)
+		if err != nil {
+			var notFound *ui.NotFoundError
+			if !errors.As(err, &notFound) {
+				resp.Diagnostics.AddError("Error Reading Mgmt Setting", err.Error())
+				return
+			}
+			currentMgmt = &settings.Mgmt{}
+		}
+
+		setting := r.mgmtModelToSetting(ctx, &mgmt, currentMgmt)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
 			resp.Diagnostics.AddError("Error Updating Mgmt Setting", err.Error())
 			return
 		}
 	}
 
-	if !plan.Radius.IsNull() && !plan.Radius.IsUnknown() {
+	// radius_secret_wo never reaches the radius object, so a version bump is
+	// the only sign that the secret needs writing.
+	if !config.Radius.IsNull() && !plan.Radius.IsNull() && !plan.Radius.IsUnknown() &&
+		(settingSectionChanged(plan.Radius, state.Radius) ||
+			!plan.RadiusSecretWOVersion.Equal(state.RadiusSecretWOVersion)) {
 		var radius settingRadiusModel
 		resp.Diagnostics.Append(plan.Radius.As(ctx, &radius, basetypes.ObjectAsOptions{})...)
 		if resp.Diagnostics.HasError() {
@@ -641,24 +3265,139 @@ func (r *settingResource) Update(
 		}
 
 		setting := r.radiusModelToSetting(ctx, &radius, currentRadius)
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		secretWO := r.readRadiusSecretWO(ctx, req.Config, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if !secretWO.IsNull() && !secretWO.IsUnknown() {
+			setting.Secret = secretWO.ValueString()
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
 			resp.Diagnostics.AddError("Error Updating Radius Setting", err.Error())
 			return
 		}
 	}
 
-	if !plan.USG.IsNull() && !plan.USG.IsUnknown() {
+	if !config.Snmp.IsNull() && !plan.Snmp.IsNull() && !plan.Snmp.IsUnknown() &&
+		settingSectionChanged(plan.Snmp, state.Snmp) {
+		var snmp settingSnmpModel
+		resp.Diagnostics.Append(plan.Snmp.As(ctx, &snmp, basetypes.ObjectAsOptions{})...)
+		r.readSnmpPasswordWO(ctx, req.Config, &snmp, state.Snmp, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// Read current remote settings as the base so unset fields keep their remote values
+		_, currentSnmp, err := ui.GetSetting[*settings.Snmp](r.client.ApiClient, ctx, site)
+		if err != nil {
+			var notFound *ui.NotFoundError
+			if !errors.As(err, &notFound) {
+				resp.Diagnostics.AddError("Error Reading SNMP Setting", err.Error())
+				return
+			}
+			currentSnmp = &settings.Snmp{}
+		}
+
+		setting := r.snmpModelToSetting(ctx, &snmp, currentSnmp)
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating SNMP Setting", err.Error())
+			return
+		}
+	}
+
+	if !config.USG.IsNull() && !plan.USG.IsNull() && !plan.USG.IsUnknown() &&
+		settingSectionChanged(plan.USG, state.USG) {
 		var usg settingUSGModel
 		resp.Diagnostics.Append(plan.USG.As(ctx, &usg, basetypes.ObjectAsOptions{})...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
-		setting := r.usgModelToSetting(ctx, &usg)
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		// Read the live document so unmanaged attributes are carried over
+		// rather than written as false (#493).
+		_, currentUsg, err := ui.GetSetting[*settings.Usg](r.client.ApiClient, ctx, site)
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading USG Setting", err.Error())
+			return
+		}
+		setting := r.usgModelToSetting(ctx, &usg, currentUsg)
+		if err := r.writeSetting(ctx, site, setting.Usg); err != nil {
 			resp.Diagnostics.AddError("Error Updating USG Setting", err.Error())
 			return
 		}
+		// Newer controllers store Region Blocking under the standalone
+		// usg_geo setting and ignore the usg geo fields (#374).
+		var geoConfig types.Object
+		resp.Diagnostics.Append(req.Config.GetAttribute(
+			ctx, path.Root("usg").AtName("geo_ip_filtering"), &geoConfig)...)
+		r.persistUsgGeoFiltering(ctx, site, geoConfig, &usg, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	if !config.IgmpSnooping.IsNull() && !plan.IgmpSnooping.IsNull() &&
+		!plan.IgmpSnooping.IsUnknown() &&
+		settingSectionChanged(plan.IgmpSnooping, state.IgmpSnooping) {
+		var igmp settingIgmpSnoopingModel
+		resp.Diagnostics.Append(plan.IgmpSnooping.As(ctx, &igmp, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		_, currentIgmp, err := ui.GetSetting[*settings.IgmpSnooping](r.client.ApiClient, ctx, site)
+		if err != nil {
+			var notFound *ui.NotFoundError
+			if !errors.As(err, &notFound) {
+				resp.Diagnostics.AddError("Error Reading IGMP Snooping Setting", err.Error())
+				return
+			}
+			currentIgmp = &settings.IgmpSnooping{}
+		}
+
+		setting := r.igmpSnoopingModelToSetting(ctx, &igmp, currentIgmp, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if err := r.writeSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating IGMP Snooping Setting", err.Error())
+			return
+		}
+	}
+
+	if settingSectionChanged(plan.GlobalSwitch, state.GlobalSwitch) {
+		var globalSwitchConfig types.Object
+		resp.Diagnostics.Append(
+			req.Config.GetAttribute(ctx, path.Root("global_switch"), &globalSwitchConfig)...)
+		r.persistGlobalSwitch(ctx, site, globalSwitchConfig, &resp.Diagnostics)
+	}
+
+	if settingSectionChanged(plan.Connectivity, state.Connectivity) {
+		var connectivityConfig types.Object
+		resp.Diagnostics.Append(
+			req.Config.GetAttribute(ctx, path.Root("connectivity"), &connectivityConfig)...)
+		r.persistConnectivity(ctx, site, connectivityConfig, &resp.Diagnostics)
+	}
+
+	if settingSectionChanged(plan.RadioAi, state.RadioAi) {
+		var radioAiConfig types.Object
+		resp.Diagnostics.Append(
+			req.Config.GetAttribute(ctx, path.Root("radio_ai"), &radioAiConfig)...)
+		r.persistRadioAi(ctx, site, radioAiConfig, &resp.Diagnostics)
+	}
+
+	if settingSectionChanged(plan.Mdns, state.Mdns) {
+		r.persistMdns(ctx, site, &plan, &resp.Diagnostics)
+	}
+
+	if settingSectionChanged(plan.EtherLighting, state.EtherLighting) {
+		var etherLightingConfig types.Object
+		resp.Diagnostics.Append(
+			req.Config.GetAttribute(ctx, path.Root("etherlighting"), &etherLightingConfig)...)
+		r.persistEtherLighting(ctx, site, etherLightingConfig, &resp.Diagnostics)
+	}
+	if resp.Diagnostics.HasError() {
+		return
 	}
 
 	// Read back the settings
@@ -667,6 +3406,12 @@ func (r *settingResource) Update(
 		return
 	}
 
+	// Pass a stored identity through untouched; derive it from state only for
+	// resources created before identity support.
+	if req.Identity == nil || req.Identity.Raw.IsFullyNull() {
+		identity := settingIdentityModel{Site: types.StringValue(site)}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -684,12 +3429,192 @@ func (r *settingResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	resource.ImportStatePassthroughID(
-		ctx,
-		path.Root("id"),
-		req,
-		resp,
-	)
+	// Import by resource identity (import block with identity, Terraform 1.12+).
+	if req.ID == "" {
+		var identity settingIdentityModel
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if identity.Site.IsNull() || identity.Site.ValueString() == "" {
+			resp.Diagnostics.AddError(
+				"Invalid Import Identity",
+				"Setting identity must have `site` set to the site name.",
+			)
+			return
+		}
+		// Settings are a per-site singleton whose id is the site name.
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("id"), identity.Site)...)
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+		r.readImportedSettings(ctx, identity.Site.ValueString(), &resp.State, &resp.Diagnostics)
+		return
+	}
+
+	// Import by ID string (terraform import CLI, or import block with id set).
+	// The import id is the site name (which is also the resource id).
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), req.ID)...)
+	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("site"), req.ID)...)
+	r.readImportedSettings(ctx, req.ID, &resp.State, &resp.Diagnostics)
+}
+
+// readImportedSettings reads every section the controller holds a document for
+// into a freshly imported state.
+//
+// readSettings refreshes only the sections already in state, and for most of
+// them only the leaves already in state, so an import used to read nothing:
+// every section the configuration sets then planned as an update that
+// rewrote the live values. Seeding each present section with a value whose
+// every leaf is known makes readSettings read the whole document; a section
+// whose document the controller lacks stays null. The sections the
+// configuration does not set are kept by UseStateForUnknown and are not
+// written back (see Update).
+func (r *settingResource) readImportedSettings(
+	ctx context.Context,
+	site string,
+	state *tfsdk.State,
+	diags *diag.Diagnostics,
+) {
+	if diags.HasError() {
+		return
+	}
+	var data settingResourceModel
+	diags.Append(state.Get(ctx, &data)...)
+	if diags.HasError() {
+		return
+	}
+
+	rawSettings, err := r.client.ListSettings(ctx, site)
+	if err != nil {
+		diags.AddError("Error Listing Settings", err.Error())
+		return
+	}
+	present := make(map[string]bool, len(rawSettings))
+	for _, raw := range rawSettings {
+		present[raw.Key] = true
+	}
+
+	for _, section := range []struct {
+		value     *types.Object
+		setting   settings.Setting
+		attrTypes map[string]attr.Type
+	}{
+		{&data.AutoSpeedtest, (*settings.AutoSpeedtest)(nil), autoSpeedtestAttrTypes},
+		{&data.Country, (*settings.Country)(nil), countryAttrTypes},
+		{&data.Dpi, (*settings.Dpi)(nil), dpiAttrTypes},
+		{&data.Lcm, (*settings.Lcm)(nil), lcmAttrTypes},
+		{&data.NetworkOpt, (*settings.NetworkOptimization)(nil), networkOptimizationAttrTypes},
+		{&data.Ntp, (*settings.Ntp)(nil), ntpAttrTypes},
+		{&data.Syslog, (*settings.Rsyslogd)(nil), syslogAttrTypes},
+		{&data.Doh, (*settings.Doh)(nil), dohAttrTypes},
+		{&data.Ips, (*settings.Ips)(nil), ipsAttrTypes},
+		{&data.Mgmt, (*settings.Mgmt)(nil), mgmtAttrTypes},
+		{&data.Radius, (*settings.Radius)(nil), radiusAttrTypes},
+		{&data.USG, (*settings.Usg)(nil), usgAttrTypes},
+		{&data.IgmpSnooping, (*settings.IgmpSnooping)(nil), igmpSnoopingAttrTypes},
+		{&data.Connectivity, (*settings.Connectivity)(nil), connectivityAttrTypes},
+		{&data.GlobalSwitch, (*settings.GlobalSwitch)(nil), globalSwitchAttrTypes},
+	} {
+		key, err := settings.GetSettingKey(section.setting)
+		if err != nil {
+			diags.AddError("Error Importing Settings", err.Error())
+			return
+		}
+		if !present[key] {
+			continue
+		}
+		value, d := knownObject(ctx, section.attrTypes)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		*section.value = value
+	}
+
+	// The controller stores only a hash of the SSH password, and
+	// mgmtSettingToModel keeps whatever the prior value was: leave it unset
+	// rather than importing the seed's empty string.
+	if !data.Mgmt.IsNull() {
+		mgmt := data.Mgmt.Attributes()
+		if sshObj, ok := mgmt["ssh"].(types.Object); ok {
+			ssh := sshObj.Attributes()
+			ssh["password"] = types.StringNull()
+			var d diag.Diagnostics
+			mgmt["ssh"], d = types.ObjectValue(mgmtSSHAttrTypes, ssh)
+			diags.Append(d...)
+			data.Mgmt, d = types.ObjectValue(mgmtAttrTypes, mgmt)
+			diags.Append(d...)
+			if diags.HasError() {
+				return
+			}
+		}
+	}
+	if !data.Radius.IsNull() {
+		radius := data.Radius.Attributes()
+		radius["secret"] = types.StringNull()
+		var d diag.Diagnostics
+		data.Radius, d = types.ObjectValue(radiusAttrTypes, radius)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+	}
+
+	r.readSettings(ctx, site, &data, diags)
+	if diags.HasError() {
+		return
+	}
+	diags.Append(state.Set(ctx, &data)...)
+}
+
+// knownObject returns an object of attrTypes whose every leaf is known: zero
+// scalars, empty lists, and nested objects built the same way. The section
+// readers populate only the leaves that are known in the model they are
+// given, so this asks them for every leaf.
+func knownObject(
+	ctx context.Context,
+	attrTypes map[string]attr.Type,
+) (types.Object, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	values := make(map[string]attr.Value, len(attrTypes))
+	for name, t := range attrTypes {
+		if obj, ok := t.(types.ObjectType); ok {
+			nested, d := knownObject(ctx, obj.AttrTypes)
+			diags.Append(d...)
+			values[name] = nested
+			continue
+		}
+		tfType := t.TerraformType(ctx)
+		var zero tftypes.Value
+		switch {
+		case tfType.Is(tftypes.Bool):
+			zero = tftypes.NewValue(tfType, false)
+		case tfType.Is(tftypes.Number):
+			zero = tftypes.NewValue(tfType, 0)
+		case tfType.Is(tftypes.String):
+			zero = tftypes.NewValue(tfType, "")
+			if _, ok := t.(timetypes.GoDurationType); ok {
+				// The duration type rejects an empty string.
+				zero = tftypes.NewValue(tfType, "0s")
+			}
+		default:
+			zero = tftypes.NewValue(tfType, []tftypes.Value{})
+		}
+		value, err := t.ValueFromTerraform(ctx, zero)
+		if err != nil {
+			diags.AddError("Error Importing Settings", err.Error())
+			continue
+		}
+		values[name] = value
+	}
+	if diags.HasError() {
+		return types.ObjectNull(attrTypes), diags
+	}
+	obj, d := types.ObjectValue(attrTypes, values)
+	diags.Append(d...)
+	return obj, diags
 }
 
 func (r *settingResource) readSettings(
@@ -703,6 +3628,221 @@ func (r *settingResource) readSettings(
 	data.Site = types.StringValue(site)
 
 	// Only read settings that were configured in the plan, set others to null
+
+	// Auto speedtest settings
+	if !data.AutoSpeedtest.IsNull() && !data.AutoSpeedtest.IsUnknown() {
+		_, asSetting, err := ui.GetSetting[*settings.AutoSpeedtest](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Auto Speedtest Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(
+			ctx, autoSpeedtestAttrTypes, r.autoSpeedtestSettingToModel(asSetting),
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.AutoSpeedtest = objValue
+	} else {
+		data.AutoSpeedtest = types.ObjectNull(autoSpeedtestAttrTypes)
+	}
+
+	// Country settings
+	if !data.Country.IsNull() && !data.Country.IsUnknown() {
+		_, s, err := ui.GetSetting[*settings.Country](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Country Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(ctx, countryAttrTypes, r.countrySettingToModel(s))
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Country = objValue
+	} else {
+		data.Country = types.ObjectNull(countryAttrTypes)
+	}
+
+	// DPI settings
+	if !data.Dpi.IsNull() && !data.Dpi.IsUnknown() {
+		_, s, err := ui.GetSetting[*settings.Dpi](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading DPI Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(ctx, dpiAttrTypes, r.dpiSettingToModel(s))
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Dpi = objValue
+	} else {
+		data.Dpi = types.ObjectNull(dpiAttrTypes)
+	}
+
+	// LCM settings
+	if !data.Lcm.IsNull() && !data.Lcm.IsUnknown() {
+		_, s, err := ui.GetSetting[*settings.Lcm](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading LCM Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(ctx, lcmAttrTypes, r.lcmSettingToModel(s))
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Lcm = objValue
+	} else {
+		data.Lcm = types.ObjectNull(lcmAttrTypes)
+	}
+
+	// Network optimization settings
+	if !data.NetworkOpt.IsNull() && !data.NetworkOpt.IsUnknown() {
+		_, s, err := ui.GetSetting[*settings.NetworkOptimization](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Network Optimization Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(
+			ctx, networkOptimizationAttrTypes, r.networkOptimizationSettingToModel(s),
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.NetworkOpt = objValue
+	} else {
+		data.NetworkOpt = types.ObjectNull(networkOptimizationAttrTypes)
+	}
+
+	// NTP settings
+	if !data.Ntp.IsNull() && !data.Ntp.IsUnknown() {
+		_, s, err := ui.GetSetting[*settings.Ntp](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading NTP Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(ctx, ntpAttrTypes, r.ntpSettingToModel(s))
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Ntp = objValue
+	} else {
+		data.Ntp = types.ObjectNull(ntpAttrTypes)
+	}
+
+	// Syslog settings
+	if !data.Syslog.IsNull() && !data.Syslog.IsUnknown() {
+		_, s, err := ui.GetSetting[*settings.Rsyslogd](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Syslog Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(
+			ctx, syslogAttrTypes, r.syslogSettingToModel(ctx, s, diags),
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Syslog = objValue
+	} else {
+		data.Syslog = types.ObjectNull(syslogAttrTypes)
+	}
+
+	// DoH settings
+	if !data.Doh.IsNull() && !data.Doh.IsUnknown() {
+		var planDoh settingDohModel
+		diags.Append(data.Doh.As(ctx, &planDoh, basetypes.ObjectAsOptions{})...)
+		if diags.HasError() {
+			return
+		}
+
+		_, dohSetting, err := ui.GetSetting[*settings.Doh](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading DoH Setting", err.Error())
+			return
+		}
+
+		dohModel := r.dohSettingToModel(ctx, dohSetting, &planDoh, diags)
+		objValue, d := types.ObjectValueFrom(ctx, dohAttrTypes, dohModel)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Doh = objValue
+	} else {
+		data.Doh = types.ObjectNull(dohAttrTypes)
+	}
+
+	// IPS settings
+	if !data.Ips.IsNull() && !data.Ips.IsUnknown() {
+		var planIps settingIpsModel
+		diags.Append(data.Ips.As(ctx, &planIps, basetypes.ObjectAsOptions{})...)
+		if diags.HasError() {
+			return
+		}
+
+		_, typedIps, err := ui.GetSetting[*settings.Ips](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading IPS Setting", err.Error())
+			return
+		}
+		ipsSetting := typedIps
+
+		// Suppression lives in the standalone ips_suppression setting (#381).
+		// go-unifi v1.34.1 removed Ips.Suppression entirely, so read it as its
+		// own document and carry it alongside.
+		var ipsSuppression *settings.IpsSuppression
+		planSupp, suppOK, d := util.ObjectAs[settingIpsSuppressionModel](ctx, planIps.Suppression)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		if suppOK && ipsSuppressionConfigured(&planSupp) {
+			rawData, found, err := r.readRawSettingData(ctx, site, ipsSuppressionSettingKey)
+			if err != nil {
+				diags.AddError("Error Reading IPS Suppression Setting", err.Error())
+				return
+			}
+			if !found {
+				// Controllers without the standalone document keep
+				// suppression nested in the ips setting (see
+				// persistIpsSuppression).
+				ipsData, ipsFound, ipsErr := r.readRawSettingData(ctx, site, ipsSettingKey)
+				if ipsErr != nil {
+					diags.AddError("Error Reading IPS Suppression Setting", ipsErr.Error())
+					return
+				}
+				if nested, ok := ipsData["suppression"].(map[string]any); ipsFound && ok {
+					rawData, found = nested, true
+				}
+			}
+			if found {
+				supp, err := ipsSuppressionFromRaw(rawData)
+				if err != nil {
+					diags.AddError("Error Reading IPS Suppression Setting", err.Error())
+					return
+				}
+				ipsSuppression = supp
+			}
+		}
+
+		ipsModel := r.ipsSettingToModel(ctx, ipsSetting, &planIps, diags, ipsSuppression)
+		objValue, d := types.ObjectValueFrom(ctx, ipsAttrTypes, ipsModel)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Ips = objValue
+	} else {
+		data.Ips = types.ObjectNull(ipsAttrTypes)
+	}
+
 	// Mgmt settings
 	if !data.Mgmt.IsNull() && !data.Mgmt.IsUnknown() {
 		// Get the current plan/state values
@@ -719,40 +3859,14 @@ func (r *settingResource) readSettings(
 		}
 
 		mgmtModel := r.mgmtSettingToModel(ctx, mgmtSetting, &planMgmt)
-		objValue, d := types.ObjectValueFrom(ctx, map[string]attr.Type{
-			"auto_upgrade": types.BoolType,
-			"ssh_enabled":  types.BoolType,
-			"ssh_keys": types.ListType{
-				ElemType: types.ObjectType{
-					AttrTypes: map[string]attr.Type{
-						"name":    types.StringType,
-						"type":    types.StringType,
-						"key":     types.StringType,
-						"comment": types.StringType,
-					},
-				},
-			},
-		}, mgmtModel)
+		objValue, d := types.ObjectValueFrom(ctx, mgmtAttrTypes, mgmtModel)
 		diags.Append(d...)
 		if diags.HasError() {
 			return
 		}
 		data.Mgmt = objValue
 	} else {
-		data.Mgmt = types.ObjectNull(map[string]attr.Type{
-			"auto_upgrade": types.BoolType,
-			"ssh_enabled":  types.BoolType,
-			"ssh_keys": types.ListType{
-				ElemType: types.ObjectType{
-					AttrTypes: map[string]attr.Type{
-						"name":    types.StringType,
-						"type":    types.StringType,
-						"key":     types.StringType,
-						"comment": types.StringType,
-					},
-				},
-			},
-		})
+		data.Mgmt = types.ObjectNull(mgmtAttrTypes)
 	}
 
 	// Radius settings
@@ -771,26 +3885,39 @@ func (r *settingResource) readSettings(
 		}
 
 		radiusModel := r.radiusSettingToModel(ctx, radiusSetting, &planRadius)
-		objValue, d := types.ObjectValueFrom(ctx, map[string]attr.Type{
-			"accounting_enabled":      types.BoolType,
-			"acct_port":               types.Int64Type,
-			"auth_port":               types.Int64Type,
-			"interim_update_interval": types.Int64Type,
-			"secret":                  types.StringType,
-		}, radiusModel)
+		objValue, d := types.ObjectValueFrom(ctx, radiusAttrTypes, radiusModel)
 		diags.Append(d...)
 		if diags.HasError() {
 			return
 		}
 		data.Radius = objValue
 	} else {
-		data.Radius = types.ObjectNull(map[string]attr.Type{
-			"accounting_enabled":      types.BoolType,
-			"acct_port":               types.Int64Type,
-			"auth_port":               types.Int64Type,
-			"interim_update_interval": types.Int64Type,
-			"secret":                  types.StringType,
-		})
+		data.Radius = types.ObjectNull(radiusAttrTypes)
+	}
+
+	// SNMP settings
+	if !data.Snmp.IsNull() && !data.Snmp.IsUnknown() {
+		var prior settingSnmpModel
+		diags.Append(data.Snmp.As(ctx, &prior, basetypes.ObjectAsOptions{})...)
+		if diags.HasError() {
+			return
+		}
+		_, snmpSetting, err := ui.GetSetting[*settings.Snmp](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading SNMP Setting", err.Error())
+			return
+		}
+
+		objValue, d := types.ObjectValueFrom(
+			ctx, snmpAttrTypes, r.snmpSettingToModel(ctx, snmpSetting, &prior),
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Snmp = objValue
+	} else {
+		data.Snmp = types.ObjectNull(snmpAttrTypes)
 	}
 
 	// USG settings
@@ -802,111 +3929,162 @@ func (r *settingResource) readSettings(
 			return
 		}
 
-		_, usgSetting, err := ui.GetSetting[*settings.Usg](r.client.ApiClient, ctx, site)
+		_, typedUsg, err := ui.GetSetting[*settings.Usg](r.client.ApiClient, ctx, site)
 		if err != nil {
 			diags.AddError("Error Reading USG Setting", err.Error())
 			return
 		}
 
+		usgSetting := &usgWithGeo{Usg: typedUsg}
+
+		// Newer controllers store Region Blocking under the standalone
+		// usg_geo setting: when the controller has one it is authoritative
+		// for the geo fields, so mirror it into the usg struct before
+		// conversion (#374). Older controllers keep them on usg itself,
+		// where only the raw payload still carries them.
+		planGeo, geoOK, d := util.ObjectAs[settingUsgGeoIPFilteringModel](
+			ctx,
+			planUSG.GeoIPFiltering,
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		if geoOK && usgGeoConfigured(&planGeo) {
+			rawData, found, err := r.readRawSettingData(ctx, site, usgGeoSettingKey)
+			if err != nil {
+				diags.AddError("Error Reading USG GeoIP Filtering Setting", err.Error())
+				return
+			}
+			if found {
+				applyUsgGeoIPFiltering(usgSetting, rawData)
+			} else if legacy, legacyFound, legacyErr := r.readRawSettingData(
+				ctx, site, usgSettingKey,
+			); legacyErr == nil && legacyFound {
+				applyLegacyUsgGeoIPFiltering(usgSetting, legacy)
+			}
+		}
+
 		usgModel := r.usgSettingToModel(ctx, usgSetting, &planUSG)
-		objValue, d := types.ObjectValueFrom(ctx, map[string]attr.Type{
-			"broadcast_ping": types.BoolType,
-			"dns_verification": types.ObjectType{
-				AttrTypes: map[string]attr.Type{
-					"domain":               types.StringType,
-					"primary_dns_server":   types.StringType,
-					"secondary_dns_server": types.StringType,
-					"setting_preference":   types.StringType,
-				},
-			},
-			"ftp_module":                         types.BoolType,
-			"geo_ip_filtering_block":             types.StringType,
-			"geo_ip_filtering_countries":         types.StringType,
-			"geo_ip_filtering_enabled":           types.BoolType,
-			"geo_ip_filtering_traffic_direction": types.StringType,
-			"gre_module":                         types.BoolType,
-			"h323_module":                        types.BoolType,
-			"icmp_timeout":                       types.Int64Type,
-			"mss_clamp":                          types.StringType,
-			"offload_accounting":                 types.BoolType,
-			"offload_l2_blocking":                types.BoolType,
-			"offload_sch":                        types.BoolType,
-			"other_timeout":                      types.Int64Type,
-			"pptp_module":                        types.BoolType,
-			"receive_redirects":                  types.BoolType,
-			"send_redirects":                     types.BoolType,
-			"sip_module":                         types.BoolType,
-			"syn_cookies":                        types.BoolType,
-			"tcp_close_timeout":                  types.Int64Type,
-			"tcp_close_wait_timeout":             types.Int64Type,
-			"tcp_established_timeout":            types.Int64Type,
-			"tcp_fin_wait_timeout":               types.Int64Type,
-			"tcp_last_ack_timeout":               types.Int64Type,
-			"tcp_syn_recv_timeout":               types.Int64Type,
-			"tcp_syn_sent_timeout":               types.Int64Type,
-			"tcp_time_wait_timeout":              types.Int64Type,
-			"tftp_module":                        types.BoolType,
-			"timeout_setting_preference":         types.StringType,
-			"udp_other_timeout":                  types.Int64Type,
-			"udp_stream_timeout":                 types.Int64Type,
-			"unbind_wan_monitors":                types.BoolType,
-			"upnp_enabled":                       types.BoolType,
-			"upnp_nat_pmp_enabled":               types.BoolType,
-			"upnp_secure_mode":                   types.BoolType,
-			"upnp_wan_interface":                 types.StringType,
-		}, usgModel)
+		objValue, d := types.ObjectValueFrom(ctx, usgAttrTypes, usgModel)
 		diags.Append(d...)
 		if diags.HasError() {
 			return
 		}
 		data.USG = objValue
 	} else {
-		data.USG = types.ObjectNull(map[string]attr.Type{
-			"broadcast_ping": types.BoolType,
-			"dns_verification": types.ObjectType{
-				AttrTypes: map[string]attr.Type{
-					"domain":               types.StringType,
-					"primary_dns_server":   types.StringType,
-					"secondary_dns_server": types.StringType,
-					"setting_preference":   types.StringType,
-				},
-			},
-			"ftp_module":                         types.BoolType,
-			"geo_ip_filtering_block":             types.StringType,
-			"geo_ip_filtering_countries":         types.StringType,
-			"geo_ip_filtering_enabled":           types.BoolType,
-			"geo_ip_filtering_traffic_direction": types.StringType,
-			"gre_module":                         types.BoolType,
-			"h323_module":                        types.BoolType,
-			"icmp_timeout":                       types.Int64Type,
-			"mss_clamp":                          types.StringType,
-			"offload_accounting":                 types.BoolType,
-			"offload_l2_blocking":                types.BoolType,
-			"offload_sch":                        types.BoolType,
-			"other_timeout":                      types.Int64Type,
-			"pptp_module":                        types.BoolType,
-			"receive_redirects":                  types.BoolType,
-			"send_redirects":                     types.BoolType,
-			"sip_module":                         types.BoolType,
-			"syn_cookies":                        types.BoolType,
-			"tcp_close_timeout":                  types.Int64Type,
-			"tcp_close_wait_timeout":             types.Int64Type,
-			"tcp_established_timeout":            types.Int64Type,
-			"tcp_fin_wait_timeout":               types.Int64Type,
-			"tcp_last_ack_timeout":               types.Int64Type,
-			"tcp_syn_recv_timeout":               types.Int64Type,
-			"tcp_syn_sent_timeout":               types.Int64Type,
-			"tcp_time_wait_timeout":              types.Int64Type,
-			"tftp_module":                        types.BoolType,
-			"timeout_setting_preference":         types.StringType,
-			"udp_other_timeout":                  types.Int64Type,
-			"udp_stream_timeout":                 types.Int64Type,
-			"unbind_wan_monitors":                types.BoolType,
-			"upnp_enabled":                       types.BoolType,
-			"upnp_nat_pmp_enabled":               types.BoolType,
-			"upnp_secure_mode":                   types.BoolType,
-			"upnp_wan_interface":                 types.StringType,
-		})
+		data.USG = types.ObjectNull(usgAttrTypes)
+	}
+
+	// IGMP snooping (site-level)
+	if !data.IgmpSnooping.IsNull() && !data.IgmpSnooping.IsUnknown() {
+		_, igmpSetting, err := ui.GetSetting[*settings.IgmpSnooping](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading IGMP Snooping Setting", err.Error())
+			return
+		}
+		igmpModel := r.igmpSnoopingSettingToModel(ctx, igmpSetting, diags)
+		objValue, d := types.ObjectValueFrom(ctx, igmpSnoopingAttrTypes, igmpModel)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.IgmpSnooping = objValue
+	} else {
+		data.IgmpSnooping = types.ObjectNull(igmpSnoopingAttrTypes)
+	}
+
+	// Connectivity (wireless meshing)
+	if !data.Connectivity.IsNull() && !data.Connectivity.IsUnknown() {
+		_, connSetting, err := ui.GetSetting[*settings.Connectivity](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Connectivity Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(
+			ctx,
+			connectivityAttrTypes,
+			r.connectivitySettingToModel(connSetting),
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.Connectivity = objValue
+	} else {
+		data.Connectivity = types.ObjectNull(connectivityAttrTypes)
+	}
+
+	r.readMdns(ctx, site, data, diags)
+	if diags.HasError() {
+		return
+	}
+
+	// Channel AI
+	if !data.RadioAi.IsNull() && !data.RadioAi.IsUnknown() {
+		_, raSetting, err := ui.GetSetting[*settings.RadioAi](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Channel AI Setting", err.Error())
+			return
+		}
+		model, d := r.radioAiSettingToModel(ctx, raSetting)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		objValue, d := types.ObjectValueFrom(ctx, radioAiAttrTypes, model)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		// An attribute the plan carries as null from prior state (one added
+		// after the state was written, or one the controller did not report)
+		// stays null, as in mdns: filling it from the controller here would be
+		// an inconsistent result after apply.
+		data.RadioAi = keepNullAttributes(data.RadioAi, objValue, diags)
+	} else {
+		data.RadioAi = types.ObjectNull(radioAiAttrTypes)
+	}
+
+	// Global switch settings
+	if !data.GlobalSwitch.IsNull() && !data.GlobalSwitch.IsUnknown() {
+		_, gsSetting, err := ui.GetSetting[*settings.GlobalSwitch](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Global Switch Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(
+			ctx,
+			globalSwitchAttrTypes,
+			r.globalSwitchSettingToModel(ctx, gsSetting, diags),
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.GlobalSwitch = objValue
+	} else {
+		data.GlobalSwitch = types.ObjectNull(globalSwitchAttrTypes)
+	}
+	// Etherlighting colors
+	if !data.EtherLighting.IsNull() && !data.EtherLighting.IsUnknown() {
+		_, elSetting, err := ui.GetSetting[*settings.EtherLighting](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Etherlighting Setting", err.Error())
+			return
+		}
+		objValue, d := types.ObjectValueFrom(
+			ctx,
+			etherLightingAttrTypes,
+			r.etherLightingSettingToModel(ctx, elSetting, diags),
+		)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.EtherLighting = objValue
+	} else {
+		data.EtherLighting = types.ObjectNull(etherLightingAttrTypes)
 	}
 }
 
@@ -914,26 +4092,59 @@ func (r *settingResource) readSettings(
 func (r *settingResource) mgmtModelToSetting(
 	ctx context.Context,
 	model *settingMgmtModel,
+	base *settings.Mgmt,
 ) *settings.Mgmt {
-	setting := &settings.Mgmt{}
+	setting := base
 
-	if !model.AutoUpgrade.IsNull() {
-		setting.AutoUpgrade = model.AutoUpgrade.ValueBool()
+	if au, ok, _ := util.ObjectAs[settingMgmtAutoUpgradeModel](ctx, model.AutoUpgrade); ok {
+		if !au.Enabled.IsNull() && !au.Enabled.IsUnknown() {
+			setting.AutoUpgrade = au.Enabled.ValueBool()
+		}
+		if !au.Hour.IsNull() && !au.Hour.IsUnknown() {
+			setting.AutoUpgradeHour = au.Hour.ValueInt64Pointer()
+		}
 	}
-	if !model.SSHEnabled.IsNull() {
-		setting.SSHEnabled = model.SSHEnabled.ValueBool()
+	if !model.AdvancedFeatureEnabled.IsNull() && !model.AdvancedFeatureEnabled.IsUnknown() {
+		setting.AdvancedFeatureEnabled = model.AdvancedFeatureEnabled.ValueBool()
+	}
+	if !model.DebugToolsEnabled.IsNull() && !model.DebugToolsEnabled.IsUnknown() {
+		setting.DebugToolsEnabled = model.DebugToolsEnabled.ValueBool()
+	}
+	if !model.DirectConnectEnabled.IsNull() && !model.DirectConnectEnabled.IsUnknown() {
+		setting.DirectConnectEnabled = model.DirectConnectEnabled.ValueBool()
+	}
+	if !model.UnifiIdpEnabled.IsNull() && !model.UnifiIdpEnabled.IsUnknown() {
+		setting.UniFiIdentityProviderEnabled = model.UnifiIdpEnabled.ValueBool()
+	}
+	if !model.WifimanEnabled.IsNull() && !model.WifimanEnabled.IsUnknown() {
+		setting.WifimanEnabled = model.WifimanEnabled.ValueBool()
 	}
 
-	if !model.SSHKeys.IsNull() && !model.SSHKeys.IsUnknown() {
-		var sshKeys []sshKeyModel
-		model.SSHKeys.ElementsAs(ctx, &sshKeys, false)
-		for _, sshKey := range sshKeys {
-			setting.SSHKeys = append(setting.SSHKeys, settings.SettingMgmtSSHKeys{
-				Name:    sshKey.Name.ValueString(),
-				KeyType: sshKey.Type.ValueString(),
-				Key:     sshKey.Key.ValueString(),
-				Comment: sshKey.Comment.ValueString(),
-			})
+	if ssh, ok, _ := util.ObjectAs[settingMgmtSSHModel](ctx, model.SSH); ok {
+		if !ssh.Enabled.IsNull() && !ssh.Enabled.IsUnknown() {
+			setting.SSHEnabled = ssh.Enabled.ValueBool()
+		}
+		if !ssh.Username.IsNull() && !ssh.Username.IsUnknown() {
+			setting.SSHUsername = ssh.Username.ValueString()
+		}
+		if !ssh.Password.IsNull() && !ssh.Password.IsUnknown() {
+			setting.SSHPassword = ssh.Password.ValueString()
+		}
+		if !ssh.AuthPasswordEnabled.IsNull() && !ssh.AuthPasswordEnabled.IsUnknown() {
+			setting.SSHAuthPasswordEnabled = ssh.AuthPasswordEnabled.ValueBool()
+		}
+		if !ssh.Keys.IsNull() && !ssh.Keys.IsUnknown() {
+			setting.SSHKeys = nil
+			var sshKeys []sshKeyModel
+			ssh.Keys.ElementsAs(ctx, &sshKeys, false)
+			for _, sshKey := range sshKeys {
+				setting.SSHKeys = append(setting.SSHKeys, settings.SettingMgmtSSHKeys{
+					Name:    sshKey.Name.ValueString(),
+					KeyType: sshKey.Type.ValueString(),
+					Key:     sshKey.Key.ValueString(),
+					Comment: sshKey.Comment.ValueString(),
+				})
+			}
 		}
 	}
 
@@ -947,21 +4158,58 @@ func (r *settingResource) mgmtSettingToModel(
 ) *settingMgmtModel {
 	model := &settingMgmtModel{}
 
-	// Only populate fields that were explicitly configured in the plan
-	if !plan.AutoUpgrade.IsNull() && !plan.AutoUpgrade.IsUnknown() {
-		model.AutoUpgrade = types.BoolValue(setting.AutoUpgrade)
-	} else {
-		model.AutoUpgrade = types.BoolNull()
+	// Only populate fields that were explicitly configured in the plan, so the
+	// resource doesn't report drift on settings the user doesn't manage.
+	boolOrNull := func(planVal types.Bool, apiVal bool) types.Bool {
+		if !planVal.IsNull() && !planVal.IsUnknown() {
+			return types.BoolValue(apiVal)
+		}
+		return types.BoolNull()
 	}
 
-	if !plan.SSHEnabled.IsNull() && !plan.SSHEnabled.IsUnknown() {
-		model.SSHEnabled = types.BoolValue(setting.SSHEnabled)
+	model.AdvancedFeatureEnabled = boolOrNull(
+		plan.AdvancedFeatureEnabled, setting.AdvancedFeatureEnabled,
+	)
+	model.DebugToolsEnabled = boolOrNull(plan.DebugToolsEnabled, setting.DebugToolsEnabled)
+	model.DirectConnectEnabled = boolOrNull(plan.DirectConnectEnabled, setting.DirectConnectEnabled)
+	model.UnifiIdpEnabled = boolOrNull(plan.UnifiIdpEnabled, setting.UniFiIdentityProviderEnabled)
+	model.WifimanEnabled = boolOrNull(plan.WifimanEnabled, setting.WifimanEnabled)
+
+	// auto_upgrade: an unconfigured (null/unknown) group stays null, exactly
+	// as the flat leaves did.
+	if planAU, ok, _ := util.ObjectAs[settingMgmtAutoUpgradeModel](ctx, plan.AutoUpgrade); ok {
+		au := settingMgmtAutoUpgradeModel{
+			Enabled: boolOrNull(planAU.Enabled, setting.AutoUpgrade),
+			Hour:    types.Int64Null(),
+		}
+		if !planAU.Hour.IsNull() && !planAU.Hour.IsUnknown() {
+			au.Hour = types.Int64PointerValue(setting.AutoUpgradeHour)
+		}
+		model.AutoUpgrade, _ = types.ObjectValueFrom(ctx, mgmtAutoUpgradeAttrTypes, au)
 	} else {
-		model.SSHEnabled = types.BoolNull()
+		model.AutoUpgrade = types.ObjectNull(mgmtAutoUpgradeAttrTypes)
 	}
 
-	if !plan.SSHKeys.IsNull() && !plan.SSHKeys.IsUnknown() {
-		if len(setting.SSHKeys) > 0 {
+	sshKeyType := types.ObjectType{AttrTypes: mgmtSSHKeyAttrTypes}
+	if planSSH, ok, _ := util.ObjectAs[settingMgmtSSHModel](ctx, plan.SSH); ok {
+		ssh := settingMgmtSSHModel{
+			Enabled: boolOrNull(planSSH.Enabled, setting.SSHEnabled),
+			AuthPasswordEnabled: boolOrNull(
+				planSSH.AuthPasswordEnabled,
+				setting.SSHAuthPasswordEnabled,
+			),
+			Username: types.StringNull(),
+			Keys:     types.ListNull(sshKeyType),
+		}
+		if !planSSH.Username.IsNull() && !planSSH.Username.IsUnknown() {
+			ssh.Username = util.StringValueOrNull(setting.SSHUsername)
+		}
+
+		// The controller never returns the plaintext SSH password (only
+		// hashes), so preserve the configured value to avoid a perpetual diff.
+		ssh.Password = planSSH.Password
+
+		if !planSSH.Keys.IsNull() && !planSSH.Keys.IsUnknown() && len(setting.SSHKeys) > 0 {
 			var sshKeys []sshKeyModel
 			for _, sshKey := range setting.SSHKeys {
 				sshKeys = append(sshKeys, sshKeyModel{
@@ -971,37 +4219,95 @@ func (r *settingResource) mgmtSettingToModel(
 					Comment: types.StringValue(sshKey.Comment),
 				})
 			}
-			listValue, _ := types.ListValueFrom(ctx, types.ObjectType{
-				AttrTypes: map[string]attr.Type{
-					"name":    types.StringType,
-					"type":    types.StringType,
-					"key":     types.StringType,
-					"comment": types.StringType,
-				},
-			}, sshKeys)
-			model.SSHKeys = listValue
-		} else {
-			model.SSHKeys = types.ListNull(types.ObjectType{
-				AttrTypes: map[string]attr.Type{
-					"name":    types.StringType,
-					"type":    types.StringType,
-					"key":     types.StringType,
-					"comment": types.StringType,
-				},
-			})
+			ssh.Keys, _ = types.ListValueFrom(ctx, sshKeyType, sshKeys)
 		}
+		model.SSH, _ = types.ObjectValueFrom(ctx, mgmtSSHAttrTypes, ssh)
 	} else {
-		model.SSHKeys = types.ListNull(types.ObjectType{
-			AttrTypes: map[string]attr.Type{
-				"name":    types.StringType,
-				"type":    types.StringType,
-				"key":     types.StringType,
-				"comment": types.StringType,
-			},
-		})
+		model.SSH = types.ObjectNull(mgmtSSHAttrTypes)
 	}
 
 	return model
+}
+
+// SNMP conversion functions.
+
+// readSnmpPasswordWO reads the secret from configuration, not the plan (where
+// write-only values are always null). Only a new version applies the secret;
+// unrelated updates with the same version leave the controller password alone.
+func (r *settingResource) readSnmpPasswordWO(
+	ctx context.Context,
+	config tfsdk.Config,
+	model *settingSnmpModel,
+	prior types.Object,
+	diags *diag.Diagnostics,
+) {
+	if diags.HasError() || model.PasswordWOVersion.IsNull() || model.PasswordWOVersion.IsUnknown() {
+		return
+	}
+	if !prior.IsNull() && !prior.IsUnknown() {
+		var previous settingSnmpModel
+		diags.Append(prior.As(ctx, &previous, basetypes.ObjectAsOptions{})...)
+		if diags.HasError() || model.PasswordWOVersion.Equal(previous.PasswordWOVersion) {
+			return
+		}
+	}
+	diags.Append(
+		config.GetAttribute(ctx, path.Root("snmp").AtName("password_wo"), &model.PasswordWO)...)
+}
+
+// snmpModelToSetting overlays the known model values onto base (the current
+// remote setting), so an attribute left unset keeps the controller's value
+// instead of being zeroed; e.g. configuring only the v3 user must not turn
+// v1/v2c off.
+func (r *settingResource) snmpModelToSetting(
+	_ context.Context,
+	model *settingSnmpModel,
+	base *settings.Snmp,
+) *settings.Snmp {
+	setting := base
+
+	if !model.Enabled.IsNull() && !model.Enabled.IsUnknown() {
+		setting.Enabled = model.Enabled.ValueBool()
+	}
+	if !model.Community.IsNull() && !model.Community.IsUnknown() {
+		setting.Community = model.Community.ValueString()
+	}
+	if !model.EnabledV3.IsNull() && !model.EnabledV3.IsUnknown() {
+		setting.EnabledV3 = model.EnabledV3.ValueBool()
+	}
+	if !model.Username.IsNull() && !model.Username.IsUnknown() {
+		setting.Username = model.Username.ValueString()
+	}
+	if !model.Password.IsNull() && !model.Password.IsUnknown() {
+		setting.Password = model.Password.ValueString()
+	} else if !model.PasswordWO.IsNull() && !model.PasswordWO.IsUnknown() {
+		setting.Password = model.PasswordWO.ValueString()
+	} else {
+		// Never replay an echoed/masked password from the read base. The SDK
+		// omits an empty x_password, preserving the remote credential.
+		setting.Password = ""
+	}
+
+	return setting
+}
+
+// snmpSettingToModel reads public fields and community from the controller.
+// Passwords may be omitted or masked: retain only the planned/stored password
+// and rotation version, never the API password or the write-only input.
+func (r *settingResource) snmpSettingToModel(
+	_ context.Context,
+	setting *settings.Snmp,
+	prior *settingSnmpModel,
+) *settingSnmpModel {
+	return &settingSnmpModel{
+		Enabled:           types.BoolValue(setting.Enabled),
+		Community:         util.StringValueOrNull(setting.Community),
+		EnabledV3:         types.BoolValue(setting.EnabledV3),
+		Username:          util.StringValueOrNull(setting.Username),
+		Password:          prior.Password,
+		PasswordWO:        types.StringNull(),
+		PasswordWOVersion: prior.PasswordWOVersion,
+	}
 }
 
 // Radius conversion functions.
@@ -1022,7 +4328,10 @@ func (r *settingResource) radiusModelToSetting(
 		setting.AuthPort = model.AuthPort.ValueInt64Pointer()
 	}
 	if !model.InterimUpdateInterval.IsNull() && !model.InterimUpdateInterval.IsUnknown() {
-		setting.InterimUpdateInterval = model.InterimUpdateInterval.ValueInt64Pointer()
+		setting.InterimUpdateInterval = util.DurationUnitsPtr(
+			model.InterimUpdateInterval,
+			time.Second,
+		)
 	}
 	if !model.Secret.IsNull() && !model.Secret.IsUnknown() {
 		setting.Secret = model.Secret.ValueString()
@@ -1045,7 +4354,7 @@ func (r *settingResource) radiusSettingToModel(
 
 	model.AuthPort = types.Int64PointerValue(setting.AuthPort)
 
-	model.InterimUpdateInterval = types.Int64PointerValue(setting.InterimUpdateInterval)
+	model.InterimUpdateInterval = util.DurationPtrValue(setting.InterimUpdateInterval, time.Second)
 
 	if !plan.Secret.IsNull() && !plan.Secret.IsUnknown() {
 		if setting.Secret != "" {
@@ -1060,12 +4369,218 @@ func (r *settingResource) radiusSettingToModel(
 	return model
 }
 
+// readRadiusSecretWO reads the write-only radius_secret_wo attribute. Write-only
+// values are only available through the request config, never plan or state.
+func (r *settingResource) readRadiusSecretWO(
+	ctx context.Context,
+	config tfsdk.Config,
+	diags *diag.Diagnostics,
+) types.String {
+	var secretWO types.String
+	diags.Append(config.GetAttribute(ctx, path.Root("radius_secret_wo"), &secretWO)...)
+	return secretWO
+}
+
 // USG conversion functions.
+// usgGeoSettingKey is the standalone setting key newer controllers (observed
+// on Network 10.4.x) use to store GeoIP Region Blocking, as
+// usg_geo.ip_filtering. Older controllers store the same data as
+// geo_ip_filtering_* fields on the usg setting itself and reject this key
+// with api.err.Invalid (#374).
+const usgGeoSettingKey = "usg_geo"
+
+// usgSettingKey is the usg setting itself, read and written raw for the
+// legacy geo_ip_filtering_* fields the v10 models no longer carry.
+const usgSettingKey = "usg"
+
+// usgGeoConfigured reports whether the planned usg.geo_ip_filtering object
+// manages any Region Blocking field.
+func usgGeoConfigured(plan *settingUsgGeoIPFilteringModel) bool {
+	return (!plan.Enabled.IsNull() && !plan.Enabled.IsUnknown()) ||
+		(!plan.Block.IsNull() && !plan.Block.IsUnknown()) ||
+		(!plan.Countries.IsNull() && !plan.Countries.IsUnknown()) ||
+		(!plan.TrafficDirection.IsNull() && !plan.TrafficDirection.IsUnknown())
+}
+
+// usgGeoRawSetting builds the standalone usg_geo setting payload from the
+// usg.geo_ip_filtering object. The legacy usg field names map onto
+// usg_geo.ip_filtering: block becomes action; countries, enabled and
+// traffic_direction keep their names and shapes.
+func usgGeoRawSetting(model *settingUsgGeoIPFilteringModel) *settings.RawSetting {
+	ipFiltering := map[string]any{
+		// Always sent: the legacy usg field is likewise always serialized,
+		// so an unconfigured enabled reads as false on both paths.
+		"enabled": model.Enabled.ValueBool(),
+	}
+	if !model.Block.IsNull() && !model.Block.IsUnknown() {
+		ipFiltering["action"] = model.Block.ValueString()
+	}
+	if !model.Countries.IsNull() && !model.Countries.IsUnknown() {
+		ipFiltering["countries"] = model.Countries.ValueString()
+	}
+	if !model.TrafficDirection.IsNull() && !model.TrafficDirection.IsUnknown() {
+		ipFiltering["traffic_direction"] = model.TrafficDirection.ValueString()
+	}
+	return &settings.RawSetting{
+		BaseSetting: settings.BaseSetting{Key: usgGeoSettingKey},
+		Data:        map[string]any{"ip_filtering": ipFiltering},
+	}
+}
+
+// usgWithGeo pairs the typed usg setting with its Region Blocking fields.
+// Controller v10 moved geo_ip_filtering_* off the usg setting into the
+// standalone usg_geo setting, so settings.Usg no longer carries them; older
+// controllers still store them on usg itself and are served through
+// applyLegacyUsgGeoIPFiltering / the raw write in persistUsgGeoFiltering.
+type usgWithGeo struct {
+	*settings.Usg
+	GeoIPFilteringEnabled          bool
+	GeoIPFilteringBlock            string
+	GeoIPFilteringCountries        string
+	GeoIPFilteringTrafficDirection string
+}
+
+// usgGeoRawFields renders the carrier's Region Blocking fields in the legacy
+// geo_ip_filtering_* shape older controllers persist on the usg setting.
+func (u *usgWithGeo) usgGeoRawFields() map[string]any {
+	return map[string]any{
+		"geo_ip_filtering_enabled":           u.GeoIPFilteringEnabled,
+		"geo_ip_filtering_block":             u.GeoIPFilteringBlock,
+		"geo_ip_filtering_countries":         u.GeoIPFilteringCountries,
+		"geo_ip_filtering_traffic_direction": u.GeoIPFilteringTrafficDirection,
+	}
+}
+
+// applyLegacyUsgGeoIPFiltering fills the carrier from the geo_ip_filtering_*
+// fields of a raw usg setting, the shape older controllers store.
+func applyLegacyUsgGeoIPFiltering(setting *usgWithGeo, data map[string]any) {
+	if v, ok := data["geo_ip_filtering_enabled"].(bool); ok {
+		setting.GeoIPFilteringEnabled = v
+	}
+	if v, ok := data["geo_ip_filtering_block"].(string); ok {
+		setting.GeoIPFilteringBlock = v
+	}
+	if v, ok := data["geo_ip_filtering_countries"].(string); ok {
+		setting.GeoIPFilteringCountries = v
+	}
+	if v, ok := data["geo_ip_filtering_traffic_direction"].(string); ok {
+		setting.GeoIPFilteringTrafficDirection = v
+	}
+}
+
+// applyUsgGeoIPFiltering overrides the usg setting's geo fields with the
+// values from a usg_geo setting's ip_filtering payload, which is
+// authoritative whenever the controller stores one.
+func applyUsgGeoIPFiltering(setting *usgWithGeo, data map[string]any) {
+	ipf, ok := data["ip_filtering"].(map[string]any)
+	if !ok {
+		return
+	}
+	if v, ok := ipf["enabled"].(bool); ok {
+		setting.GeoIPFilteringEnabled = v
+	}
+	if v, ok := ipf["action"].(string); ok {
+		setting.GeoIPFilteringBlock = v
+	}
+	switch v := ipf["countries"].(type) {
+	case string:
+		setting.GeoIPFilteringCountries = v
+	case []any:
+		// Defensive: tolerate a list-of-codes shape by normalizing to the
+		// comma-separated form the schema exposes.
+		codes := make([]string, 0, len(v))
+		for _, c := range v {
+			if s, ok := c.(string); ok {
+				codes = append(codes, s)
+			}
+		}
+		setting.GeoIPFilteringCountries = strings.Join(codes, ",")
+	}
+	if v, ok := ipf["traffic_direction"].(string); ok {
+		setting.GeoIPFilteringTrafficDirection = v
+	}
+}
+
+// persistUsgGeoFiltering makes sure configured Region Blocking fields reach
+// the controller. Older controllers persist them as geo_ip_filtering_* on
+// the usg setting; newer controllers ignore those fields there and keep the
+// live configuration under usg_geo.ip_filtering instead, which used to leave
+// applies without effect and the plan permanently inconsistent (#374).
+func (r *settingResource) persistUsgGeoFiltering(
+	ctx context.Context,
+	site string,
+	config types.Object,
+	model *settingUSGModel,
+	diags *diag.Diagnostics,
+) {
+	if config.IsNull() {
+		return
+	}
+	geo, ok, d := util.ObjectAs[settingUsgGeoIPFilteringModel](ctx, model.GeoIPFiltering)
+	diags.Append(d...)
+	if !ok || !usgGeoConfigured(&geo) {
+		return
+	}
+	carrier := &usgWithGeo{
+		GeoIPFilteringEnabled:          geo.Enabled.ValueBool(),
+		GeoIPFilteringBlock:            geo.Block.ValueString(),
+		GeoIPFilteringCountries:        geo.Countries.ValueString(),
+		GeoIPFilteringTrafficDirection: geo.TrafficDirection.ValueString(),
+	}
+
+	err := r.client.UpdateSetting(ctx, site, usgGeoRawSetting(&geo))
+	if err == nil {
+		return
+	}
+
+	// Controllers without the standalone document (observed on Network
+	// 10.0.162) reject the usg_geo key with api.err.Invalid and persist the
+	// geo_ip_filtering_* fields on the usg setting itself. The v10 models
+	// dropped those fields, so the preceding typed usg update no longer
+	// carries them: merge them into the raw usg setting instead. A fresh site
+	// has never stored them, so their absence from the document is not a
+	// reason to skip the fallback; the absence of a usg_geo document is what
+	// identifies the legacy controller.
+	var apiErr *ui.APIError
+	if errors.As(err, &apiErr) && apiErr.Message == "api.err.Invalid" {
+		if _, hasStandalone, probeErr := r.readRawSettingData(
+			ctx, site, usgGeoSettingKey,
+		); probeErr == nil && !hasStandalone {
+			usgData, found, readErr := r.readRawSettingData(ctx, site, usgSettingKey)
+			if readErr == nil && found {
+				for k, v := range carrier.usgGeoRawFields() {
+					usgData[k] = v
+				}
+				raw := &settings.RawSetting{
+					BaseSetting: settings.BaseSetting{Key: usgSettingKey},
+					Data:        usgData,
+				}
+				if writeErr := r.client.UpdateSetting(ctx, site, raw); writeErr != nil {
+					diags.AddError(
+						"Error Updating USG GeoIP Filtering Setting",
+						writeErr.Error(),
+					)
+				}
+				return
+			}
+		}
+	}
+	diags.AddError("Error Updating USG GeoIP Filtering Setting", err.Error())
+}
+
 func (r *settingResource) usgModelToSetting(
 	ctx context.Context,
 	model *settingUSGModel,
-) *settings.Usg {
-	setting := &settings.Usg{}
+	base *settings.Usg,
+) *usgWithGeo {
+	// Start from the controller's current document: twenty bools on
+	// settings.Usg serialize without omitempty, so a freshly built struct
+	// writes false for every attribute the configuration does not manage
+	// (#493). base is nil only when the live document could not be read.
+	setting := &usgWithGeo{Usg: &settings.Usg{}}
+	if base != nil {
+		*setting.Usg = *base
+	}
 
 	if !model.BroadcastPing.IsNull() {
 		setting.BroadcastPing = model.BroadcastPing.ValueBool()
@@ -1083,17 +4598,21 @@ func (r *settingResource) usgModelToSetting(
 	if !model.FtpModule.IsNull() {
 		setting.FtpModule = model.FtpModule.ValueBool()
 	}
-	if !model.GeoIPFilteringBlock.IsNull() {
-		setting.GeoIPFilteringBlock = model.GeoIPFilteringBlock.ValueString()
-	}
-	if !model.GeoIPFilteringCountries.IsNull() {
-		setting.GeoIPFilteringCountries = model.GeoIPFilteringCountries.ValueString()
-	}
-	if !model.GeoIPFilteringEnabled.IsNull() {
-		setting.GeoIPFilteringEnabled = model.GeoIPFilteringEnabled.ValueBool()
-	}
-	if !model.GeoIPFilteringTrafficDirection.IsNull() {
-		setting.GeoIPFilteringTrafficDirection = model.GeoIPFilteringTrafficDirection.ValueString()
+	// Nested groups: an unset (null/unknown) object contributes nothing,
+	// which serializes the same zero values the unset flat leaves did.
+	if geo, ok, _ := util.ObjectAs[settingUsgGeoIPFilteringModel](ctx, model.GeoIPFiltering); ok {
+		if !geo.Block.IsNull() {
+			setting.GeoIPFilteringBlock = geo.Block.ValueString()
+		}
+		if !geo.Countries.IsNull() {
+			setting.GeoIPFilteringCountries = geo.Countries.ValueString()
+		}
+		if !geo.Enabled.IsNull() {
+			setting.GeoIPFilteringEnabled = geo.Enabled.ValueBool()
+		}
+		if !geo.TrafficDirection.IsNull() {
+			setting.GeoIPFilteringTrafficDirection = geo.TrafficDirection.ValueString()
+		}
 	}
 	if !model.GreModule.IsNull() {
 		setting.GreModule = model.GreModule.ValueBool()
@@ -1101,23 +4620,25 @@ func (r *settingResource) usgModelToSetting(
 	if !model.H323Module.IsNull() {
 		setting.H323Module = model.H323Module.ValueBool()
 	}
-	if !model.ICMPTimeout.IsNull() {
-		setting.ICMPTimeout = model.ICMPTimeout.ValueInt64()
+	if !model.ICMPTimeout.IsNull() && !model.ICMPTimeout.IsUnknown() {
+		setting.ICMPTimeout = util.DurationUnits(model.ICMPTimeout, time.Second)
 	}
 	if !model.MssClamp.IsNull() {
 		setting.MssClamp = model.MssClamp.ValueString()
 	}
-	if !model.OffloadAccounting.IsNull() {
-		setting.OffloadAccounting = model.OffloadAccounting.ValueBool()
+	if off, ok, _ := util.ObjectAs[settingUsgOffloadModel](ctx, model.Offload); ok {
+		if !off.Accounting.IsNull() {
+			setting.OffloadAccounting = off.Accounting.ValueBool()
+		}
+		if !off.L2Blocking.IsNull() {
+			setting.OffloadL2Blocking = off.L2Blocking.ValueBool()
+		}
+		if !off.Sch.IsNull() {
+			setting.OffloadSch = off.Sch.ValueBool()
+		}
 	}
-	if !model.OffloadL2Blocking.IsNull() {
-		setting.OffloadL2Blocking = model.OffloadL2Blocking.ValueBool()
-	}
-	if !model.OffloadSch.IsNull() {
-		setting.OffloadSch = model.OffloadSch.ValueBool()
-	}
-	if !model.OtherTimeout.IsNull() {
-		setting.OtherTimeout = model.OtherTimeout.ValueInt64()
+	if !model.OtherTimeout.IsNull() && !model.OtherTimeout.IsUnknown() {
+		setting.OtherTimeout = util.DurationUnits(model.OtherTimeout, time.Second)
 	}
 	if !model.PptpModule.IsNull() {
 		setting.PptpModule = model.PptpModule.ValueBool()
@@ -1134,29 +4655,20 @@ func (r *settingResource) usgModelToSetting(
 	if !model.SynCookies.IsNull() {
 		setting.SynCookies = model.SynCookies.ValueBool()
 	}
-	if !model.TCPCloseTimeout.IsNull() {
-		setting.TCPCloseTimeout = model.TCPCloseTimeout.ValueInt64()
-	}
-	if !model.TCPCloseWaitTimeout.IsNull() {
-		setting.TCPCloseWaitTimeout = model.TCPCloseWaitTimeout.ValueInt64()
-	}
-	if !model.TCPEstablishedTimeout.IsNull() {
-		setting.TCPEstablishedTimeout = model.TCPEstablishedTimeout.ValueInt64()
-	}
-	if !model.TCPFinWaitTimeout.IsNull() {
-		setting.TCPFinWaitTimeout = model.TCPFinWaitTimeout.ValueInt64()
-	}
-	if !model.TCPLastAckTimeout.IsNull() {
-		setting.TCPLastAckTimeout = model.TCPLastAckTimeout.ValueInt64()
-	}
-	if !model.TCPSynRecvTimeout.IsNull() {
-		setting.TCPSynRecvTimeout = model.TCPSynRecvTimeout.ValueInt64()
-	}
-	if !model.TCPSynSentTimeout.IsNull() {
-		setting.TCPSynSentTimeout = model.TCPSynSentTimeout.ValueInt64()
-	}
-	if !model.TCPTimeWaitTimeout.IsNull() {
-		setting.TCPTimeWaitTimeout = model.TCPTimeWaitTimeout.ValueInt64()
+	if tcp, ok, _ := util.ObjectAs[settingUsgTCPModel](ctx, model.TCP); ok {
+		setDur := func(dst *int64, v timetypes.GoDuration) {
+			if !v.IsNull() && !v.IsUnknown() {
+				*dst = util.DurationUnits(v, time.Second)
+			}
+		}
+		setDur(&setting.TCPCloseTimeout, tcp.CloseTimeout)
+		setDur(&setting.TCPCloseWaitTimeout, tcp.CloseWaitTimeout)
+		setDur(&setting.TCPEstablishedTimeout, tcp.EstablishedTimeout)
+		setDur(&setting.TCPFinWaitTimeout, tcp.FinWaitTimeout)
+		setDur(&setting.TCPLastAckTimeout, tcp.LastAckTimeout)
+		setDur(&setting.TCPSynRecvTimeout, tcp.SynRecvTimeout)
+		setDur(&setting.TCPSynSentTimeout, tcp.SynSentTimeout)
+		setDur(&setting.TCPTimeWaitTimeout, tcp.TimeWaitTimeout)
 	}
 	if !model.TFTPModule.IsNull() {
 		setting.TFTPModule = model.TFTPModule.ValueBool()
@@ -1164,26 +4676,30 @@ func (r *settingResource) usgModelToSetting(
 	if !model.TimeoutSettingPreference.IsNull() {
 		setting.TimeoutSettingPreference = model.TimeoutSettingPreference.ValueString()
 	}
-	if !model.UDPOtherTimeout.IsNull() {
-		setting.UDPOtherTimeout = model.UDPOtherTimeout.ValueInt64()
-	}
-	if !model.UDPStreamTimeout.IsNull() {
-		setting.UDPStreamTimeout = model.UDPStreamTimeout.ValueInt64()
+	if udp, ok, _ := util.ObjectAs[settingUsgUDPModel](ctx, model.UDP); ok {
+		if !udp.OtherTimeout.IsNull() && !udp.OtherTimeout.IsUnknown() {
+			setting.UDPOtherTimeout = util.DurationUnits(udp.OtherTimeout, time.Second)
+		}
+		if !udp.StreamTimeout.IsNull() && !udp.StreamTimeout.IsUnknown() {
+			setting.UDPStreamTimeout = util.DurationUnits(udp.StreamTimeout, time.Second)
+		}
 	}
 	if !model.UnbindWANMonitors.IsNull() {
 		setting.UnbindWANMonitors = model.UnbindWANMonitors.ValueBool()
 	}
-	if !model.UPnPEnabled.IsNull() {
-		setting.UPnPEnabled = model.UPnPEnabled.ValueBool()
-	}
-	if !model.UPnPNATPmpEnabled.IsNull() {
-		setting.UPnPNATPmpEnabled = model.UPnPNATPmpEnabled.ValueBool()
-	}
-	if !model.UPnPSecureMode.IsNull() {
-		setting.UPnPSecureMode = model.UPnPSecureMode.ValueBool()
-	}
-	if !model.UPnPWANInterface.IsNull() {
-		setting.UPnPWANInterface = model.UPnPWANInterface.ValueString()
+	if upnp, ok, _ := util.ObjectAs[settingUsgUPnPModel](ctx, model.UPnP); ok {
+		if !upnp.Enabled.IsNull() {
+			setting.UPnPEnabled = upnp.Enabled.ValueBool()
+		}
+		if !upnp.NATPmpEnabled.IsNull() {
+			setting.UPnPNATPmpEnabled = upnp.NATPmpEnabled.ValueBool()
+		}
+		if !upnp.SecureMode.IsNull() {
+			setting.UPnPSecureMode = upnp.SecureMode.ValueBool()
+		}
+		if !upnp.WANInterface.IsNull() {
+			setting.UPnPWANInterface = upnp.WANInterface.ValueString()
+		}
 	}
 
 	return setting
@@ -1191,7 +4707,7 @@ func (r *settingResource) usgModelToSetting(
 
 func (r *settingResource) usgSettingToModel(
 	ctx context.Context,
-	setting *settings.Usg,
+	setting *usgWithGeo,
 	plan *settingUSGModel,
 ) *settingUSGModel {
 	model := &settingUSGModel{}
@@ -1204,26 +4720,20 @@ func (r *settingResource) usgSettingToModel(
 	}
 
 	if !plan.DNSVerification.IsNull() && !plan.DNSVerification.IsUnknown() {
-		dnsVerif := dnsVerificationModel{
-			Domain:             types.StringValue(setting.DNSVerification.Domain),
-			PrimaryDNSServer:   types.StringValue(setting.DNSVerification.PrimaryDNSServer),
-			SecondaryDNSServer: types.StringValue(setting.DNSVerification.SecondaryDNSServer),
-			SettingPreference:  types.StringValue(setting.DNSVerification.SettingPreference),
+		dns := setting.DNSVerification
+		if dns == nil {
+			dns = &settings.SettingUsgDNSVerification{}
 		}
-		objValue, _ := types.ObjectValueFrom(ctx, map[string]attr.Type{
-			"domain":               types.StringType,
-			"primary_dns_server":   types.StringType,
-			"secondary_dns_server": types.StringType,
-			"setting_preference":   types.StringType,
-		}, dnsVerif)
+		dnsVerif := dnsVerificationModel{
+			Domain:             types.StringValue(dns.Domain),
+			PrimaryDNSServer:   types.StringValue(dns.PrimaryDNSServer),
+			SecondaryDNSServer: types.StringValue(dns.SecondaryDNSServer),
+			SettingPreference:  types.StringValue(dns.SettingPreference),
+		}
+		objValue, _ := types.ObjectValueFrom(ctx, usgDNSVerificationAttrTypes, dnsVerif)
 		model.DNSVerification = objValue
 	} else {
-		model.DNSVerification = types.ObjectNull(map[string]attr.Type{
-			"domain":               types.StringType,
-			"primary_dns_server":   types.StringType,
-			"secondary_dns_server": types.StringType,
-			"setting_preference":   types.StringType,
-		})
+		model.DNSVerification = types.ObjectNull(usgDNSVerificationAttrTypes)
 	}
 
 	if !plan.FtpModule.IsNull() && !plan.FtpModule.IsUnknown() {
@@ -1232,43 +4742,47 @@ func (r *settingResource) usgSettingToModel(
 		model.FtpModule = types.BoolNull()
 	}
 
-	if !plan.GeoIPFilteringBlock.IsNull() && !plan.GeoIPFilteringBlock.IsUnknown() {
-		if setting.GeoIPFilteringBlock != "" {
-			model.GeoIPFilteringBlock = types.StringValue(setting.GeoIPFilteringBlock)
-		} else {
-			model.GeoIPFilteringBlock = types.StringNull()
+	// Nested groups: only populate a group the plan configured, and within
+	// it only the leaves the plan configured (exactly as the flat leaves did).
+	boolIfPlanned := func(planVal types.Bool, apiVal bool) types.Bool {
+		if !planVal.IsNull() && !planVal.IsUnknown() {
+			return types.BoolValue(apiVal)
 		}
-	} else {
-		model.GeoIPFilteringBlock = types.StringNull()
+		return types.BoolNull()
+	}
+	stringIfPlanned := func(planVal types.String, apiVal string) types.String {
+		if !planVal.IsNull() && !planVal.IsUnknown() {
+			return util.StringValueOrNull(apiVal)
+		}
+		return types.StringNull()
+	}
+	durIfPlanned := func(planVal timetypes.GoDuration, apiVal int64) timetypes.GoDuration {
+		if !planVal.IsNull() && !planVal.IsUnknown() {
+			return util.DurationValue(apiVal, time.Second)
+		}
+		return timetypes.NewGoDurationNull()
 	}
 
-	if !plan.GeoIPFilteringCountries.IsNull() && !plan.GeoIPFilteringCountries.IsUnknown() {
-		if setting.GeoIPFilteringCountries != "" {
-			model.GeoIPFilteringCountries = types.StringValue(setting.GeoIPFilteringCountries)
-		} else {
-			model.GeoIPFilteringCountries = types.StringNull()
-		}
+	if planGeo, ok, _ := util.ObjectAs[settingUsgGeoIPFilteringModel](
+		ctx,
+		plan.GeoIPFiltering,
+	); ok {
+		model.GeoIPFiltering, _ = types.ObjectValueFrom(
+			ctx, usgGeoIPFilteringAttrTypes, settingUsgGeoIPFilteringModel{
+				Block: stringIfPlanned(planGeo.Block, setting.GeoIPFilteringBlock),
+				Countries: stringIfPlanned(
+					planGeo.Countries,
+					setting.GeoIPFilteringCountries,
+				),
+				Enabled: boolIfPlanned(planGeo.Enabled, setting.GeoIPFilteringEnabled),
+				TrafficDirection: stringIfPlanned(
+					planGeo.TrafficDirection,
+					setting.GeoIPFilteringTrafficDirection,
+				),
+			},
+		)
 	} else {
-		model.GeoIPFilteringCountries = types.StringNull()
-	}
-
-	if !plan.GeoIPFilteringEnabled.IsNull() && !plan.GeoIPFilteringEnabled.IsUnknown() {
-		model.GeoIPFilteringEnabled = types.BoolValue(setting.GeoIPFilteringEnabled)
-	} else {
-		model.GeoIPFilteringEnabled = types.BoolNull()
-	}
-
-	if !plan.GeoIPFilteringTrafficDirection.IsNull() &&
-		!plan.GeoIPFilteringTrafficDirection.IsUnknown() {
-		if setting.GeoIPFilteringTrafficDirection != "" {
-			model.GeoIPFilteringTrafficDirection = types.StringValue(
-				setting.GeoIPFilteringTrafficDirection,
-			)
-		} else {
-			model.GeoIPFilteringTrafficDirection = types.StringNull()
-		}
-	} else {
-		model.GeoIPFilteringTrafficDirection = types.StringNull()
+		model.GeoIPFiltering = types.ObjectNull(usgGeoIPFilteringAttrTypes)
 	}
 
 	if !plan.GreModule.IsNull() && !plan.GreModule.IsUnknown() {
@@ -1284,9 +4798,9 @@ func (r *settingResource) usgSettingToModel(
 	}
 
 	if !plan.ICMPTimeout.IsNull() && !plan.ICMPTimeout.IsUnknown() {
-		model.ICMPTimeout = types.Int64Value(setting.ICMPTimeout)
+		model.ICMPTimeout = util.DurationValue(setting.ICMPTimeout, time.Second)
 	} else {
-		model.ICMPTimeout = types.Int64Null()
+		model.ICMPTimeout = timetypes.NewGoDurationNull()
 	}
 
 	if !plan.MssClamp.IsNull() && !plan.MssClamp.IsUnknown() {
@@ -1299,28 +4813,20 @@ func (r *settingResource) usgSettingToModel(
 		model.MssClamp = types.StringNull()
 	}
 
-	if !plan.OffloadAccounting.IsNull() && !plan.OffloadAccounting.IsUnknown() {
-		model.OffloadAccounting = types.BoolValue(setting.OffloadAccounting)
+	if planOff, ok, _ := util.ObjectAs[settingUsgOffloadModel](ctx, plan.Offload); ok {
+		model.Offload, _ = types.ObjectValueFrom(ctx, usgOffloadAttrTypes, settingUsgOffloadModel{
+			Accounting: boolIfPlanned(planOff.Accounting, setting.OffloadAccounting),
+			L2Blocking: boolIfPlanned(planOff.L2Blocking, setting.OffloadL2Blocking),
+			Sch:        boolIfPlanned(planOff.Sch, setting.OffloadSch),
+		})
 	} else {
-		model.OffloadAccounting = types.BoolNull()
-	}
-
-	if !plan.OffloadL2Blocking.IsNull() && !plan.OffloadL2Blocking.IsUnknown() {
-		model.OffloadL2Blocking = types.BoolValue(setting.OffloadL2Blocking)
-	} else {
-		model.OffloadL2Blocking = types.BoolNull()
-	}
-
-	if !plan.OffloadSch.IsNull() && !plan.OffloadSch.IsUnknown() {
-		model.OffloadSch = types.BoolValue(setting.OffloadSch)
-	} else {
-		model.OffloadSch = types.BoolNull()
+		model.Offload = types.ObjectNull(usgOffloadAttrTypes)
 	}
 
 	if !plan.OtherTimeout.IsNull() && !plan.OtherTimeout.IsUnknown() {
-		model.OtherTimeout = types.Int64Value(setting.OtherTimeout)
+		model.OtherTimeout = util.DurationValue(setting.OtherTimeout, time.Second)
 	} else {
-		model.OtherTimeout = types.Int64Null()
+		model.OtherTimeout = timetypes.NewGoDurationNull()
 	}
 
 	if !plan.PptpModule.IsNull() && !plan.PptpModule.IsUnknown() {
@@ -1353,52 +4859,22 @@ func (r *settingResource) usgSettingToModel(
 		model.SynCookies = types.BoolNull()
 	}
 
-	if !plan.TCPCloseTimeout.IsNull() && !plan.TCPCloseTimeout.IsUnknown() {
-		model.TCPCloseTimeout = types.Int64Value(setting.TCPCloseTimeout)
+	if planTCP, ok, _ := util.ObjectAs[settingUsgTCPModel](ctx, plan.TCP); ok {
+		model.TCP, _ = types.ObjectValueFrom(ctx, usgTCPAttrTypes, settingUsgTCPModel{
+			CloseTimeout:     durIfPlanned(planTCP.CloseTimeout, setting.TCPCloseTimeout),
+			CloseWaitTimeout: durIfPlanned(planTCP.CloseWaitTimeout, setting.TCPCloseWaitTimeout),
+			EstablishedTimeout: durIfPlanned(
+				planTCP.EstablishedTimeout,
+				setting.TCPEstablishedTimeout,
+			),
+			FinWaitTimeout:  durIfPlanned(planTCP.FinWaitTimeout, setting.TCPFinWaitTimeout),
+			LastAckTimeout:  durIfPlanned(planTCP.LastAckTimeout, setting.TCPLastAckTimeout),
+			SynRecvTimeout:  durIfPlanned(planTCP.SynRecvTimeout, setting.TCPSynRecvTimeout),
+			SynSentTimeout:  durIfPlanned(planTCP.SynSentTimeout, setting.TCPSynSentTimeout),
+			TimeWaitTimeout: durIfPlanned(planTCP.TimeWaitTimeout, setting.TCPTimeWaitTimeout),
+		})
 	} else {
-		model.TCPCloseTimeout = types.Int64Null()
-	}
-
-	if !plan.TCPCloseWaitTimeout.IsNull() && !plan.TCPCloseWaitTimeout.IsUnknown() {
-		model.TCPCloseWaitTimeout = types.Int64Value(setting.TCPCloseWaitTimeout)
-	} else {
-		model.TCPCloseWaitTimeout = types.Int64Null()
-	}
-
-	if !plan.TCPEstablishedTimeout.IsNull() && !plan.TCPEstablishedTimeout.IsUnknown() {
-		model.TCPEstablishedTimeout = types.Int64Value(setting.TCPEstablishedTimeout)
-	} else {
-		model.TCPEstablishedTimeout = types.Int64Null()
-	}
-
-	if !plan.TCPFinWaitTimeout.IsNull() && !plan.TCPFinWaitTimeout.IsUnknown() {
-		model.TCPFinWaitTimeout = types.Int64Value(setting.TCPFinWaitTimeout)
-	} else {
-		model.TCPFinWaitTimeout = types.Int64Null()
-	}
-
-	if !plan.TCPLastAckTimeout.IsNull() && !plan.TCPLastAckTimeout.IsUnknown() {
-		model.TCPLastAckTimeout = types.Int64Value(setting.TCPLastAckTimeout)
-	} else {
-		model.TCPLastAckTimeout = types.Int64Null()
-	}
-
-	if !plan.TCPSynRecvTimeout.IsNull() && !plan.TCPSynRecvTimeout.IsUnknown() {
-		model.TCPSynRecvTimeout = types.Int64Value(setting.TCPSynRecvTimeout)
-	} else {
-		model.TCPSynRecvTimeout = types.Int64Null()
-	}
-
-	if !plan.TCPSynSentTimeout.IsNull() && !plan.TCPSynSentTimeout.IsUnknown() {
-		model.TCPSynSentTimeout = types.Int64Value(setting.TCPSynSentTimeout)
-	} else {
-		model.TCPSynSentTimeout = types.Int64Null()
-	}
-
-	if !plan.TCPTimeWaitTimeout.IsNull() && !plan.TCPTimeWaitTimeout.IsUnknown() {
-		model.TCPTimeWaitTimeout = types.Int64Value(setting.TCPTimeWaitTimeout)
-	} else {
-		model.TCPTimeWaitTimeout = types.Int64Null()
+		model.TCP = types.ObjectNull(usgTCPAttrTypes)
 	}
 
 	if !plan.TFTPModule.IsNull() && !plan.TFTPModule.IsUnknown() {
@@ -1417,16 +4893,13 @@ func (r *settingResource) usgSettingToModel(
 		model.TimeoutSettingPreference = types.StringNull()
 	}
 
-	if !plan.UDPOtherTimeout.IsNull() && !plan.UDPOtherTimeout.IsUnknown() {
-		model.UDPOtherTimeout = types.Int64Value(setting.UDPOtherTimeout)
+	if planUDP, ok, _ := util.ObjectAs[settingUsgUDPModel](ctx, plan.UDP); ok {
+		model.UDP, _ = types.ObjectValueFrom(ctx, usgUDPAttrTypes, settingUsgUDPModel{
+			OtherTimeout:  durIfPlanned(planUDP.OtherTimeout, setting.UDPOtherTimeout),
+			StreamTimeout: durIfPlanned(planUDP.StreamTimeout, setting.UDPStreamTimeout),
+		})
 	} else {
-		model.UDPOtherTimeout = types.Int64Null()
-	}
-
-	if !plan.UDPStreamTimeout.IsNull() && !plan.UDPStreamTimeout.IsUnknown() {
-		model.UDPStreamTimeout = types.Int64Value(setting.UDPStreamTimeout)
-	} else {
-		model.UDPStreamTimeout = types.Int64Null()
+		model.UDP = types.ObjectNull(usgUDPAttrTypes)
 	}
 
 	if !plan.UnbindWANMonitors.IsNull() && !plan.UnbindWANMonitors.IsUnknown() {
@@ -1435,33 +4908,1480 @@ func (r *settingResource) usgSettingToModel(
 		model.UnbindWANMonitors = types.BoolNull()
 	}
 
-	if !plan.UPnPEnabled.IsNull() && !plan.UPnPEnabled.IsUnknown() {
-		model.UPnPEnabled = types.BoolValue(setting.UPnPEnabled)
+	if planUPnP, ok, _ := util.ObjectAs[settingUsgUPnPModel](ctx, plan.UPnP); ok {
+		model.UPnP, _ = types.ObjectValueFrom(ctx, usgUPnPAttrTypes, settingUsgUPnPModel{
+			Enabled:       boolIfPlanned(planUPnP.Enabled, setting.UPnPEnabled),
+			NATPmpEnabled: boolIfPlanned(planUPnP.NATPmpEnabled, setting.UPnPNATPmpEnabled),
+			SecureMode:    boolIfPlanned(planUPnP.SecureMode, setting.UPnPSecureMode),
+			WANInterface:  stringIfPlanned(planUPnP.WANInterface, setting.UPnPWANInterface),
+		})
 	} else {
-		model.UPnPEnabled = types.BoolNull()
-	}
-
-	if !plan.UPnPNATPmpEnabled.IsNull() && !plan.UPnPNATPmpEnabled.IsUnknown() {
-		model.UPnPNATPmpEnabled = types.BoolValue(setting.UPnPNATPmpEnabled)
-	} else {
-		model.UPnPNATPmpEnabled = types.BoolNull()
-	}
-
-	if !plan.UPnPSecureMode.IsNull() && !plan.UPnPSecureMode.IsUnknown() {
-		model.UPnPSecureMode = types.BoolValue(setting.UPnPSecureMode)
-	} else {
-		model.UPnPSecureMode = types.BoolNull()
-	}
-
-	if !plan.UPnPWANInterface.IsNull() && !plan.UPnPWANInterface.IsUnknown() {
-		if setting.UPnPWANInterface != "" {
-			model.UPnPWANInterface = types.StringValue(setting.UPnPWANInterface)
-		} else {
-			model.UPnPWANInterface = types.StringNull()
-		}
-	} else {
-		model.UPnPWANInterface = types.StringNull()
+		model.UPnP = types.ObjectNull(usgUPnPAttrTypes)
 	}
 
 	return model
+}
+
+// IGMP snooping conversion functions.
+
+// igmpSnoopingModelToSetting overlays the user-set fields (enabled, network_ids)
+// onto the current remote setting (base) so advanced querier/flood options are
+// preserved across updates.
+func (r *settingResource) igmpSnoopingModelToSetting(
+	ctx context.Context,
+	model *settingIgmpSnoopingModel,
+	base *settings.IgmpSnooping,
+	diags *diag.Diagnostics,
+) *settings.IgmpSnooping {
+	setting := base
+	if !model.Enabled.IsNull() && !model.Enabled.IsUnknown() {
+		setting.Enabled = model.Enabled.ValueBool()
+	}
+	if !model.NetworkIDs.IsNull() && !model.NetworkIDs.IsUnknown() {
+		var ids []string
+		diags.Append(model.NetworkIDs.ElementsAs(ctx, &ids, false)...)
+		setting.NetworkIDs = ids
+	}
+	return setting
+}
+
+func (r *settingResource) igmpSnoopingSettingToModel(
+	ctx context.Context,
+	setting *settings.IgmpSnooping,
+	diags *diag.Diagnostics,
+) *settingIgmpSnoopingModel {
+	model := &settingIgmpSnoopingModel{
+		Enabled: types.BoolValue(setting.Enabled),
+	}
+	ids, d := types.ListValueFrom(ctx, types.StringType, setting.NetworkIDs)
+	diags.Append(d...)
+	model.NetworkIDs = ids
+	return model
+}
+
+// Global switch conversion functions.
+
+// persistGlobalSwitch writes the global_switch fields set in config, if any.
+// obj must come from config, not the plan: UseStateForUnknown fills omitted
+// fields in the plan from state, and those must not be re-sent. The
+// controller merges this partial PUT into the stored setting, so fields the
+// pinned go-unifi struct doesn't know about (link debounce, PoE staging, ...)
+// are left untouched.
+func (r *settingResource) persistGlobalSwitch(
+	ctx context.Context,
+	site string,
+	obj types.Object,
+	diags *diag.Diagnostics,
+) {
+	if obj.IsNull() || obj.IsUnknown() {
+		return
+	}
+	var model settingGlobalSwitchModel
+	diags.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return
+	}
+
+	setting := globalSwitchRawSetting(ctx, &model, diags)
+	if diags.HasError() {
+		return
+	}
+	if len(setting.Data) == 0 {
+		return
+	}
+	if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		diags.AddError("Error Updating Global Switch Setting", err.Error())
+	}
+}
+
+const globalSwitchSettingKey = "global_switch"
+
+// globalSwitchRawSetting builds a partial global_switch payload containing only
+// the fields set in the model.
+func globalSwitchRawSetting(
+	ctx context.Context,
+	model *settingGlobalSwitchModel,
+	diags *diag.Diagnostics,
+) *settings.RawSetting {
+	data := map[string]any{}
+	if !model.AclDeviceIsolation.IsNull() && !model.AclDeviceIsolation.IsUnknown() {
+		var ids []string
+		diags.Append(model.AclDeviceIsolation.ElementsAs(ctx, &ids, false)...)
+		if ids == nil {
+			// An explicitly empty list must clear the setting, so send [] rather
+			// than nil - which would marshal as null and be rejected.
+			ids = []string{}
+		}
+		data["acl_device_isolation"] = ids
+	}
+	if !model.StpVersion.IsNull() && !model.StpVersion.IsUnknown() {
+		data["stp_version"] = model.StpVersion.ValueString()
+	}
+	if !model.DHCPSnoop.IsNull() && !model.DHCPSnoop.IsUnknown() {
+		data["dhcp_snoop"] = model.DHCPSnoop.ValueBool()
+	}
+	if !model.JumboframeEnabled.IsNull() && !model.JumboframeEnabled.IsUnknown() {
+		data["jumboframe_enabled"] = model.JumboframeEnabled.ValueBool()
+	}
+	if !model.Dot1XPortctrlEnabled.IsNull() && !model.Dot1XPortctrlEnabled.IsUnknown() {
+		data["dot1x_portctrl_enabled"] = model.Dot1XPortctrlEnabled.ValueBool()
+	}
+	return &settings.RawSetting{
+		BaseSetting: settings.BaseSetting{Key: globalSwitchSettingKey},
+		Data:        data,
+	}
+}
+
+func (r *settingResource) globalSwitchSettingToModel(
+	ctx context.Context,
+	setting *settings.GlobalSwitch,
+	diags *diag.Diagnostics,
+) *settingGlobalSwitchModel {
+	isolation, d := types.ListValueFrom(ctx, types.StringType, setting.AclDeviceIsolation)
+	diags.Append(d...)
+	return &settingGlobalSwitchModel{
+		AclDeviceIsolation:   isolation,
+		StpVersion:           types.StringValue(setting.StpVersion),
+		DHCPSnoop:            types.BoolValue(setting.DHCPSnoop),
+		JumboframeEnabled:    types.BoolValue(setting.JumboframeEnabled),
+		Dot1XPortctrlEnabled: types.BoolValue(setting.Dot1XPortctrlEnabled),
+	}
+}
+
+// Connectivity conversion functions.
+
+// persistConnectivity writes the connectivity fields set in config, if any.
+// obj must come from config, not the plan: UseStateForUnknown fills omitted
+// fields in the plan from state, and those must not be re-sent. The controller
+// merges this partial PUT into the stored setting, so the generated mesh
+// credentials (x_mesh_essid / x_mesh_psk) and anything else not modelled here
+// survive untouched (#518).
+func (r *settingResource) persistConnectivity(
+	ctx context.Context,
+	site string,
+	obj types.Object,
+	diags *diag.Diagnostics,
+) {
+	if obj.IsNull() || obj.IsUnknown() {
+		return
+	}
+	var model settingConnectivityModel
+	diags.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return
+	}
+
+	setting := connectivityRawSetting(&model)
+	if len(setting.Data) == 0 {
+		return
+	}
+	if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		diags.AddError("Error Updating Connectivity Setting", err.Error())
+	}
+}
+
+const connectivitySettingKey = "connectivity"
+
+// connectivityRawSetting builds a partial connectivity payload containing only
+// the fields set in the model.
+func connectivityRawSetting(model *settingConnectivityModel) *settings.RawSetting {
+	data := map[string]any{}
+	if !model.Enabled.IsNull() && !model.Enabled.IsUnknown() {
+		data["enabled"] = model.Enabled.ValueBool()
+	}
+	if !model.MloMeshEnabled.IsNull() && !model.MloMeshEnabled.IsUnknown() {
+		data["mlo_mesh_enabled"] = model.MloMeshEnabled.ValueBool()
+	}
+	if !model.UplinkType.IsNull() && !model.UplinkType.IsUnknown() {
+		data["uplink_type"] = model.UplinkType.ValueString()
+	}
+	if !model.UplinkHost.IsNull() && !model.UplinkHost.IsUnknown() {
+		data["uplink_host"] = model.UplinkHost.ValueString()
+	}
+	return &settings.RawSetting{
+		BaseSetting: settings.BaseSetting{Key: connectivitySettingKey},
+		Data:        data,
+	}
+}
+
+func (r *settingResource) connectivitySettingToModel(
+	setting *settings.Connectivity,
+) *settingConnectivityModel {
+	return &settingConnectivityModel{
+		Enabled:        types.BoolValue(setting.Enabled),
+		MloMeshEnabled: types.BoolValue(setting.MloMeshEnabled),
+		UplinkType:     stringOrNull(setting.UplinkType),
+		UplinkHost:     stringOrNull(setting.UplinkHost),
+	}
+}
+
+// Channel AI conversion functions.
+
+// radioAiStringList is a radio_ai list of strings: optional, kept from state
+// when omitted, each element checked by elem.
+func radioAiStringList(description string, elem validator.String) schema.ListAttribute {
+	return schema.ListAttribute{
+		MarkdownDescription: description,
+		ElementType:         types.StringType,
+		Optional:            true,
+		Computed:            true,
+		Validators: []validator.List{
+			listvalidator.ValueStringsAre(elem),
+		},
+		PlanModifiers: []planmodifier.List{
+			listplanmodifier.UseStateForUnknown(),
+		},
+	}
+}
+
+// radioAiChannelList is a radio_ai list of channel numbers.
+func radioAiChannelList(description string, elem validator.Int64) schema.ListAttribute {
+	return schema.ListAttribute{
+		MarkdownDescription: description,
+		ElementType:         types.Int64Type,
+		Optional:            true,
+		Computed:            true,
+		Validators: []validator.List{
+			listvalidator.ValueInt64sAre(elem),
+		},
+		PlanModifiers: []planmodifier.List{
+			listplanmodifier.UseStateForUnknown(),
+		},
+	}
+}
+
+// persistRadioAi writes the radio_ai fields set in config, if any. Like
+// persistConnectivity, obj must come from config, not the plan, and the
+// controller merges the partial PUT into the stored setting.
+func (r *settingResource) persistRadioAi(
+	ctx context.Context,
+	site string,
+	obj types.Object,
+	diags *diag.Diagnostics,
+) {
+	if obj.IsNull() || obj.IsUnknown() {
+		return
+	}
+	var model settingRadioAiModel
+	diags.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return
+	}
+
+	setting, d := radioAiRawSetting(ctx, &model)
+	diags.Append(d...)
+	if diags.HasError() || len(setting.Data) == 0 {
+		return
+	}
+	// As writeSetting does for the typed sections, send only the keys whose
+	// value differs from the stored setting.
+	stored, err := r.storedSetting(ctx, site, radioAiSettingKey)
+	if err != nil {
+		diags.AddError("Error Updating Channel AI Setting", err.Error())
+		return
+	}
+	changed, err := rawSettingChanges(stored, setting.Data)
+	if err != nil {
+		diags.AddError("Error Updating Channel AI Setting", err.Error())
+		return
+	}
+	if len(changed) == 0 {
+		return
+	}
+	setting.Data = changed
+	if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		diags.AddError("Error Updating Channel AI Setting", err.Error())
+	}
+}
+
+// rawSettingChanges returns the keys of data whose JSON value differs from
+// the stored one (see settingChanges). Unlike there, a key absent from the
+// stored setting is always sent: data holds only configured keys, so a
+// configured false or [] is meant.
+func rawSettingChanges(stored, data map[string]any) (map[string]any, error) {
+	changes := map[string]any{}
+	for k, v := range data {
+		cur, present := stored[k]
+		if !present {
+			changes[k] = v
+			continue
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		var want any
+		if err := json.Unmarshal(b, &want); err != nil {
+			return nil, err
+		}
+		if !jsonValuesEqual(cur, want) {
+			changes[k] = v
+		}
+	}
+	return changes, nil
+}
+
+// radioAiHtModeConflict rejects a configured ht_modes_ng or ht_modes_na
+// holding a width above the channel_width of that band's planned
+// radios_configuration entry. The controller drops those widths from the
+// stored list (seen on Network 10.6.109: ht_modes_ng = [20, 40] with ng
+// channel_width = 20 stored [20]), so the apply would otherwise end in an
+// inconsistent result. As in radioAiDfsConflict, the list must come from
+// config and radios_configuration from the plan; an unknown or absent entry
+// is not checked. There is no ht_modes list for 6e.
+func radioAiHtModeConflict(ctx context.Context, config, plan types.Object) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if !isKnown(config) || !isKnown(plan) {
+		return diags
+	}
+	configs, ok := plan.Attributes()["radios_configuration"].(types.List)
+	if !ok || !isKnown(configs) {
+		return diags
+	}
+	var entries []settingRadioAiRadioConfigModel
+	diags.Append(configs.ElementsAs(ctx, &entries, false)...)
+	if diags.HasError() {
+		return diags
+	}
+	maxWidth := map[string]int64{}
+	for _, e := range entries {
+		if isKnown(e.Radio) && isKnown(e.ChannelWidth) {
+			maxWidth[e.Radio.ValueString()] = e.ChannelWidth.ValueInt64()
+		}
+	}
+	for _, band := range []string{"ng", "na"} {
+		name := "ht_modes_" + band
+		limit, ok := maxWidth[band]
+		if !ok {
+			continue
+		}
+		modes, ok := config.Attributes()[name].(types.List)
+		if !ok || !isKnown(modes) {
+			continue
+		}
+		var wide []string
+		for _, v := range modes.Elements() {
+			w, ok := v.(types.Int64)
+			if ok && isKnown(w) && w.ValueInt64() > limit {
+				wide = append(wide, fmt.Sprint(w.ValueInt64()))
+			}
+		}
+		if len(wide) == 0 {
+			continue
+		}
+		diags.AddAttributeError(
+			path.Root("radio_ai").AtName(name),
+			"HT mode wider than the band's channel width",
+			fmt.Sprintf("%s lists the widths %s MHz, but the %s entry of "+
+				"radios_configuration has channel_width = %d, and the controller "+
+				"drops wider HT modes from the list in that case. Remove them from "+
+				"%s, or raise channel_width for %s.",
+				name, strings.Join(wide, ", "), band, limit, name, band),
+		)
+	}
+	return diags
+}
+
+// radioAiDfsChannelMin and radioAiDfsChannelMax bound the 5 GHz DFS channels
+// (UNII-2A 52-64 and UNII-2C 100-144).
+const (
+	radioAiDfsChannelMin = 52
+	radioAiDfsChannelMax = 144
+)
+
+// radioAiDfsConflict rejects a configured channels_na holding DFS channels
+// while the planned radios_configuration turns DFS off for na. The controller
+// drops those channels from the stored list (seen on Network 10.6.109), so the
+// apply would otherwise end in an inconsistent result. channels_na must come
+// from config: a list the plan carries from state is what the controller
+// stored. radios_configuration comes from the plan, so a dfs = false kept
+// from state counts too; an unknown one is not checked.
+func radioAiDfsConflict(ctx context.Context, config, plan types.Object) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if !isKnown(config) || !isKnown(plan) {
+		return diags
+	}
+	channels, ok := config.Attributes()["channels_na"].(types.List)
+	if !ok || !isKnown(channels) {
+		return diags
+	}
+	configs, ok := plan.Attributes()["radios_configuration"].(types.List)
+	if !ok || !isKnown(configs) {
+		return diags
+	}
+	var entries []settingRadioAiRadioConfigModel
+	diags.Append(configs.ElementsAs(ctx, &entries, false)...)
+	if diags.HasError() {
+		return diags
+	}
+	dfsOff := false
+	for _, e := range entries {
+		if e.Radio.ValueString() == "na" && isKnown(e.Dfs) && !e.Dfs.ValueBool() {
+			dfsOff = true
+		}
+	}
+	if !dfsOff {
+		return diags
+	}
+	var dfs []string
+	for _, v := range channels.Elements() {
+		c, ok := v.(types.Int64)
+		if !ok || !isKnown(c) {
+			continue
+		}
+		if n := c.ValueInt64(); n >= radioAiDfsChannelMin && n <= radioAiDfsChannelMax {
+			dfs = append(dfs, fmt.Sprint(n))
+		}
+	}
+	if len(dfs) == 0 {
+		return diags
+	}
+	diags.AddAttributeError(
+		path.Root("radio_ai").AtName("channels_na"),
+		"DFS channels with DFS disabled",
+		fmt.Sprintf("channels_na lists the DFS channels %s, but the na entry of "+
+			"radios_configuration has dfs = false, and the controller drops DFS "+
+			"channels from the list in that case. Remove them from channels_na, "+
+			"or set dfs = true for na.", strings.Join(dfs, ", ")),
+	)
+	return diags
+}
+
+const radioAiSettingKey = "radio_ai"
+
+// radioAiRawSetting builds a partial radio_ai payload containing only the
+// fields set in the model. Channels and HT modes go out as numeric strings,
+// the form the controller's own UI stores them in.
+func radioAiRawSetting(
+	ctx context.Context,
+	model *settingRadioAiModel,
+) (*settings.RawSetting, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	data := map[string]any{}
+	if !model.Enabled.IsNull() && !model.Enabled.IsUnknown() {
+		data["enabled"] = model.Enabled.ValueBool()
+	}
+	if !model.AutoEnabled.IsNull() && !model.AutoEnabled.IsUnknown() {
+		data["auto_enabled"] = model.AutoEnabled.ValueBool()
+	}
+	if !model.CronExpr.IsNull() && !model.CronExpr.IsUnknown() {
+		data["cron_expr"] = model.CronExpr.ValueString()
+	}
+	if !model.SettingPreference.IsNull() && !model.SettingPreference.IsUnknown() {
+		data["setting_preference"] = model.SettingPreference.ValueString()
+	}
+	if !model.AutoChannelPresetsType.IsNull() && !model.AutoChannelPresetsType.IsUnknown() {
+		data["auto_channel_presets_type"] = model.AutoChannelPresetsType.ValueString()
+	}
+	if !model.AutoAdjustChannelsToCountry.IsNull() &&
+		!model.AutoAdjustChannelsToCountry.IsUnknown() {
+		data["auto_adjust_channels_to_country"] = model.AutoAdjustChannelsToCountry.ValueBool()
+	}
+	stringLists := map[string]types.List{
+		"radios":                model.Radios,
+		"optimize":              model.Optimize,
+		"exclude_devices":       model.ExcludeDevices,
+		"high_priority_devices": model.HighPriorityDevices,
+	}
+	for key, list := range stringLists {
+		if list.IsNull() || list.IsUnknown() {
+			continue
+		}
+		values := []string{}
+		diags.Append(list.ElementsAs(ctx, &values, false)...)
+		data[key] = values
+	}
+	channels := map[string]types.List{
+		"channels_ng": model.ChannelsNg,
+		"channels_na": model.ChannelsNa,
+		"channels_6e": model.Channels6E,
+		"ht_modes_ng": model.HtModesNg,
+		"ht_modes_na": model.HtModesNa,
+	}
+	for key, list := range channels {
+		if list.IsNull() || list.IsUnknown() {
+			continue
+		}
+		var values []int64
+		diags.Append(list.ElementsAs(ctx, &values, false)...)
+		out := make([]string, len(values))
+		for i, v := range values {
+			out[i] = fmt.Sprint(v)
+		}
+		data[key] = out
+	}
+	if !model.ChannelsBlacklist.IsNull() && !model.ChannelsBlacklist.IsUnknown() {
+		var entries []settingRadioAiBlacklistModel
+		diags.Append(model.ChannelsBlacklist.ElementsAs(ctx, &entries, false)...)
+		out := make([]settings.SettingRadioAiChannelsBlacklist, len(entries))
+		for i, e := range entries {
+			out[i] = settings.SettingRadioAiChannelsBlacklist{
+				Radio:        e.Radio.ValueString(),
+				Channel:      e.Channel.ValueInt64Pointer(),
+				ChannelWidth: e.ChannelWidth.ValueInt64Pointer(),
+			}
+		}
+		data["channels_blacklist"] = out
+	}
+	if !model.RadiosConfiguration.IsNull() && !model.RadiosConfiguration.IsUnknown() {
+		var entries []settingRadioAiRadioConfigModel
+		diags.Append(model.RadiosConfiguration.ElementsAs(ctx, &entries, false)...)
+		out := make([]settings.SettingRadioAiRadiosConfiguration, len(entries))
+		for i, e := range entries {
+			out[i] = settings.SettingRadioAiRadiosConfiguration{
+				Radio:        e.Radio.ValueString(),
+				ChannelWidth: e.ChannelWidth.ValueInt64Pointer(),
+				Dfs:          e.Dfs.ValueBool(),
+			}
+		}
+		data["radios_configuration"] = out
+	}
+	return &settings.RawSetting{
+		BaseSetting: settings.BaseSetting{Key: radioAiSettingKey},
+		Data:        data,
+	}, diags
+}
+
+func (r *settingResource) radioAiSettingToModel(
+	ctx context.Context,
+	setting *settings.RadioAi,
+) (*settingRadioAiModel, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	stringList := func(v []string) types.List {
+		if v == nil {
+			v = []string{}
+		}
+		l, d := types.ListValueFrom(ctx, types.StringType, v)
+		diags.Append(d...)
+		return l
+	}
+	int64List := func(v []int64) types.List {
+		if v == nil {
+			v = []int64{}
+		}
+		l, d := types.ListValueFrom(ctx, types.Int64Type, v)
+		diags.Append(d...)
+		return l
+	}
+	blacklist := make([]settingRadioAiBlacklistModel, len(setting.ChannelsBlacklist))
+	for i, b := range setting.ChannelsBlacklist {
+		blacklist[i] = settingRadioAiBlacklistModel{
+			Radio:        types.StringValue(b.Radio),
+			Channel:      types.Int64PointerValue(b.Channel),
+			ChannelWidth: types.Int64PointerValue(b.ChannelWidth),
+		}
+	}
+	blacklistList, d := types.ListValueFrom(
+		ctx, types.ObjectType{AttrTypes: radioAiBlacklistAttrTypes}, blacklist)
+	diags.Append(d...)
+	radioConfigs := make([]settingRadioAiRadioConfigModel, len(setting.RadiosConfiguration))
+	for i, c := range setting.RadiosConfiguration {
+		radioConfigs[i] = settingRadioAiRadioConfigModel{
+			Radio:        types.StringValue(c.Radio),
+			ChannelWidth: types.Int64PointerValue(c.ChannelWidth),
+			Dfs:          types.BoolValue(c.Dfs),
+		}
+	}
+	radioConfigList, d := types.ListValueFrom(
+		ctx, types.ObjectType{AttrTypes: radioAiRadioConfigAttrTypes}, radioConfigs)
+	diags.Append(d...)
+	return &settingRadioAiModel{
+		Enabled:                     types.BoolValue(setting.Enabled),
+		AutoEnabled:                 types.BoolPointerValue(setting.AutoEnabled),
+		CronExpr:                    stringOrNull(setting.CronExpr),
+		Radios:                      stringList(setting.Radios),
+		Optimize:                    stringList(setting.Optimize),
+		ChannelsNg:                  int64List(setting.ChannelsNg),
+		ChannelsNa:                  int64List(setting.ChannelsNa),
+		Channels6E:                  int64List(setting.Channels6E),
+		ExcludeDevices:              stringList(setting.ExcludeDevices),
+		SettingPreference:           stringOrNull(setting.SettingPreference),
+		AutoChannelPresetsType:      stringOrNull(setting.AutoChannelPresetsType),
+		AutoAdjustChannelsToCountry: types.BoolValue(setting.AutoAdjustChannelsToCountry),
+		HtModesNg:                   int64List(setting.HtModesNg),
+		HtModesNa:                   int64List(setting.HtModesNa),
+		HighPriorityDevices:         stringList(setting.HighPriorityDevices),
+		ChannelsBlacklist:           blacklistList,
+		RadiosConfiguration:         radioConfigList,
+	}, diags
+}
+
+// Etherlighting conversion functions.
+
+// persistEtherLighting writes the etherlighting lists set in config, if any.
+// obj must come from config, not the plan: UseStateForUnknown fills an omitted
+// list in the plan from state, and that must not be re-sent. The controller
+// merges this partial PUT into the stored setting, so a list left out of the
+// configuration keeps the colors set in the UI.
+func (r *settingResource) persistEtherLighting(
+	ctx context.Context,
+	site string,
+	obj types.Object,
+	diags *diag.Diagnostics,
+) {
+	if obj.IsNull() || obj.IsUnknown() {
+		return
+	}
+	var model settingEtherLightingModel
+	diags.Append(obj.As(ctx, &model, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return
+	}
+
+	setting := etherLightingRawSetting(ctx, &model, diags)
+	if diags.HasError() {
+		return
+	}
+	if len(setting.Data) == 0 {
+		return
+	}
+	if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		diags.AddError("Error Updating Etherlighting Setting", err.Error())
+	}
+}
+
+const etherLightingSettingKey = "ether_lighting"
+
+func etherLightingRawSetting(
+	ctx context.Context,
+	model *settingEtherLightingModel,
+	diags *diag.Diagnostics,
+) *settings.RawSetting {
+	data := map[string]any{}
+	if !model.NetworkOverrides.IsNull() && !model.NetworkOverrides.IsUnknown() {
+		var overrides []settingEtherLightingNetworkOverrideModel
+		diags.Append(model.NetworkOverrides.ElementsAs(ctx, &overrides, false)...)
+		// Never nil, which would marshal as null rather than [].
+		entries := make([]settings.SettingEtherLightingNetworkOverrides, 0, len(overrides))
+		for _, o := range overrides {
+			entries = append(entries, settings.SettingEtherLightingNetworkOverrides{
+				Key:         o.Network.ValueString(),
+				RawColorHex: o.Color.ValueString(),
+			})
+		}
+		data["network_overrides"] = entries
+	}
+	if !model.SpeedOverrides.IsNull() && !model.SpeedOverrides.IsUnknown() {
+		var overrides []settingEtherLightingSpeedOverrideModel
+		diags.Append(model.SpeedOverrides.ElementsAs(ctx, &overrides, false)...)
+		entries := make([]settings.SettingEtherLightingSpeedOverrides, 0, len(overrides))
+		for _, o := range overrides {
+			entries = append(entries, settings.SettingEtherLightingSpeedOverrides{
+				Key:         o.Speed.ValueString(),
+				RawColorHex: o.Color.ValueString(),
+			})
+		}
+		data["speed_overrides"] = entries
+	}
+	return &settings.RawSetting{
+		BaseSetting: settings.BaseSetting{Key: etherLightingSettingKey},
+		Data:        data,
+	}
+}
+
+func (r *settingResource) etherLightingSettingToModel(
+	ctx context.Context,
+	setting *settings.EtherLighting,
+	diags *diag.Diagnostics,
+) *settingEtherLightingModel {
+	networkOverrides := make(
+		[]settingEtherLightingNetworkOverrideModel, 0, len(setting.NetworkOverrides),
+	)
+	for _, o := range setting.NetworkOverrides {
+		networkOverrides = append(networkOverrides, settingEtherLightingNetworkOverrideModel{
+			Network: types.StringValue(o.Key),
+			Color:   types.StringValue(o.RawColorHex),
+		})
+	}
+	networkList, d := types.ListValueFrom(
+		ctx,
+		types.ObjectType{AttrTypes: etherLightingNetworkOverrideAttrTypes},
+		networkOverrides,
+	)
+	diags.Append(d...)
+
+	speedOverrides := make(
+		[]settingEtherLightingSpeedOverrideModel, 0, len(setting.SpeedOverrides),
+	)
+	for _, o := range setting.SpeedOverrides {
+		speedOverrides = append(speedOverrides, settingEtherLightingSpeedOverrideModel{
+			Speed: types.StringValue(o.Key),
+			Color: types.StringValue(o.RawColorHex),
+		})
+	}
+	speedList, d := types.ListValueFrom(
+		ctx,
+		types.ObjectType{AttrTypes: etherLightingSpeedOverrideAttrTypes},
+		speedOverrides,
+	)
+	diags.Append(d...)
+
+	return &settingEtherLightingModel{
+		NetworkOverrides: networkList,
+		SpeedOverrides:   speedList,
+	}
+}
+
+// DoH conversion functions.
+func (r *settingResource) autoSpeedtestModelToSetting(
+	model *settingAutoSpeedtestModel,
+) *settings.AutoSpeedtest {
+	setting := &settings.AutoSpeedtest{}
+	if !model.Enabled.IsNull() && !model.Enabled.IsUnknown() {
+		setting.Enabled = model.Enabled.ValueBool()
+	}
+	if !model.CronExpr.IsNull() && !model.CronExpr.IsUnknown() {
+		setting.CronExpr = model.CronExpr.ValueString()
+	}
+	return setting
+}
+
+func (r *settingResource) autoSpeedtestSettingToModel(
+	setting *settings.AutoSpeedtest,
+) settingAutoSpeedtestModel {
+	return settingAutoSpeedtestModel{
+		Enabled:  types.BoolValue(setting.Enabled),
+		CronExpr: util.StringValueOrNull(setting.CronExpr),
+	}
+}
+
+func (r *settingResource) countryModelToSetting(m *settingCountryModel) *settings.Country {
+	return &settings.Country{Code: m.Code.ValueInt64Pointer()}
+}
+
+func (r *settingResource) countrySettingToModel(s *settings.Country) settingCountryModel {
+	return settingCountryModel{Code: types.Int64PointerValue(s.Code)}
+}
+
+func (r *settingResource) dpiModelToSetting(m *settingDpiModel) *settings.Dpi {
+	return &settings.Dpi{
+		Enabled:               m.Enabled.ValueBool(),
+		FingerprintingEnabled: m.FingerprintingEnabled.ValueBool(),
+	}
+}
+
+func (r *settingResource) dpiSettingToModel(s *settings.Dpi) settingDpiModel {
+	return settingDpiModel{
+		Enabled:               types.BoolValue(s.Enabled),
+		FingerprintingEnabled: types.BoolValue(s.FingerprintingEnabled),
+	}
+}
+
+func (r *settingResource) lcmModelToSetting(m *settingLcmModel) *settings.Lcm {
+	setting := &settings.Lcm{
+		Enabled:    m.Enabled.ValueBool(),
+		Sync:       m.Sync.ValueBool(),
+		TouchEvent: m.TouchEvent.ValueBool(),
+	}
+	// Guard the optional ints: an unknown (unset Optional+Computed) value yields a
+	// 0 pointer, which the controller rejects as out of range (cf. #288/#303).
+	if !m.Brightness.IsNull() && !m.Brightness.IsUnknown() {
+		setting.Brightness = m.Brightness.ValueInt64Pointer()
+	}
+	if !m.IdleTimeout.IsNull() && !m.IdleTimeout.IsUnknown() {
+		setting.IDleTimeout = m.IdleTimeout.ValueInt64Pointer()
+	}
+	return setting
+}
+
+func (r *settingResource) lcmSettingToModel(s *settings.Lcm) settingLcmModel {
+	return settingLcmModel{
+		Enabled:     types.BoolValue(s.Enabled),
+		Brightness:  types.Int64PointerValue(s.Brightness),
+		IdleTimeout: types.Int64PointerValue(s.IDleTimeout),
+		Sync:        types.BoolValue(s.Sync),
+		TouchEvent:  types.BoolValue(s.TouchEvent),
+	}
+}
+
+func (r *settingResource) networkOptimizationModelToSetting(
+	m *settingNetworkOptimizationModel,
+) *settings.NetworkOptimization {
+	return &settings.NetworkOptimization{Enabled: m.Enabled.ValueBool()}
+}
+
+func (r *settingResource) networkOptimizationSettingToModel(
+	s *settings.NetworkOptimization,
+) settingNetworkOptimizationModel {
+	return settingNetworkOptimizationModel{Enabled: types.BoolValue(s.Enabled)}
+}
+
+func (r *settingResource) ntpModelToSetting(m *settingNtpModel) *settings.Ntp {
+	return &settings.Ntp{
+		NtpServer1:        stringPointerIfKnown(m.NtpServer1),
+		NtpServer2:        stringPointerIfKnown(m.NtpServer2),
+		NtpServer3:        stringPointerIfKnown(m.NtpServer3),
+		NtpServer4:        stringPointerIfKnown(m.NtpServer4),
+		SettingPreference: m.SettingPreference.ValueString(),
+	}
+}
+
+// stringOrEmpty reads an unset NTP slot as a known "", which is how the
+// attribute has always been stored (#382).
+func stringOrEmpty(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func (r *settingResource) ntpSettingToModel(s *settings.Ntp) settingNtpModel {
+	return settingNtpModel{
+		NtpServer1:        types.StringValue(stringOrEmpty(s.NtpServer1)),
+		NtpServer2:        types.StringValue(stringOrEmpty(s.NtpServer2)),
+		NtpServer3:        types.StringValue(stringOrEmpty(s.NtpServer3)),
+		NtpServer4:        types.StringValue(stringOrEmpty(s.NtpServer4)),
+		SettingPreference: util.StringValueOrNull(s.SettingPreference),
+	}
+}
+
+func (r *settingResource) syslogModelToSetting(
+	ctx context.Context,
+	m *settingSyslogModel,
+	diags *diag.Diagnostics,
+) *settings.Rsyslogd {
+	setting := &settings.Rsyslogd{
+		Enabled:        m.Enabled.ValueBool(),
+		Debug:          m.Debug.ValueBool(),
+		IP:             m.IP.ValueString(),
+		LogAllContents: m.LogAllContents.ValueBool(),
+	}
+	// Guard the optional ports: an unknown (unset Optional+Computed) value yields a
+	// 0 pointer, which the controller rejects as an out-of-range port (#303, cf. #288).
+	if !m.Port.IsNull() && !m.Port.IsUnknown() {
+		setting.Port = m.Port.ValueInt64Pointer()
+	}
+	// An unset (null/unknown) group contributes nothing, which serializes the
+	// same zero values the unset flat leaves did.
+	if nc, ok, d := util.ObjectAs[settingSyslogNetconsoleModel](ctx, m.Netconsole); ok {
+		setting.NetconsoleEnabled = nc.Enabled.ValueBool()
+		setting.NetconsoleHost = nc.Host.ValueString()
+		if !nc.Port.IsNull() && !nc.Port.IsUnknown() {
+			setting.NetconsolePort = nc.Port.ValueInt64Pointer()
+		}
+	} else {
+		diags.Append(d...)
+	}
+	if tc, ok, d := util.ObjectAs[settingSyslogThisControllerModel](ctx, m.ThisController); ok {
+		setting.ThisController = tc.Enabled.ValueBool()
+		setting.ThisControllerEncryptedOnly = tc.EncryptedOnly.ValueBool()
+	} else {
+		diags.Append(d...)
+	}
+	if !m.Contents.IsNull() && !m.Contents.IsUnknown() {
+		diags.Append(m.Contents.ElementsAs(ctx, &setting.Contents, false)...)
+	}
+	return setting
+}
+
+func (r *settingResource) syslogSettingToModel(
+	ctx context.Context,
+	s *settings.Rsyslogd,
+	diags *diag.Diagnostics,
+) settingSyslogModel {
+	contents, d := types.ListValueFrom(ctx, types.StringType, s.Contents)
+	diags.Append(d...)
+	netconsole, d := types.ObjectValueFrom(
+		ctx,
+		syslogNetconsoleAttrTypes,
+		settingSyslogNetconsoleModel{
+			Enabled: types.BoolValue(s.NetconsoleEnabled),
+			Host:    util.StringValueOrNull(s.NetconsoleHost),
+			Port:    types.Int64PointerValue(s.NetconsolePort),
+		},
+	)
+	diags.Append(d...)
+	thisController, d := types.ObjectValueFrom(
+		ctx, syslogThisControllerAttrTypes, settingSyslogThisControllerModel{
+			Enabled:       types.BoolValue(s.ThisController),
+			EncryptedOnly: types.BoolValue(s.ThisControllerEncryptedOnly),
+		},
+	)
+	diags.Append(d...)
+	return settingSyslogModel{
+		Enabled:        types.BoolValue(s.Enabled),
+		Contents:       contents,
+		Debug:          types.BoolValue(s.Debug),
+		IP:             util.StringValueOrNull(s.IP),
+		Port:           types.Int64PointerValue(s.Port),
+		LogAllContents: types.BoolValue(s.LogAllContents),
+		Netconsole:     netconsole,
+		ThisController: thisController,
+	}
+}
+
+func (r *settingResource) dohModelToSetting(
+	ctx context.Context,
+	model *settingDohModel,
+	diags *diag.Diagnostics,
+) *settings.Doh {
+	setting := &settings.Doh{}
+
+	if !model.State.IsNull() && !model.State.IsUnknown() {
+		setting.State = model.State.ValueString()
+	}
+	if !model.ServerNames.IsNull() && !model.ServerNames.IsUnknown() {
+		diags.Append(model.ServerNames.ElementsAs(ctx, &setting.ServerNames, false)...)
+		if diags.HasError() {
+			return setting
+		}
+	}
+	if !model.CustomServers.IsNull() && !model.CustomServers.IsUnknown() {
+		var servers []settingDohCustomServerModel
+		diags.Append(model.CustomServers.ElementsAs(ctx, &servers, false)...)
+		if diags.HasError() {
+			return setting
+		}
+		for _, s := range servers {
+			enabled := true
+			if !s.Enabled.IsNull() && !s.Enabled.IsUnknown() {
+				enabled = s.Enabled.ValueBool()
+			}
+			setting.CustomServers = append(setting.CustomServers, settings.SettingDohCustomServers{
+				Enabled:    enabled,
+				SdnsStamp:  s.SDNSStamp.ValueString(),
+				ServerName: s.ServerName.ValueString(),
+			})
+		}
+	}
+
+	return setting
+}
+
+func (r *settingResource) dohSettingToModel(
+	ctx context.Context,
+	setting *settings.Doh,
+	plan *settingDohModel,
+	diags *diag.Diagnostics,
+) *settingDohModel {
+	model := &settingDohModel{}
+
+	if !plan.State.IsNull() && !plan.State.IsUnknown() {
+		if setting.State != "" {
+			model.State = types.StringValue(setting.State)
+		} else {
+			model.State = types.StringNull()
+		}
+	} else {
+		model.State = types.StringNull()
+	}
+
+	// When the attribute was configured (plan is known), mirror the remote
+	// value as a list — including an empty list when the controller returns
+	// none. Returning ListNull for a configured-but-empty list would differ
+	// from the planned []value and trip the "inconsistent result after apply"
+	// check. ListNull is reserved for the not-configured / unknown case.
+	if !plan.ServerNames.IsNull() && !plan.ServerNames.IsUnknown() {
+		listVal, d := types.ListValueFrom(ctx, types.StringType, setting.ServerNames)
+		diags.Append(d...)
+		model.ServerNames = listVal
+	} else {
+		model.ServerNames = types.ListNull(types.StringType)
+	}
+
+	customServersType := types.ObjectType{AttrTypes: dohCustomServerAttrTypes}
+	if !plan.CustomServers.IsNull() && !plan.CustomServers.IsUnknown() {
+		servers := make([]settingDohCustomServerModel, 0, len(setting.CustomServers))
+		for _, s := range setting.CustomServers {
+			servers = append(servers, settingDohCustomServerModel{
+				Enabled:    types.BoolValue(s.Enabled),
+				SDNSStamp:  types.StringValue(s.SdnsStamp),
+				ServerName: types.StringValue(s.ServerName),
+			})
+		}
+		listVal, d := types.ListValueFrom(ctx, customServersType, servers)
+		diags.Append(d...)
+		model.CustomServers = listVal
+	} else {
+		model.CustomServers = types.ListNull(customServersType)
+	}
+
+	return model
+}
+
+// IPS conversion functions.
+// ipsSuppressionSettingKey is the standalone setting key newer controllers
+// (observed on Network 10.4.x) use to store IPS alert suppression and
+// whitelist entries. Older controllers persist the same data nested under the
+// ips setting's "suppression" field and reject this key with api.err.Invalid.
+const ipsSuppressionSettingKey = "ips_suppression"
+
+// ipsSettingKey is the ips setting document, which carries suppression
+// nested on controllers without the standalone ips_suppression document.
+const ipsSettingKey = "ips"
+
+// readRawSettingData fetches a site setting by its raw key, for setting keys
+// the go-unifi client has no typed struct for. found is false when the
+// controller has no setting stored under that key.
+func (r *settingResource) readRawSettingData(
+	ctx context.Context,
+	site string,
+	key string,
+) (map[string]any, bool, error) {
+	rawSettings, err := r.client.ListSettings(ctx, site)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, raw := range rawSettings {
+		if raw.Key == key {
+			return raw.Data, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// ipsSuppressionFromRaw decodes the alerts/whitelist payload of a raw
+// ips_suppression setting into the nested suppression struct the ips
+// conversion functions already understand.
+func ipsSuppressionFromRaw(data map[string]any) (*settings.IpsSuppression, error) {
+	buf, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	supp := &settings.IpsSuppression{}
+	if err := json.Unmarshal(buf, supp); err != nil {
+		return nil, err
+	}
+	return supp, nil
+}
+
+// ipsSuppressionRawSetting builds the standalone ips_suppression setting
+// payload from the suppression entries of an ips setting. Nil slices are sent
+// as empty arrays so clearing the last entry actually clears the controller.
+func ipsSuppressionRawSetting(suppression *settings.IpsSuppression) *settings.RawSetting {
+	alerts := suppression.Alerts
+	if alerts == nil {
+		alerts = []settings.SettingIpsSuppressionAlerts{}
+	}
+	whitelist := suppression.Whitelist
+	if whitelist == nil {
+		whitelist = []settings.SettingIpsSuppressionWhitelist{}
+	}
+	return &settings.RawSetting{
+		BaseSetting: settings.BaseSetting{Key: ipsSuppressionSettingKey},
+		Data: map[string]any{
+			"alerts":    alerts,
+			"whitelist": whitelist,
+		},
+	}
+}
+
+// ipsSuppressionConfigured reports whether the planned ips.suppression
+// object manages either suppression list.
+func ipsSuppressionConfigured(plan *settingIpsSuppressionModel) bool {
+	return (!plan.Alerts.IsNull() && !plan.Alerts.IsUnknown()) ||
+		(!plan.Whitelist.IsNull() && !plan.Whitelist.IsUnknown())
+}
+
+// persistIpsSuppression makes sure configured suppression entries actually
+// reach the controller. Older controllers persist them nested inside the ips
+// setting (and echo them back on read); newer controllers silently drop the
+// nested field and store suppression under the standalone ips_suppression
+// setting instead, which used to leave the entries unsaved and the plan
+// permanently dirty (#381).
+func (r *settingResource) persistIpsSuppression(
+	ctx context.Context,
+	site string,
+	config types.Object,
+	suppression *settings.IpsSuppression,
+	enabledNetworks []string,
+	diags *diag.Diagnostics,
+) {
+	if config.IsNull() || suppression == nil {
+		return
+	}
+
+	// go-unifi v1.34.1 dropped the nested ips.suppression field, so the
+	// typed ips update never carries suppression: it goes to the standalone
+	// document first.
+	raw := ipsSuppressionRawSetting(suppression)
+	err := r.client.UpdateSetting(ctx, site, raw)
+	if err == nil {
+		return
+	}
+
+	// Controllers without the standalone document (observed on Network
+	// 10.0.162) reject the key with api.err.Invalid and still store
+	// suppression nested in the ips setting. Merge it into the raw ips
+	// document there; the nested write is only attempted when no standalone
+	// document exists, so a newer controller's rejection of a bad payload is
+	// still reported.
+	var apiErr *ui.APIError
+	if errors.As(err, &apiErr) && apiErr.Message == "api.err.Invalid" {
+		if _, hasStandalone, probeErr := r.readRawSettingData(
+			ctx, site, ipsSuppressionSettingKey,
+		); probeErr == nil && !hasStandalone {
+			ipsData, found, readErr := r.readRawSettingData(ctx, site, ipsSettingKey)
+			if readErr == nil && found {
+				nested := &settings.RawSetting{
+					BaseSetting: settings.BaseSetting{Key: ipsSettingKey},
+					Data:        nestIpsSuppression(ipsData, raw.Data, enabledNetworks),
+				}
+				if writeErr := r.client.UpdateSetting(ctx, site, nested); writeErr != nil {
+					diags.AddError("Error Updating IPS Suppression Setting", writeErr.Error())
+				}
+				return
+			}
+			// No ips document to carry it either: with nothing configured
+			// there is nothing to persist, so the rejection is not an error.
+			if len(suppression.Alerts) == 0 && len(suppression.Whitelist) == 0 {
+				return
+			}
+		}
+	}
+	diags.AddError("Error Updating IPS Suppression Setting", err.Error())
+}
+
+// nestIpsSuppression merges suppression into the raw ips document for
+// controllers without the standalone ips_suppression document, carrying the
+// enabled_networks just written with the typed ips update. Measured on Network
+// 10.0.162: that controller drops enabled_networks from an ips update whose
+// document holds no suppression yet, and fills it with every network when the
+// suppression is then written without it. Writing both together keeps the
+// configured list.
+func nestIpsSuppression(
+	ipsData map[string]any,
+	suppression map[string]any,
+	enabledNetworks []string,
+) map[string]any {
+	ipsData["suppression"] = suppression
+	if enabledNetworks != nil {
+		ipsData["enabled_networks"] = enabledNetworks
+	}
+	return ipsData
+}
+
+// ipsModelToSetting returns the ips setting plus, separately, the suppression
+// entries the configuration manages. go-unifi v1.34.1 removed
+// Ips.Suppression: the controller keeps suppression in its own
+// ips_suppression document, which persistIpsSuppression writes (#381).
+func (r *settingResource) ipsModelToSetting(
+	ctx context.Context,
+	model *settingIpsModel,
+	diags *diag.Diagnostics,
+	base *settings.Ips,
+) (*settings.Ips, *settings.IpsSuppression) {
+	// Start from the controller's current document rather than a zero value.
+	// Every bool on settings.Ips is serialized without omitempty, so a freshly
+	// built struct sends false for every attribute the configuration does not
+	// manage - disabling an existing honeypot or content-filtering blocking
+	// page as a side effect of an unrelated change (#493). base is nil only
+	// when the live document could not be read.
+	setting := &settings.Ips{}
+	if base != nil {
+		*setting = *base
+	}
+	var suppression *settings.IpsSuppression
+
+	if !model.IPSMode.IsNull() && !model.IPSMode.IsUnknown() {
+		setting.IPsMode = model.IPSMode.ValueString()
+	}
+	if !model.HoneypotEnabled.IsNull() && !model.HoneypotEnabled.IsUnknown() {
+		setting.HoneypotEnabled = model.HoneypotEnabled.ValueBool()
+	}
+	if !model.RestrictTorrents.IsNull() && !model.RestrictTorrents.IsUnknown() {
+		setting.RestrictTorrents = model.RestrictTorrents.ValueBool()
+	}
+	if !model.ContentFilteringBlockingPageEnabled.IsNull() &&
+		!model.ContentFilteringBlockingPageEnabled.IsUnknown() {
+		setting.ContentFilteringBlockingPageEnabled = model.ContentFilteringBlockingPageEnabled.ValueBool()
+	}
+	if !model.MemoryOptimized.IsNull() && !model.MemoryOptimized.IsUnknown() {
+		setting.MemoryOptimized = model.MemoryOptimized.ValueBool()
+	}
+	if !model.AdvancedFilteringPreference.IsNull() &&
+		!model.AdvancedFilteringPreference.IsUnknown() {
+		setting.AdvancedFilteringPreference = model.AdvancedFilteringPreference.ValueString()
+	}
+	if !model.EnabledCategories.IsNull() && !model.EnabledCategories.IsUnknown() {
+		diags.Append(model.EnabledCategories.ElementsAs(ctx, &setting.EnabledCategories, false)...)
+		if diags.HasError() {
+			return setting, suppression
+		}
+	}
+	if !model.EnabledNetworks.IsNull() && !model.EnabledNetworks.IsUnknown() {
+		diags.Append(model.EnabledNetworks.ElementsAs(ctx, &setting.EnabledNetworks, false)...)
+		if diags.HasError() {
+			return setting, suppression
+		}
+	}
+	if !model.Honeypot.IsNull() && !model.Honeypot.IsUnknown() {
+		var honeypots []settingIpsHoneypotModel
+		diags.Append(model.Honeypot.ElementsAs(ctx, &honeypots, false)...)
+		if diags.HasError() {
+			return setting, suppression
+		}
+		setting.Honeypot = nil
+		for _, h := range honeypots {
+			setting.Honeypot = append(setting.Honeypot, settings.SettingIpsHoneypot{
+				IPAddress: h.IPAddress.ValueString(),
+				NetworkID: h.NetworkID.ValueString(),
+				Version:   h.Version.ValueString(),
+			})
+		}
+	}
+	supp, suppOK, d := util.ObjectAs[settingIpsSuppressionModel](ctx, model.Suppression)
+	diags.Append(d...)
+	if diags.HasError() {
+		return setting, suppression
+	}
+	if suppOK && !supp.Whitelist.IsNull() && !supp.Whitelist.IsUnknown() {
+		var whitelist []settingIpsWhitelistModel
+		diags.Append(supp.Whitelist.ElementsAs(ctx, &whitelist, false)...)
+		if diags.HasError() {
+			return setting, suppression
+		}
+		if suppression == nil {
+			suppression = &settings.IpsSuppression{}
+		}
+		for _, w := range whitelist {
+			suppression.Whitelist = append(
+				suppression.Whitelist,
+				settings.SettingIpsSuppressionWhitelist{
+					Direction: w.Direction.ValueString(),
+					Mode:      w.Mode.ValueString(),
+					Value:     w.Value.ValueString(),
+				},
+			)
+		}
+	}
+	if suppOK && !supp.Alerts.IsNull() && !supp.Alerts.IsUnknown() {
+		var alerts []settingIpsAlertModel
+		diags.Append(supp.Alerts.ElementsAs(ctx, &alerts, false)...)
+		if diags.HasError() {
+			return setting, suppression
+		}
+		if suppression == nil {
+			suppression = &settings.IpsSuppression{}
+		}
+		for _, a := range alerts {
+			alert := settings.SettingIpsSuppressionAlerts{
+				Category:  a.Category.ValueString(),
+				Signature: a.Signature.ValueString(),
+				Type:      a.Type.ValueString(),
+			}
+			// Omit gid/id when unset rather than sending 0 (cf. #303).
+			if !a.Gid.IsNull() && !a.Gid.IsUnknown() {
+				alert.Gid = a.Gid.ValueInt64Pointer()
+			}
+			if !a.ID.IsNull() && !a.ID.IsUnknown() {
+				alert.ID = a.ID.ValueInt64Pointer()
+			}
+			if !a.Tracking.IsNull() && !a.Tracking.IsUnknown() {
+				var tracking []settingIpsTrackingModel
+				diags.Append(a.Tracking.ElementsAs(ctx, &tracking, false)...)
+				for _, t := range tracking {
+					alert.Tracking = append(alert.Tracking, settings.SettingIpsSuppressionTracking{
+						Direction: t.Direction.ValueString(),
+						Mode:      t.Mode.ValueString(),
+						Value:     t.Value.ValueString(),
+					})
+				}
+			}
+			suppression.Alerts = append(suppression.Alerts, alert)
+		}
+	}
+
+	return setting, suppression
+}
+
+func (r *settingResource) ipsSettingToModel(
+	ctx context.Context,
+	setting *settings.Ips,
+	plan *settingIpsModel,
+	diags *diag.Diagnostics,
+	suppression *settings.IpsSuppression,
+) *settingIpsModel {
+	model := &settingIpsModel{}
+
+	if !plan.IPSMode.IsNull() && !plan.IPSMode.IsUnknown() {
+		if setting.IPsMode != "" {
+			model.IPSMode = types.StringValue(setting.IPsMode)
+		} else {
+			model.IPSMode = types.StringNull()
+		}
+	} else {
+		model.IPSMode = types.StringNull()
+	}
+
+	if !plan.HoneypotEnabled.IsNull() && !plan.HoneypotEnabled.IsUnknown() {
+		model.HoneypotEnabled = types.BoolValue(setting.HoneypotEnabled)
+	} else {
+		model.HoneypotEnabled = types.BoolNull()
+	}
+
+	if !plan.RestrictTorrents.IsNull() && !plan.RestrictTorrents.IsUnknown() {
+		model.RestrictTorrents = types.BoolValue(setting.RestrictTorrents)
+	} else {
+		model.RestrictTorrents = types.BoolNull()
+	}
+
+	if !plan.ContentFilteringBlockingPageEnabled.IsNull() &&
+		!plan.ContentFilteringBlockingPageEnabled.IsUnknown() {
+		model.ContentFilteringBlockingPageEnabled = types.BoolValue(
+			setting.ContentFilteringBlockingPageEnabled,
+		)
+	} else {
+		model.ContentFilteringBlockingPageEnabled = types.BoolNull()
+	}
+
+	if !plan.MemoryOptimized.IsNull() && !plan.MemoryOptimized.IsUnknown() {
+		model.MemoryOptimized = types.BoolValue(setting.MemoryOptimized)
+	} else {
+		model.MemoryOptimized = types.BoolNull()
+	}
+
+	if !plan.AdvancedFilteringPreference.IsNull() && !plan.AdvancedFilteringPreference.IsUnknown() {
+		if setting.AdvancedFilteringPreference != "" {
+			model.AdvancedFilteringPreference = types.StringValue(
+				setting.AdvancedFilteringPreference,
+			)
+		} else {
+			model.AdvancedFilteringPreference = types.StringNull()
+		}
+	} else {
+		model.AdvancedFilteringPreference = types.StringNull()
+	}
+
+	// Configured lists mirror the remote value (empty list included); ListNull
+	// is reserved for the not-configured / unknown case. See dohSettingToModel
+	// for why a configured-but-empty list must not become ListNull.
+	if !plan.EnabledCategories.IsNull() && !plan.EnabledCategories.IsUnknown() {
+		listVal, d := types.ListValueFrom(ctx, types.StringType, setting.EnabledCategories)
+		diags.Append(d...)
+		model.EnabledCategories = listVal
+	} else {
+		model.EnabledCategories = types.ListNull(types.StringType)
+	}
+
+	if !plan.EnabledNetworks.IsNull() && !plan.EnabledNetworks.IsUnknown() {
+		listVal, d := types.ListValueFrom(ctx, types.StringType, setting.EnabledNetworks)
+		diags.Append(d...)
+		model.EnabledNetworks = listVal
+	} else {
+		model.EnabledNetworks = types.ListNull(types.StringType)
+	}
+
+	honeypotType := types.ObjectType{AttrTypes: ipsHoneypotAttrTypes}
+	if !plan.Honeypot.IsNull() && !plan.Honeypot.IsUnknown() {
+		honeypots := make([]settingIpsHoneypotModel, 0, len(setting.Honeypot))
+		for _, h := range setting.Honeypot {
+			honeypots = append(honeypots, settingIpsHoneypotModel{
+				IPAddress: types.StringValue(h.IPAddress),
+				NetworkID: types.StringValue(h.NetworkID),
+				Version:   types.StringValue(h.Version),
+			})
+		}
+		listVal, d := types.ListValueFrom(ctx, honeypotType, honeypots)
+		diags.Append(d...)
+		model.Honeypot = listVal
+	} else {
+		model.Honeypot = types.ListNull(honeypotType)
+	}
+
+	// suppression: an unconfigured (null/unknown) group stays null; inside a
+	// configured group each list mirrors the remote value only when the plan
+	// manages it, exactly as the flat lists did.
+	planSupp, suppOK, d := util.ObjectAs[settingIpsSuppressionModel](ctx, plan.Suppression)
+	diags.Append(d...)
+	if !suppOK {
+		model.Suppression = types.ObjectNull(ipsSuppressionAttrTypes)
+		return model
+	}
+	supp := settingIpsSuppressionModel{}
+
+	whitelistType := types.ObjectType{AttrTypes: ipsWhitelistAttrTypes}
+	if !planSupp.Whitelist.IsNull() && !planSupp.Whitelist.IsUnknown() {
+		var whitelist []settings.SettingIpsSuppressionWhitelist
+		if suppression != nil {
+			whitelist = suppression.Whitelist
+		}
+		entries := make([]settingIpsWhitelistModel, 0, len(whitelist))
+		for _, w := range whitelist {
+			entries = append(entries, settingIpsWhitelistModel{
+				Direction: types.StringValue(w.Direction),
+				Mode:      types.StringValue(w.Mode),
+				Value:     types.StringValue(w.Value),
+			})
+		}
+		listVal, d := types.ListValueFrom(ctx, whitelistType, entries)
+		diags.Append(d...)
+		supp.Whitelist = listVal
+	} else {
+		supp.Whitelist = types.ListNull(whitelistType)
+	}
+
+	trackingType := types.ObjectType{AttrTypes: ipsTrackingAttrTypes}
+	alertType := types.ObjectType{AttrTypes: ipsAlertAttrTypes}
+	if !planSupp.Alerts.IsNull() && !planSupp.Alerts.IsUnknown() {
+		var alerts []settings.SettingIpsSuppressionAlerts
+		if suppression != nil {
+			alerts = suppression.Alerts
+		}
+		entries := make([]settingIpsAlertModel, 0, len(alerts))
+		for _, a := range alerts {
+			tracking := make([]settingIpsTrackingModel, 0, len(a.Tracking))
+			for _, t := range a.Tracking {
+				tracking = append(tracking, settingIpsTrackingModel{
+					Direction: types.StringValue(t.Direction),
+					Mode:      types.StringValue(t.Mode),
+					Value:     types.StringValue(t.Value),
+				})
+			}
+			trackingList, d := types.ListValueFrom(ctx, trackingType, tracking)
+			diags.Append(d...)
+			entries = append(entries, settingIpsAlertModel{
+				Category:  util.StringValueOrNull(a.Category),
+				Gid:       types.Int64PointerValue(a.Gid),
+				ID:        types.Int64PointerValue(a.ID),
+				Signature: util.StringValueOrNull(a.Signature),
+				Type:      util.StringValueOrNull(a.Type),
+				Tracking:  trackingList,
+			})
+		}
+		listVal, d := types.ListValueFrom(ctx, alertType, entries)
+		diags.Append(d...)
+		supp.Alerts = listVal
+	} else {
+		supp.Alerts = types.ListNull(alertType)
+	}
+
+	suppObj, d := types.ObjectValueFrom(ctx, ipsSuppressionAttrTypes, supp)
+	diags.Append(d...)
+	model.Suppression = suppObj
+
+	return model
+}
+
+// settingSectionChanged reports whether a configured settings section has a
+// planned value that differs from state, so Update writes only the sections
+// that change. Unknown planned leaves do not count: an Optional+Computed leaf
+// the configuration leaves unset plans as unknown whenever anything else in
+// the resource changes, and that alone must not trigger a write. Writing an
+// unchanged section is not a no-op: the controller regenerates
+// mgmt.x_api_token on every mgmt write (#580).
+func settingSectionChanged(plan, state types.Object) bool {
+	if state.IsNull() || state.IsUnknown() {
+		return true
+	}
+	return attrValueChanged(plan, state)
+}
+
+func attrValueChanged(plan, state attr.Value) bool {
+	if plan.IsUnknown() {
+		return false
+	}
+	planObj, okPlan := plan.(types.Object)
+	stateObj, okState := state.(types.Object)
+	if !okPlan || !okState || planObj.IsNull() || stateObj.IsNull() {
+		return !plan.Equal(state)
+	}
+	stateAttrs := stateObj.Attributes()
+	for name, p := range planObj.Attributes() {
+		s, ok := stateAttrs[name]
+		if !ok || attrValueChanged(p, s) {
+			return true
+		}
+	}
+	return false
 }

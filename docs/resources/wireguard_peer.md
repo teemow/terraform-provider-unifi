@@ -2,42 +2,43 @@
 page_title: Wireguard Peer (Resource)
 subcategory: ""
 description: |-
-  unifi_wireguard_peer manages WireGuard VPN peers on a UniFi WireGuard server. The controller auto-generates the keypair and assigns an IP address when a peer is created.
+  Manages a WireGuard peer (client) of a WireGuard VPN server. The server is a unifi_vpn_server resource (or a network with vpn_type = "wireguard-server"); its network ID is referenced via network_id.
 ---
 
 # Wireguard Peer (Resource)
 
-`unifi_wireguard_peer` manages WireGuard VPN peers on a UniFi WireGuard server. The controller auto-generates the keypair and assigns an IP address when a peer is created.
+Manages a WireGuard peer (client) of a WireGuard VPN server. The server is a `unifi_vpn_server` resource (or a network with `vpn_type = "wireguard-server"`); its network ID is referenced via `network_id`.
 
 ## Example Usage
 
 ```terraform
-# Reference an existing WireGuard VPN server
-resource "unifi_vpn_server" "wireguard" {
-  name    = "Spiderhome"
-  subnet  = "10.100.0.1/24"
+resource "unifi_vpn_server" "wg" {
+  name   = "wireguard"
+  subnet = "192.0.2.1/24"
 
   wireguard = {
     port = 51820
   }
 }
 
-# Create WireGuard peers
-resource "unifi_wireguard_peer" "laptop" {
-  name                = "teemow-laptop"
-  wireguard_server_id = unifi_vpn_server.wireguard.id
+resource "unifi_wireguard_peer" "example" {
+  network_id   = unifi_vpn_server.wg.id
+  name         = "example-peer"
+  interface_ip = "192.0.2.10"
+  public_key   = "ZmFrZS10ZXN0LXdpcmVndWFyZC1wdWJrZXkAAAAAAAA="
 }
 
-resource "unifi_wireguard_peer" "phone" {
-  name                = "teemow-phone"
-  wireguard_server_id = unifi_vpn_server.wireguard.id
-}
+# A peer with a pre-shared key. Prefer preshared_key_wo: it is used at apply
+# time but never written to state, at the cost of the provider being unable to
+# detect a key changed outside Terraform. Leaving both unset keeps the key off
+# the wire entirely, so a key configured in the UI is preserved.
+resource "unifi_wireguard_peer" "with_psk" {
+  network_id   = unifi_vpn_server.wg.id
+  name         = "laptop"
+  interface_ip = "192.0.2.11"
+  public_key   = "ZmFrZS10ZXN0LXdpcmVndWFyZC1wdWJrZXkAAAAAAAA="
 
-# Peer with explicit enabled flag
-resource "unifi_wireguard_peer" "guest" {
-  name                = "guest-device"
-  wireguard_server_id = unifi_vpn_server.wireguard.id
-  enabled             = false
+  preshared_key_wo = var.laptop_psk
 }
 ```
 
@@ -46,30 +47,46 @@ resource "unifi_wireguard_peer" "guest" {
 
 ### Required
 
+- `interface_ip` (String) The tunnel IP assigned to the peer, without mask (e.g. `192.0.2.10`). Must be within the WireGuard server's subnet.
 - `name` (String) The name of the WireGuard peer.
-- `wireguard_server_id` (String) The ID of the WireGuard VPN server this peer belongs to.
+- `network_id` (String) The ID of the WireGuard server network the peer connects to.
+- `public_key` (String) The WireGuard public key of the peer.
 
 ### Optional
 
-- `enabled` (Boolean) Specifies whether the WireGuard peer is enabled.
-- `site` (String) The name of the site to associate the WireGuard peer with.
+> **NOTE**: [Write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments) are supported in Terraform 1.11 and later.
+
+- `allowed_ips` (List of String) Additional CIDRs routed to this peer beyond its tunnel IP. A new peer gets none; an existing peer keeps the controller's list when this is not set, so adopting a peer does not drop the routes behind it (#544). Set it to `[]` to clear them.
+- `interface_ipv6` (String) The peer's IPv6 tunnel address, without prefix length (e.g. `fd00:db8::2`), for a server with `subnet_ipv6`: within that subnet. Left unset, the peer has no IPv6 address.
+- `preshared_key` (String, Sensitive) Optional WireGuard pre-shared key for this peer (the UI's Pre-Shared Key toggle), adding a layer of symmetric encryption on top of the key pair. The controller stores and returns it in clear text, so it is kept in state - use `preshared_key_wo` to avoid persisting the secret. Left unset, the attribute is not written and a key configured out of band is preserved.
+- `preshared_key_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) Write-only equivalent of `preshared_key` (Terraform 1.11+). Used at apply time but never written to state, so it can be sourced from an ephemeral resource. Because nothing is stored, the provider cannot detect a key changed outside Terraform: such a change produces no diff. Mutually exclusive with `preshared_key`.
+- `site` (String) The name of the site the WireGuard server belongs to.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 
 ### Read-Only
 
 - `id` (String) The ID of the WireGuard peer.
-- `ip` (String) The tunnel IP address assigned to this peer by the controller.
-- `public_key` (String, Sensitive) The WireGuard public key generated by the controller for this peer.
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
 
 ## Import
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
-# import from provider configured site
-terraform import unifi_wireguard_peer.laptop 5dc28e5e9106d105bdc87217
+# import by network ID and peer ID from provider configured site
+terraform import unifi_wireguard_peer.laptop 5dc28e5e9106d105bdc87217:6a259bc465f49edd8b44d2f4
 
 # import from another site
-terraform import unifi_wireguard_peer.laptop bfa2l6i7:5dc28e5e9106d105bdc87217
+terraform import unifi_wireguard_peer.laptop bfa2l6i7:5dc28e5e9106d105bdc87217:6a259bc465f49edd8b44d2f4
 ```
