@@ -3,31 +3,54 @@ package unifi
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework-timetypes/timetypes"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
+	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/planmodifiers"
 	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/validators"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                = &portProfileResource{}
-	_ resource.ResourceWithImportState = &portProfileResource{}
+	_ resource.Resource                 = &portProfileResource{}
+	_ resource.ResourceWithImportState  = &portProfileResource{}
+	_ resource.ResourceWithIdentity     = &portProfileResource{}
+	_ resource.ResourceWithUpgradeState = &portProfileResource{}
+	_ resource.ResourceWithModifyPlan   = &portProfileResource{}
+)
+
+// Ensure provider defined types fully satisfy list interfaces.
+var (
+	_ list.ListResource              = &portProfileResource{}
+	_ list.ListResourceWithConfigure = &portProfileResource{}
 )
 
 func NewPortProfileFrameworkResource() resource.Resource {
+	return &portProfileResource{}
+}
+
+func NewPortProfileListResource() list.ListResource {
 	return &portProfileResource{}
 }
 
@@ -36,44 +59,172 @@ type portProfileResource struct {
 	client *Client
 }
 
+// portProfileIdentityModel describes the resource identity data model.
+type portProfileIdentityModel struct {
+	ID   types.String `tfsdk:"id"`
+	Site types.String `tfsdk:"site"`
+}
+
+// portProfileListConfigModel describes the list configuration model.
+type portProfileListConfigModel struct {
+	Site   types.String `tfsdk:"site"`
+	Filter types.List   `tfsdk:"filter"`
+}
+
+// portProfileListFilterModel represents a single name/value filter entry.
+type portProfileListFilterModel struct {
+	Name  types.String `tfsdk:"name"`
+	Value types.String `tfsdk:"value"`
+}
+
 // portProfileResourceModel describes the resource data model.
 type portProfileResourceModel struct {
-	ID                         types.String `tfsdk:"id"`
-	Site                       types.String `tfsdk:"site"`
-	Autoneg                    types.Bool   `tfsdk:"autoneg"`
-	Dot1XCtrl                  types.String `tfsdk:"dot1x_ctrl"`
-	Dot1XIdleTimeout           types.Int64  `tfsdk:"dot1x_idle_timeout"`
-	EgressRateLimitKbps        types.Int64  `tfsdk:"egress_rate_limit_kbps"`
-	EgressRateLimitKbpsEnabled types.Bool   `tfsdk:"egress_rate_limit_kbps_enabled"`
-	Forward                    types.String `tfsdk:"forward"`
-	FullDuplex                 types.Bool   `tfsdk:"full_duplex"`
-	Isolation                  types.Bool   `tfsdk:"isolation"`
-	LLDPMedEnabled             types.Bool   `tfsdk:"lldpmed_enabled"`
-	LLDPMedNotifyEnabled       types.Bool   `tfsdk:"lldpmed_notify_enabled"`
-	NativeNetworkConfID        types.String `tfsdk:"native_networkconf_id"`
-	Name                       types.String `tfsdk:"name"`
-	OpMode                     types.String `tfsdk:"op_mode"`
-	PoeMode                    types.String `tfsdk:"poe_mode"`
-	PortSecurityEnabled        types.Bool   `tfsdk:"port_security_enabled"`
-	PortSecurityMacAddress     types.Set    `tfsdk:"port_security_mac_address"`
-	PriorityQueue1Level        types.Int64  `tfsdk:"priority_queue1_level"`
-	PriorityQueue2Level        types.Int64  `tfsdk:"priority_queue2_level"`
-	PriorityQueue3Level        types.Int64  `tfsdk:"priority_queue3_level"`
-	PriorityQueue4Level        types.Int64  `tfsdk:"priority_queue4_level"`
-	Speed                      types.Int64  `tfsdk:"speed"`
-	StormctrlBcastEnabled      types.Bool   `tfsdk:"stormctrl_bcast_enabled"`
-	StormctrlBcastLevel        types.Int64  `tfsdk:"stormctrl_bcast_level"`
-	StormctrlBcastRate         types.Int64  `tfsdk:"stormctrl_bcast_rate"`
-	StormctrlMcastEnabled      types.Bool   `tfsdk:"stormctrl_mcast_enabled"`
-	StormctrlMcastLevel        types.Int64  `tfsdk:"stormctrl_mcast_level"`
-	StormctrlMcastRate         types.Int64  `tfsdk:"stormctrl_mcast_rate"`
-	StormctrlType              types.String `tfsdk:"stormctrl_type"`
-	StormctrlUcastEnabled      types.Bool   `tfsdk:"stormctrl_ucast_enabled"`
-	StormctrlUcastLevel        types.Int64  `tfsdk:"stormctrl_ucast_level"`
-	StormctrlUcastRate         types.Int64  `tfsdk:"stormctrl_ucast_rate"`
-	STPPortMode                types.Bool   `tfsdk:"stp_port_mode"`
-	TaggedNetworkConfIDs       types.Set    `tfsdk:"tagged_networkconf_ids"`
-	VoiceNetworkConfID         types.String `tfsdk:"voice_networkconf_id"`
+	ID                        types.String   `tfsdk:"id"`
+	Site                      types.String   `tfsdk:"site"`
+	Autoneg                   types.Bool     `tfsdk:"autoneg"`
+	Dot1X                     types.Object   `tfsdk:"dot1x"`
+	EgressRateLimit           types.Object   `tfsdk:"egress_rate_limit"`
+	Forward                   types.String   `tfsdk:"forward"`
+	FullDuplex                types.Bool     `tfsdk:"full_duplex"`
+	Isolation                 types.Bool     `tfsdk:"isolation"`
+	Lldpmed                   types.Object   `tfsdk:"lldpmed"`
+	NativeNetworkConfID       types.String   `tfsdk:"native_networkconf_id"`
+	Name                      types.String   `tfsdk:"name"`
+	OpMode                    types.String   `tfsdk:"op_mode"`
+	PoeMode                   types.String   `tfsdk:"poe_mode"`
+	PortSecurity              types.Object   `tfsdk:"port_security"`
+	PriorityQueue1Level       types.Int64    `tfsdk:"priority_queue1_level"`
+	PriorityQueue2Level       types.Int64    `tfsdk:"priority_queue2_level"`
+	PriorityQueue3Level       types.Int64    `tfsdk:"priority_queue3_level"`
+	PriorityQueue4Level       types.Int64    `tfsdk:"priority_queue4_level"`
+	Speed                     types.Int64    `tfsdk:"speed"`
+	Stormctrl                 types.Object   `tfsdk:"stormctrl"`
+	STPPortMode               types.Bool     `tfsdk:"stp_port_mode"`
+	TaggedNetworkConfIDs      types.Set      `tfsdk:"tagged_networkconf_ids"`
+	VoiceNetworkConfID        types.String   `tfsdk:"voice_networkconf_id"`
+	ExcludedNetworkConfIDs    types.Set      `tfsdk:"excluded_networkconf_ids"`
+	MulticastRouterNetworkIDs types.Set      `tfsdk:"multicast_router_networkconf_ids"`
+	TaggedVLANMgmt            types.String   `tfsdk:"tagged_vlan_mgmt"`
+	FecMode                   types.String   `tfsdk:"fec_mode"`
+	SettingPreference         types.String   `tfsdk:"setting_preference"`
+	PortKeepaliveEnabled      types.Bool     `tfsdk:"port_keepalive_enabled"`
+	Timeouts                  timeouts.Value `tfsdk:"timeouts"`
+}
+
+// portProfilePortSecurityModel is the `port_security` nested object. The MAC
+// allow-list is a Set here (it is a List on unifi_device.port_override).
+type portProfilePortSecurityModel struct {
+	Enabled    types.Bool `tfsdk:"enabled"`
+	MACAddress types.Set  `tfsdk:"mac_address"`
+}
+
+func portProfilePortSecurityAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"enabled":     types.BoolType,
+		"mac_address": types.SetType{ElemType: types.StringType},
+	}
+}
+
+// Object-level defaults for dot1x and lldpmed reproduce the values the flat
+// attributes used to send when the practitioner left the group out of
+// configuration, so the request body on create is unchanged by the nesting.
+//
+// egress_rate_limit, port_security and stormctrl deliberately have NO object
+// default: their value leaves (kbps, mac_address, level, rate) are omitempty
+// on the wire, so the controller keeps a residual value after they are unset.
+// Those leaves are Optional+Computed and the groups resolve from the
+// controller, exactly like unifi_device.port_override; disable a feature with
+// `enabled = false` rather than by removing the block.
+//
+// Their leaves carry no Defaults either, and the groups use
+// objectplanmodifier.UseStateForUnknown: the framework applies a nested
+// leaf's Default even when the parent object is null in configuration, which
+// manufactures a transient diff whenever the controller value differs from
+// the default (e.g. bcast.enabled = true) and re-plans every computed
+// attribute of the resource on every run.
+
+// portProfileDot1xDefault and portProfileLldpmedDefault are create-time
+// shapes, applied by ModifyPlan to a new profile that leaves the group out.
+// They used to be schema Defaults, which the framework applies before any plan
+// modifier runs: every adopted profile whose configuration left the group out
+// planned these constants over the controller's 802.1X and LLDP-MED settings
+// (#544). On update the groups keep the controller's object.
+func portProfileDot1xDefault() types.Object {
+	return types.ObjectValueMust(portDot1xAttrTypes(), map[string]attr.Value{
+		"ctrl":         types.StringValue("force_authorized"),
+		"idle_timeout": timetypes.NewGoDurationValue(5 * time.Minute),
+	})
+}
+
+func portProfileLldpmedDefault() types.Object {
+	return types.ObjectValueMust(portLldpmedAttrTypes(), map[string]attr.Value{
+		"enabled":        types.BoolValue(true),
+		"notify_enabled": types.BoolNull(),
+	})
+}
+
+// portProfileStormctrlSchema is the `stormctrl` nested attribute.
+func portProfileStormctrlSchema() schema.SingleNestedAttribute {
+	class := func(kind string) schema.SingleNestedAttribute {
+		return schema.SingleNestedAttribute{
+			Description: kind + " Storm Control for the port profile.",
+			Optional:    true,
+			Computed:    true,
+			PlanModifiers: []planmodifier.Object{
+				objectplanmodifier.UseStateForUnknown(),
+			},
+			Attributes: map[string]schema.Attribute{
+				"enabled": schema.BoolAttribute{
+					Description: "Enable " + kind + " Storm Control for the port profile. Computed from the controller when not set.",
+					Optional:    true,
+					Computed:    true,
+				},
+				"level": schema.Int64Attribute{
+					Description: "The " + kind + " Storm Control level for the port profile. Can be between 0 and 100.",
+					Optional:    true,
+					Computed:    true,
+					Validators: []validator.Int64{
+						int64validator.Between(0, 100),
+						int64validator.ConflictsWith(
+							path.MatchRelative().AtParent().AtName("rate"),
+						),
+					},
+				},
+				"rate": schema.Int64Attribute{
+					Description: "The " + kind + " Storm Control rate for the port profile. Can be between 0 and 14880000.",
+					Optional:    true,
+					Computed:    true,
+					Validators: []validator.Int64{
+						int64validator.Between(0, 14880000),
+						int64validator.ConflictsWith(
+							path.MatchRelative().AtParent().AtName("level"),
+						),
+					},
+				},
+			},
+		}
+	}
+	return schema.SingleNestedAttribute{
+		Description: "Storm Control settings for the port profile. Computed from the controller when not set; disable a class with `enabled = false` rather than by removing the block.",
+		Optional:    true,
+		Computed:    true,
+		PlanModifiers: []planmodifier.Object{
+			objectplanmodifier.UseStateForUnknown(),
+		},
+		Attributes: map[string]schema.Attribute{
+			"type": schema.StringAttribute{
+				Description: "The type of Storm Control to use for the port profile. Can be `level` or `rate`.",
+				Optional:    true,
+				Computed:    true,
+				Validators: []validator.String{
+					stringvalidator.OneOf("level", "rate"),
+				},
+			},
+			"bcast": class("broadcast"),
+			"mcast": class("multicast"),
+			"ucast": class("unknown unicast"),
+		},
+	}
 }
 
 func (r *portProfileResource) Metadata(
@@ -84,12 +235,43 @@ func (r *portProfileResource) Metadata(
 	resp.TypeName = req.ProviderTypeName + "_port_profile"
 }
 
+// IdentitySchema implements [resource.ResourceWithIdentity].
+func (r *portProfileResource) IdentitySchema(
+	_ context.Context,
+	_ resource.IdentitySchemaRequest,
+	resp *resource.IdentitySchemaResponse,
+) {
+	resp.IdentitySchema = identityschema.Schema{
+		Version: 2,
+		Attributes: map[string]identityschema.Attribute{
+			"id": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+			"site": identityschema.StringAttribute{
+				OptionalForImport: true,
+			},
+		},
+	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity]. See
+// siteIdentityUpgraders.
+func (r *portProfileResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return siteIdentityUpgraders(func() *Client { return r.client })
+}
+
 func (r *portProfileResource) Schema(
 	ctx context.Context,
 	req resource.SchemaRequest,
 	resp *resource.SchemaResponse,
 ) {
 	resp.Schema = schema.Schema{
+		// v1: dot1x_idle_timeout changed from Int64 (seconds) to a GoDuration string.
+		// v2: prefixed attributes bundled into nested objects (dot1x,
+		//     egress_rate_limit, lldpmed, port_security, stormctrl). See UpgradeState.
+		Version:     2,
 		Description: "`unifi_port_profile` manages a port profile for use on network switches.",
 
 		Attributes: map[string]schema.Attribute{
@@ -110,82 +292,141 @@ func (r *portProfileResource) Schema(
 				},
 			},
 			"autoneg": schema.BoolAttribute{
-				Description: "Enable link auto negotiation for the port profile. When set to `true` this overrides `speed`.",
-				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(true),
-			},
-			"dot1x_ctrl": schema.StringAttribute{
-				Description: "The type of 802.1X control to use. Can be `auto`, `force_authorized`, `force_unauthorized`, `mac_based` or `multi_host`.",
-				Optional:    true,
-				Computed:    true,
-				Default:     stringdefault.StaticString("force_authorized"),
-				Validators: []validator.String{
-					stringvalidator.OneOf(
-						"auto",
-						"force_authorized",
-						"force_unauthorized",
-						"mac_based",
-						"multi_host",
-					),
+				Description: "Enable link auto negotiation for the port profile. When set to `true` this overrides `speed`. " +
+					"Defaults to `true` for a newly created profile; an existing profile keeps the controller's value.",
+				Optional: true,
+				Computed: true,
+				// Always on the wire (go-unifi sends false for an unset bool), so a
+				// new profile still needs the old `true` (#544).
+				PlanModifiers: []planmodifier.Bool{
+					planmodifiers.BoolDefaultOnCreateKeepNull(true),
 				},
 			},
-			"dot1x_idle_timeout": schema.Int64Attribute{
-				Description: "The timeout, in seconds, to use when using the MAC Based 802.1X control. Can be between 0 and 65535",
+			"dot1x": schema.SingleNestedAttribute{
+				Description: "802.1X port authentication settings for the port profile. Taken from the controller when not set.",
 				Optional:    true,
 				Computed:    true,
-				Default:     int64default.StaticInt64(300),
-				Validators: []validator.Int64{
-					int64validator.Between(0, 65535),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"ctrl": schema.StringAttribute{
+						Description: "The type of 802.1X control to use. Can be `auto`, `force_authorized`, `force_unauthorized`, `mac_based` or `multi_host`. " +
+							"Defaults to `force_authorized` for a newly created profile; an existing profile keeps the controller's value.",
+						Optional: true,
+						Computed: true,
+						PlanModifiers: []planmodifier.String{
+							planmodifiers.StringDefaultOnCreate("force_authorized"),
+						},
+						Validators: []validator.String{
+							stringvalidator.OneOf(
+								"auto",
+								"force_authorized",
+								"force_unauthorized",
+								"mac_based",
+								"multi_host",
+							),
+						},
+					},
+					"idle_timeout": schema.StringAttribute{
+						Description: "The idle timeout to use when using MAC Based 802.1X control, as a " +
+							"Go duration string (e.g. `5m`, `300s`). Defaults to `5m0s` for a newly " +
+							"created profile; an existing profile keeps the controller's value, which " +
+							"may be none.",
+						CustomType: timetypes.GoDurationType{},
+						Optional:   true,
+						Computed:   true,
+						PlanModifiers: []planmodifier.String{
+							planmodifiers.StringDefaultOnCreateKeepNull("5m0s"),
+						},
+						Validators: []validator.String{
+							validators.GoDurationBetween(0, 65535*time.Second),
+							validators.GoDurationMultipleOf(time.Second),
+						},
+					},
 				},
 			},
-			"egress_rate_limit_kbps": schema.Int64Attribute{
-				Description: "The egress rate limit, in kpbs, for the port profile. Can be between `64` and `9999999`.",
-				Optional:    true,
-				Validators: []validator.Int64{
-					int64validator.Between(64, 9999999),
-				},
-			},
-			"egress_rate_limit_kbps_enabled": schema.BoolAttribute{
-				Description: "Enable egress rate limiting for the port profile.",
+			"egress_rate_limit": schema.SingleNestedAttribute{
+				Description: "Egress rate limiting for the port profile. Computed from the controller when not set; disable with `enabled = false` rather than by removing the block.",
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(false),
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						Description: "Enable egress rate limiting for the port profile. Computed from the controller when not set.",
+						Optional:    true,
+						Computed:    true,
+					},
+					"kbps": schema.Int64Attribute{
+						Description: "The egress rate limit, in kbps, for the port profile. Can be between `64` and `9999999`.",
+						Optional:    true,
+						Computed:    true,
+						Validators: []validator.Int64{
+							int64validator.Between(64, 9999999),
+						},
+					},
+				},
 			},
 			"forward": schema.StringAttribute{
-				Description: "The type forwarding to use for the port profile. Can be `all`, `native`, `customize` or `disabled`.",
-				Optional:    true,
-				Computed:    true,
-				Default:     stringdefault.StaticString("all"),
+				Description: "The type forwarding to use for the port profile. Can be " +
+					"`all`, `native`, `customize` or `disabled`. When unset it follows " +
+					"`tagged_vlan_mgmt`, which is what the controller stores for that mode: " +
+					"`all` for `auto`, `native` for `block_all`, `customize` for `custom`. " +
+					"`customize` requires a native network that carries a VLAN id, unless " +
+					"`tagged_vlan_mgmt` is `custom`: otherwise the controller silently stores " +
+					"`all` for a profile whose native network is untagged, which the provider " +
+					"rejects at plan time rather than letting the apply leave the resource tainted.",
+				Optional: true,
+				Computed: true,
 				Validators: []validator.String{
 					stringvalidator.OneOf("all", "native", "customize", "disabled"),
 				},
 			},
 			"full_duplex": schema.BoolAttribute{
-				Description: "Enable full duplex for the port profile.",
+				Description: "Enable full duplex for the port profile. Taken from the controller when not set.",
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(false),
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"isolation": schema.BoolAttribute{
-				Description: "Enable port isolation for the port profile.",
+				Description: "Enable port isolation for the port profile. Taken from the controller when not set.",
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(false),
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
-			"lldpmed_enabled": schema.BoolAttribute{
-				Description: "Enable LLDP-MED for the port profile.",
+			"lldpmed": schema.SingleNestedAttribute{
+				Description: "LLDP-MED settings for the port profile. Taken from the controller when not set.",
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(true),
-			},
-			"lldpmed_notify_enabled": schema.BoolAttribute{
-				Description: "Enable LLDP-MED topology change notifications for the port profile.",
-				Optional:    true,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						Description: "Enable LLDP-MED for the port profile. Defaults to `true` for a newly " +
+							"created profile; an existing profile keeps the controller's value.",
+						Optional: true,
+						Computed: true,
+					},
+					"notify_enabled": schema.BoolAttribute{
+						Description: "Enable LLDP-MED topology change notifications for the port profile.",
+						Optional:    true,
+					},
+				},
 			},
 			"native_networkconf_id": schema.StringAttribute{
-				Description: "The ID of network to use as the main network on the port profile.",
+				Description: "The ID of network to use as the main (native/untagged) network on the port profile. Assigned by the controller if not set.",
 				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"name": schema.StringAttribute{
 				Description: "The name of the port profile.",
@@ -195,7 +436,10 @@ func (r *portProfileResource) Schema(
 				Description: "The operation mode for the port profile. Can only be `switch`",
 				Optional:    true,
 				Computed:    true,
-				Default:     stringdefault.StaticString("switch"),
+				// Kept (#544): `switch` is the only value a port profile takes
+				// (Read maps an absent op_mode to it), so the Default cannot
+				// overwrite a different controller value.
+				Default: stringdefault.StaticString("switch"),
 				Validators: []validator.String{
 					stringvalidator.OneOf("switch"),
 				},
@@ -207,16 +451,26 @@ func (r *portProfileResource) Schema(
 					stringvalidator.OneOf("auto", "passv24", "passthrough", "off"),
 				},
 			},
-			"port_security_enabled": schema.BoolAttribute{
-				Description: "Enable port security for the port profile.",
+			"port_security": schema.SingleNestedAttribute{
+				Description: "Port security (MAC allow-list) settings for the port profile. Computed from the controller when not set; disable with `enabled = false` rather than by removing the block.",
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-			},
-			"port_security_mac_address": schema.SetAttribute{
-				Description: "The MAC addresses associated with the port security for the port profile.",
-				Optional:    true,
-				ElementType: types.StringType,
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						Description: "Enable port security for the port profile. Computed from the controller when not set.",
+						Optional:    true,
+						Computed:    true,
+					},
+					"mac_address": schema.SetAttribute{
+						Description: "The MAC addresses associated with the port security for the port profile.",
+						Optional:    true,
+						Computed:    true,
+						ElementType: types.StringType,
+					},
+				},
 			},
 			"priority_queue1_level": schema.Int64Attribute{
 				Description: "The priority queue 1 level for the port profile. Can be between 0 and 100.",
@@ -265,82 +519,14 @@ func (r *portProfileResource) Schema(
 					),
 				},
 			},
-			"stormctrl_bcast_enabled": schema.BoolAttribute{
-				Description: "Enable broadcast Storm Control for the port profile.",
-				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-			},
-			"stormctrl_bcast_level": schema.Int64Attribute{
-				Description: "The broadcast Storm Control level for the port profile. Can be between 0 and 100.",
-				Optional:    true,
-				Validators: []validator.Int64{
-					int64validator.Between(0, 100),
-					int64validator.ConflictsWith(path.MatchRoot("stormctrl_bcast_rate")),
-				},
-			},
-			"stormctrl_bcast_rate": schema.Int64Attribute{
-				Description: "The broadcast Storm Control rate for the port profile. Can be between 0 and 14880000.",
-				Optional:    true,
-				Validators: []validator.Int64{
-					int64validator.Between(0, 14880000),
-					int64validator.ConflictsWith(path.MatchRoot("stormctrl_bcast_level")),
-				},
-			},
-			"stormctrl_mcast_enabled": schema.BoolAttribute{
-				Description: "Enable multicast Storm Control for the port profile.",
-				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-			},
-			"stormctrl_mcast_level": schema.Int64Attribute{
-				Description: "The multicast Storm Control level for the port profile. Can be between 0 and 100.",
-				Optional:    true,
-				Validators: []validator.Int64{
-					int64validator.Between(0, 100),
-					int64validator.ConflictsWith(path.MatchRoot("stormctrl_mcast_rate")),
-				},
-			},
-			"stormctrl_mcast_rate": schema.Int64Attribute{
-				Description: "The multicast Storm Control rate for the port profile. Can be between 0 and 14880000.",
-				Optional:    true,
-				Validators: []validator.Int64{
-					int64validator.Between(0, 14880000),
-					int64validator.ConflictsWith(path.MatchRoot("stormctrl_mcast_level")),
-				},
-			},
-			"stormctrl_type": schema.StringAttribute{
-				Description: "The type of Storm Control to use for the port profile. Can be `level` or `rate`.",
-				Optional:    true,
-				Validators: []validator.String{
-					stringvalidator.OneOf("level", "rate"),
-				},
-			},
-			"stormctrl_ucast_enabled": schema.BoolAttribute{
-				Description: "Enable unknown unicast Storm Control for the port profile.",
-				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-			},
-			"stormctrl_ucast_level": schema.Int64Attribute{
-				Description: "The unknown unicast Storm Control level for the port profile. Can be between 0 and 100.",
-				Optional:    true,
-				Validators: []validator.Int64{
-					int64validator.Between(0, 100),
-					int64validator.ConflictsWith(path.MatchRoot("stormctrl_ucast_rate")),
-				},
-			},
-			"stormctrl_ucast_rate": schema.Int64Attribute{
-				Description: "The unknown unicast Storm Control rate for the port profile. Can be between 0 and 14880000.",
-				Optional:    true,
-				Validators: []validator.Int64{
-					int64validator.Between(0, 14880000),
-					int64validator.ConflictsWith(path.MatchRoot("stormctrl_ucast_level")),
-				},
-			},
+			"stormctrl": portProfileStormctrlSchema(),
 			"stp_port_mode": schema.BoolAttribute{
-				Description: "Enable Spanning Tree Protocol (STP) for the port profile.",
+				Description: "Enable Spanning Tree Protocol (STP) for the port profile. Computed from the controller when not set.",
 				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"tagged_networkconf_ids": schema.SetAttribute{
 				Description: "The IDs of networks to tag traffic with for the port profile.",
@@ -351,7 +537,105 @@ func (r *portProfileResource) Schema(
 				Description: "The ID of network to use for voice traffic for the port profile.",
 				Optional:    true,
 			},
+			"excluded_networkconf_ids": schema.SetAttribute{
+				Description: "The IDs of networks excluded from the port profile (used when `tagged_vlan_mgmt` is `custom`). Computed from the controller when not set.",
+				Optional:    true,
+				Computed:    true,
+				ElementType: types.StringType,
+				PlanModifiers: []planmodifier.Set{
+					setplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"multicast_router_networkconf_ids": schema.SetAttribute{
+				Description: "The IDs of networks designated as multicast routers for the port profile.",
+				Optional:    true,
+				ElementType: types.StringType,
+			},
+			"tagged_vlan_mgmt": schema.StringAttribute{
+				Description: "How tagged VLANs are managed on the port. Can be `auto`, `block_all`, or `custom`.",
+				Optional:    true,
+				Computed:    true,
+				Validators: []validator.String{
+					stringvalidator.OneOf("auto", "block_all", "custom"),
+				},
+			},
+			"fec_mode": schema.StringAttribute{
+				Description: "Forward Error Correction mode. Can be `rs-fec`, `fc-fec`, `default`, or `disabled`.",
+				Optional:    true,
+				Validators: []validator.String{
+					stringvalidator.OneOf("rs-fec", "fc-fec", "default", "disabled"),
+				},
+			},
+			"setting_preference": schema.StringAttribute{
+				Description: "Whether the port profile settings are managed automatically or manually. Can be `auto` or `manual`.",
+				Optional:    true,
+				Computed:    true,
+				Validators: []validator.String{
+					stringvalidator.OneOf("auto", "manual"),
+				},
+			},
+			"port_keepalive_enabled": schema.BoolAttribute{
+				Description: "Enable port keepalive for the port profile. Taken from the controller when not set.",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"timeouts": timeouts.Attributes(
+				ctx,
+				timeouts.Opts{Create: true, Read: true, Update: true, Delete: true},
+			),
 		},
+	}
+}
+
+// UpgradeState migrates prior port profile state to the current schema version.
+//
+//	v0 -> current: dot1x_idle_timeout changed from integer seconds to a
+//	    GoDuration string.
+//	v1 -> current: the flat dot1x_*, egress_rate_limit_*, lldpmed_*,
+//	    port_security_* and stormctrl_* attributes moved into nested objects
+//	    (see nestPortGroupState, shared with unifi_device.port_override).
+func (r *portProfileResource) UpgradeState(
+	ctx context.Context,
+) map[int64]resource.StateUpgrader {
+	var schemaResp resource.SchemaResponse
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	upgrader := func(rewrite func(state map[string]any)) resource.StateUpgrader {
+		return resource.StateUpgrader{
+			StateUpgrader: func(
+				ctx context.Context,
+				req resource.UpgradeStateRequest,
+				resp *resource.UpgradeStateResponse,
+			) {
+				if req.RawState == nil {
+					return
+				}
+				dv, err := util.UpgradeRawState(
+					schemaType,
+					req.RawState.JSON,
+					func(state map[string]any) {
+						rewrite(state)
+						nestPortGroupState(state)
+					},
+				)
+				if err != nil {
+					resp.Diagnostics.AddError("Failed to upgrade port profile state", err.Error())
+					return
+				}
+				resp.DynamicValue = dv
+			},
+		}
+	}
+
+	return map[int64]resource.StateUpgrader{
+		0: upgrader(func(state map[string]any) {
+			util.SetDurationField(state, "dot1x_idle_timeout", time.Second)
+		}),
+		1: upgrader(func(map[string]any) {}),
 	}
 }
 
@@ -391,9 +675,36 @@ func (r *portProfileResource) Create(
 		return
 	}
 
+	createTimeout, timeoutDiags := plan.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
 	site := plan.Site.ValueString()
 	if site == "" {
 		site = r.client.Site
+	}
+
+	// #383 made go-unifi always serialize native_networkconf_id (no omitempty)
+	// so an explicit "" can clear the native network. On create with the
+	// attribute unset (unknown), that would send "" — which some controllers
+	// (e.g. Network 10.0 demo mode) store as-is and answer by flipping forward
+	// to "customize" instead of auto-assigning the default network. Resolve the
+	// site's default network up front so the create body carries the same
+	// concrete native ID the controller would have auto-assigned.
+	// Unknown covers both omitted and explicitly-null config (the attribute is
+	// Optional+Computed); the null check is defensive so an explicit null can
+	// never fall through and serialize as a clearing "".
+	if plan.NativeNetworkConfID.IsUnknown() || plan.NativeNetworkConfID.IsNull() {
+		defaultNetworkID, d := r.defaultNativeNetworkID(ctx, site)
+		resp.Diagnostics.Append(d...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		plan.NativeNetworkConfID = types.StringValue(defaultNetworkID)
 	}
 
 	// Convert model to API request
@@ -415,8 +726,12 @@ func (r *portProfileResource) Create(
 	// Set state
 	plan.ID = types.StringValue(apiPortProfile.ID)
 	plan.Site = types.StringValue(site)
-	r.setResourceData(ctx, apiPortProfile, &plan, site)
+	resp.Diagnostics.Append(r.portProfileToModel(ctx, apiPortProfile, &plan, site)...)
 
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, portProfileIdentityModel{
+		ID:   plan.ID,
+		Site: plan.Site,
+	})...)
 	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
 }
@@ -433,6 +748,31 @@ func (r *portProfileResource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := state.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Fall back to the resource identity when the state carries no ID (e.g.
+	// old states, or a state written by an identity-based import).
+	if state.ID.IsNull() || state.ID.IsUnknown() {
+		if req.Identity != nil && !req.Identity.Raw.IsFullyNull() {
+			var identity portProfileIdentityModel
+			resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			state.ID = identity.ID
+			if (state.Site.IsNull() || state.Site.IsUnknown()) &&
+				identity.Site.ValueString() != "" {
+				state.Site = identity.Site
+			}
+		}
+	}
+
 	id := state.ID.ValueString()
 	site := state.Site.ValueString()
 	if site == "" {
@@ -442,7 +782,11 @@ func (r *portProfileResource) Read(
 	portProfile, err := r.client.GetPortProfile(ctx, site, id)
 	if err != nil {
 		if _, ok := err.(*unifi.NotFoundError); ok {
-			resp.State.RemoveResource(ctx)
+			removeResourceOnRead(
+				ctx,
+				resp,
+				portProfileIdentityModel{ID: state.ID, Site: state.Site},
+			)
 			return
 		}
 		resp.Diagnostics.AddError(
@@ -453,8 +797,17 @@ func (r *portProfileResource) Read(
 	}
 
 	// Update state from API response
-	r.setResourceData(ctx, portProfile, &state, site)
+	resp.Diagnostics.Append(r.portProfileToModel(ctx, portProfile, &state, site)...)
 
+	// A stored identity must be passed through unchanged: Terraform treats
+	// any modification of a non-null identity (including filling a null
+	// attribute) as an error. Only derive identity from state when none exists.
+	if req.Identity == nil || req.Identity.Raw.IsFullyNull() {
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, portProfileIdentityModel{
+			ID:   state.ID,
+			Site: state.Site,
+		})...)
+	}
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
 }
@@ -477,6 +830,14 @@ func (r *portProfileResource) Update(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	updateTimeout, timeoutDiags := plan.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
 
 	site := plan.Site.ValueString()
 	if site == "" {
@@ -521,8 +882,19 @@ func (r *portProfileResource) Update(
 	}
 
 	// Update state from API response
-	r.setResourceData(ctx, apiPortProfile, &state, site)
+	resp.Diagnostics.Append(r.portProfileToModel(ctx, apiPortProfile, &state, site)...)
 
+	state.Timeouts = plan.Timeouts
+
+	// A stored identity must be passed through unchanged: Terraform treats
+	// any modification of a non-null identity (including filling a null
+	// attribute) as an error. Only derive identity from state when none exists.
+	if req.Identity == nil || req.Identity.Raw.IsFullyNull() {
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, portProfileIdentityModel{
+			ID:   state.ID,
+			Site: state.Site,
+		})...)
+	}
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
 }
@@ -538,6 +910,14 @@ func (r *portProfileResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := state.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	id := state.ID.ValueString()
 	site := state.Site.ValueString()
@@ -563,6 +943,23 @@ func (r *portProfileResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
+	// Import by resource identity (import block with identity, Terraform 1.12+).
+	if req.ID == "" {
+		var identity portProfileIdentityModel
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+		if identity.Site.ValueString() != "" {
+			resp.Diagnostics.Append(
+				resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+		}
+		return
+	}
+
+	// Import by ID string: "id" or "site:id".
 	idParts, diags := util.ParseImportID(req.ID, 1, 2)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -571,14 +968,197 @@ func (r *portProfileResource) ImportState(
 
 	if site := idParts["site"]; site != "" {
 		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), site)...)
+		resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("site"), site)...)
 	}
 
 	if id := idParts["id"]; id != "" {
 		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), id)...)
+		resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), id)...)
 	}
 }
 
 // Helper methods
+
+// defaultNativeNetworkID returns the network the controller would auto-assign
+// as a port profile's native network: the site's default (undeletable)
+// corporate network, falling back to the first corporate network.
+// ModifyPlan rejects forward = "customize" on a profile whose native network
+// has no VLAN id. The controller accepts such a write and then stores
+// forward = "all" instead, so the post-apply read disagrees with the plan:
+// Create fails with "Provider produced inconsistent result after apply", leaves
+// the resource tainted, and every later apply destroys, recreates and fails
+// identically - the configuration can never converge (#496).
+//
+// Failing at plan time with the reason is the only outcome that lets the
+// operator act. Adopting the controller's value instead would hide a silent
+// divergence between configuration and state, and retrying cannot help: the
+// controller is not going to change its mind.
+func (r *portProfileResource) ModifyPlan(
+	ctx context.Context,
+	req resource.ModifyPlanRequest,
+	resp *resource.ModifyPlanResponse,
+) {
+	if req.Plan.Raw.IsNull() {
+		return // resource is being destroyed
+	}
+
+	// Create-only defaults (#544): these were schema Defaults, which replaced
+	// the controller's value on every adopted profile. lldpmed.enabled is
+	// always on the wire (go-unifi sends false for an unset bool), so a new
+	// profile still needs the old `true` - otherwise it would be created with
+	// LLDP-MED off. It is planned here rather than by an attribute modifier
+	// because the lldpmed object itself only gets its create-time shape here
+	// (autoneg is planmodifiers.BoolDefaultOnCreateKeepNull on the attribute).
+	hasPrior := !req.State.Raw.IsNull()
+	planObjectOnCreate(ctx, req, resp, path.Root("dot1x"), portProfileDot1xDefault())
+	planObjectOnCreate(ctx, req, resp, path.Root("lldpmed"), portProfileLldpmedDefault())
+	planDefaultOnCreate(ctx, req, resp, path.Root("lldpmed").AtName("enabled"),
+		types.BoolValue(true), hasPrior)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if r.client == nil {
+		return // not configured yet (e.g. during validation)
+	}
+
+	var forward, nativeID, site, taggedMgmt, configTaggedMgmt, priorTaggedMgmt types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("forward"), &forward)...)
+	resp.Diagnostics.Append(
+		req.Plan.GetAttribute(ctx, path.Root("tagged_vlan_mgmt"), &taggedMgmt)...)
+	resp.Diagnostics.Append(
+		req.Config.GetAttribute(ctx, path.Root("tagged_vlan_mgmt"), &configTaggedMgmt)...)
+	if !req.State.Raw.IsNull() {
+		resp.Diagnostics.Append(
+			req.State.GetAttribute(ctx, path.Root("tagged_vlan_mgmt"), &priorTaggedMgmt)...)
+	}
+	resp.Diagnostics.Append(
+		req.Plan.GetAttribute(ctx, path.Root("native_networkconf_id"), &nativeID)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("site"), &site)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if forward.IsNull() || forward.IsUnknown() || forward.ValueString() != "customize" {
+		return
+	}
+	// An unknown native network is resolved at apply time to the site default,
+	// which is a corporate network and may well be untagged - but the plan
+	// cannot know which, so leave it to the apply rather than guess.
+	if nativeID.IsNull() || nativeID.IsUnknown() || nativeID.ValueString() == "" {
+		return
+	}
+	mode, known := customizeTaggedVLANMgmt(taggedMgmt, configTaggedMgmt, priorTaggedMgmt)
+	if !known {
+		return
+	}
+
+	siteName := site.ValueString()
+	if siteName == "" {
+		siteName = r.client.Site
+	}
+
+	network, err := r.client.GetNetwork(ctx, siteName, nativeID.ValueString())
+	if err != nil {
+		// Do not fail the plan on a lookup problem: the apply will surface a
+		// real error, and a transient read must not block an unrelated change.
+		return
+	}
+	if !customizeIsRewritten(mode, network.VLAN) {
+		return
+	}
+
+	resp.Diagnostics.AddAttributeError(
+		path.Root("forward"),
+		"forward = \"customize\" requires a native network with a VLAN id",
+		fmt.Sprintf(
+			"The native network %q has no VLAN id, and the controller silently stores "+
+				"forward = \"all\" for such a profile instead of \"customize\". The "+
+				"post-apply read would then disagree with the plan, failing with "+
+				"\"Provider produced inconsistent result after apply\" and leaving the "+
+				"resource tainted.\n\n"+
+				"Either set forward = \"all\" for this profile, set "+
+				"tagged_vlan_mgmt = \"custom\" (the controller keeps customize "+
+				"for it), or point native_networkconf_id at a network that carries "+
+				"a VLAN id.",
+			networkName(network),
+		),
+	)
+}
+
+// customizeIsRewritten reports whether the controller stores forward = "all"
+// for a customize profile: custom keeps customize whatever the native network,
+// the other modes keep it only on a native network with a VLAN id.
+func customizeIsRewritten(taggedVLANMgmt string, nativeVLAN *int64) bool {
+	if taggedVLANMgmt == "custom" {
+		return false
+	}
+	return nativeVLAN == nil || *nativeVLAN == 0
+}
+
+// customizeTaggedVLANMgmt resolves the tagged_vlan_mgmt that the customize
+// check judges. The attribute is Optional+Computed, so when configuration
+// leaves it out it plans unknown on any update; the controller keeps the
+// stored mode, which prior state holds. On create there is no prior mode and
+// the controller assigns its default, so the empty mode keeps the refusal. A
+// value set by an expression that is unknown until apply cannot be judged,
+// so the second return is false and the check is skipped.
+func customizeTaggedVLANMgmt(planned, configured, prior types.String) (string, bool) {
+	if !planned.IsUnknown() {
+		return planned.ValueString(), true
+	}
+	if configured.IsUnknown() {
+		return "", false
+	}
+	if prior.IsNull() || prior.IsUnknown() {
+		return "", true
+	}
+	return prior.ValueString(), true
+}
+
+// networkName returns a network's name for diagnostics, falling back to its ID.
+func networkName(n *unifi.Network) string {
+	if n.Name != nil && *n.Name != "" {
+		return *n.Name
+	}
+	return n.ID
+}
+
+func (r *portProfileResource) defaultNativeNetworkID(
+	ctx context.Context,
+	site string,
+) (string, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	networks, err := r.client.ListNetwork(ctx, site)
+	if err != nil {
+		diags.AddError(
+			"Error Listing Networks",
+			fmt.Sprintf("Could not resolve the default native network: %s", err),
+		)
+		return "", diags
+	}
+
+	fallback := ""
+	for _, network := range networks {
+		if network.Purpose != "corporate" {
+			continue
+		}
+		if network.NoDelete {
+			return network.ID, diags
+		}
+		if fallback == "" {
+			fallback = network.ID
+		}
+	}
+	if fallback == "" {
+		diags.AddError(
+			"No Native Network Found",
+			"Could not find a corporate network to use as the port profile's native network; set native_networkconf_id explicitly.",
+		)
+	}
+	return fallback, diags
+}
 
 func (r *portProfileResource) modelToAPIPortProfile(
 	ctx context.Context,
@@ -603,22 +1183,30 @@ func (r *portProfileResource) modelToAPIPortProfile(
 		portProfile.Isolation = model.Isolation.ValueBool()
 	}
 
-	if !model.Dot1XCtrl.IsNull() && !model.Dot1XCtrl.IsUnknown() {
-		portProfile.Dot1XCtrl = model.Dot1XCtrl.ValueString()
+	// Nested feature groups. A null/unknown group contributes nothing, exactly
+	// as its flat attributes did when unset.
+	if dot1x, ok, d := util.ObjectAs[portDot1xModel](ctx, model.Dot1X); ok {
+		if !dot1x.Ctrl.IsNull() && !dot1x.Ctrl.IsUnknown() {
+			portProfile.Dot1XCtrl = dot1x.Ctrl.ValueString()
+		}
+		portProfile.Dot1XIDleTimeout = util.DurationUnitsPtr(dot1x.IdleTimeout, time.Second)
+	} else {
+		diags.Append(d...)
 	}
-
-	portProfile.Dot1XIDleTimeout = model.Dot1XIdleTimeout.ValueInt64Pointer()
 
 	if !model.Forward.IsNull() && !model.Forward.IsUnknown() {
 		portProfile.Forward = model.Forward.ValueString()
 	}
 
-	if !model.LLDPMedEnabled.IsNull() && !model.LLDPMedEnabled.IsUnknown() {
-		portProfile.LldpmedEnabled = model.LLDPMedEnabled.ValueBool()
-	}
-
-	if !model.LLDPMedNotifyEnabled.IsNull() && !model.LLDPMedNotifyEnabled.IsUnknown() {
-		portProfile.LldpmedNotifyEnabled = model.LLDPMedNotifyEnabled.ValueBool()
+	if lldp, ok, d := util.ObjectAs[portLldpmedModel](ctx, model.Lldpmed); ok {
+		if !lldp.Enabled.IsNull() && !lldp.Enabled.IsUnknown() {
+			portProfile.LldpmedEnabled = lldp.Enabled.ValueBool()
+		}
+		if !lldp.NotifyEnabled.IsNull() && !lldp.NotifyEnabled.IsUnknown() {
+			portProfile.LldpmedNotifyEnabled = lldp.NotifyEnabled.ValueBool()
+		}
+	} else {
+		diags.Append(d...)
 	}
 
 	// Skip native network config for now as field name is unclear
@@ -627,24 +1215,90 @@ func (r *portProfileResource) modelToAPIPortProfile(
 		portProfile.PoeMode = model.PoeMode.ValueString()
 	}
 
-	if !model.PortSecurityEnabled.IsNull() && !model.PortSecurityEnabled.IsUnknown() {
-		portProfile.PortSecurityEnabled = model.PortSecurityEnabled.ValueBool()
+	if ps, ok, d := util.ObjectAs[portProfilePortSecurityModel](ctx, model.PortSecurity); ok {
+		if !ps.Enabled.IsNull() && !ps.Enabled.IsUnknown() {
+			portProfile.PortSecurityEnabled = ps.Enabled.ValueBool()
+		}
+		if !ps.MACAddress.IsNull() && !ps.MACAddress.IsUnknown() {
+			var macAddresses []string
+			diags.Append(ps.MACAddress.ElementsAs(ctx, &macAddresses, false)...)
+			if !diags.HasError() {
+				portProfile.PortSecurityMACAddress = macAddresses
+			}
+		}
+	} else {
+		diags.Append(d...)
 	}
 
-	// Convert port security MAC addresses
-	if !model.PortSecurityMacAddress.IsNull() && !model.PortSecurityMacAddress.IsUnknown() {
-		var macAddresses []string
-		diags.Append(model.PortSecurityMacAddress.ElementsAs(ctx, &macAddresses, false)...)
-		if !diags.HasError() {
-			portProfile.PortSecurityMACAddress = macAddresses
+	if erl, ok, d := util.ObjectAs[portEgressRateLimitModel](ctx, model.EgressRateLimit); ok {
+		if !erl.Enabled.IsNull() && !erl.Enabled.IsUnknown() {
+			portProfile.EgressRateLimitKbpsEnabled = erl.Enabled.ValueBool()
 		}
+		if !erl.Kbps.IsNull() && !erl.Kbps.IsUnknown() {
+			portProfile.EgressRateLimitKbps = erl.Kbps.ValueInt64Pointer()
+		}
+	} else {
+		diags.Append(d...)
 	}
+
+	sc, d := portStormctrlFromObject(ctx, model.Stormctrl)
+	diags.Append(d...)
+	portProfile.StormctrlType = sc.Type
+	portProfile.StormctrlBroadcastastEnabled = sc.BcastEnabled != nil && *sc.BcastEnabled
+	portProfile.StormctrlBroadcastastLevel = sc.BcastLevel
+	portProfile.StormctrlBroadcastastRate = sc.BcastRate
+	portProfile.StormctrlMcastEnabled = sc.McastEnabled != nil && *sc.McastEnabled
+	portProfile.StormctrlMcastLevel = sc.McastLevel
+	portProfile.StormctrlMcastRate = sc.McastRate
+	portProfile.StormctrlUcastEnabled = sc.UcastEnabled != nil && *sc.UcastEnabled
+	portProfile.StormctrlUcastLevel = sc.UcastLevel
+	portProfile.StormctrlUcastRate = sc.UcastRate
+
+	portProfile.PriorityQueue1Level = util.ConvertInt64ToAPIValue(model.PriorityQueue1Level)
+	portProfile.PriorityQueue2Level = util.ConvertInt64ToAPIValue(model.PriorityQueue2Level)
+	portProfile.PriorityQueue3Level = util.ConvertInt64ToAPIValue(model.PriorityQueue3Level)
+	portProfile.PriorityQueue4Level = util.ConvertInt64ToAPIValue(model.PriorityQueue4Level)
 
 	portProfile.Speed = model.Speed.ValueInt64Pointer()
 
-	// Convert tagged network IDs - skip for now as field name is unclear
+	if !model.NativeNetworkConfID.IsNull() {
+		portProfile.NATiveNetworkID = model.NativeNetworkConfID.ValueString()
+	}
+	if !model.VoiceNetworkConfID.IsNull() {
+		portProfile.VoiceNetworkID = model.VoiceNetworkConfID.ValueString()
+	}
+	if !model.TaggedVLANMgmt.IsNull() && !model.TaggedVLANMgmt.IsUnknown() {
+		portProfile.TaggedVLANMgmt = model.TaggedVLANMgmt.ValueString()
+	}
 
-	// Handle storm control and other complex fields as needed...
+	// The controller stores forward in step with tagged_vlan_mgmt, so an unset
+	// forward is derived from it rather than defaulted.
+	if model.Forward.IsNull() || model.Forward.IsUnknown() {
+		portProfile.Forward = forwardForTaggedVLANMgmt(portProfile.TaggedVLANMgmt)
+	}
+	if !model.FecMode.IsNull() {
+		portProfile.FecMode = model.FecMode.ValueString()
+	}
+	if !model.SettingPreference.IsNull() && !model.SettingPreference.IsUnknown() {
+		portProfile.SettingPreference = model.SettingPreference.ValueString()
+	}
+	portProfile.PortKeepaliveEnabled = model.PortKeepaliveEnabled.ValueBool()
+	portProfile.StpPortMode = model.STPPortMode.ValueBool()
+
+	if !model.ExcludedNetworkConfIDs.IsNull() && !model.ExcludedNetworkConfIDs.IsUnknown() {
+		var ids []string
+		diags.Append(model.ExcludedNetworkConfIDs.ElementsAs(ctx, &ids, false)...)
+		if !diags.HasError() {
+			portProfile.ExcludedNetworkIDs = ids
+		}
+	}
+	if !model.MulticastRouterNetworkIDs.IsNull() && !model.MulticastRouterNetworkIDs.IsUnknown() {
+		var ids []string
+		diags.Append(model.MulticastRouterNetworkIDs.ElementsAs(ctx, &ids, false)...)
+		if !diags.HasError() {
+			portProfile.MulticastRouterNetworkIDs = ids
+		}
+	}
 
 	return portProfile, diags
 }
@@ -655,6 +1309,27 @@ func (r *portProfileResource) setResourceData(
 	model *portProfileResourceModel,
 	site string,
 ) {
+	r.portProfileToModel(ctx, portProfile, model, site)
+}
+
+// portProfileToModel populates the resource model from the API struct, setting
+// every schema field. It is the reusable API->model converter shared by Read
+// and List. It only performs API->model field population; plan/state
+// reconciliation (applyPlanToState) is intentionally left to the callers.
+func (r *portProfileResource) portProfileToModel(
+	ctx context.Context,
+	api *unifi.PortProfile,
+	model *portProfileResourceModel,
+	site string,
+) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	portProfile := api
+
+	if portProfile.ID != "" {
+		model.ID = types.StringValue(portProfile.ID)
+	}
+
 	model.Site = types.StringValue(site)
 
 	if portProfile.Name == "" {
@@ -665,13 +1340,13 @@ func (r *portProfileResource) setResourceData(
 
 	model.Autoneg = types.BoolValue(portProfile.Autoneg)
 
-	if portProfile.Dot1XCtrl == "" {
-		model.Dot1XCtrl = types.StringValue("force_authorized")
-	} else {
-		model.Dot1XCtrl = types.StringValue(portProfile.Dot1XCtrl)
+	dot1xCtrl := portProfile.Dot1XCtrl
+	if dot1xCtrl == "" {
+		dot1xCtrl = "force_authorized"
 	}
-
-	model.Dot1XIdleTimeout = types.Int64PointerValue(portProfile.Dot1XIDleTimeout)
+	dot1x, d := portDot1xObject(ctx, dot1xCtrl, portProfile.Dot1XIDleTimeout)
+	diags.Append(d...)
+	model.Dot1X = dot1x
 
 	if portProfile.Forward == "" {
 		model.Forward = types.StringValue("native")
@@ -683,16 +1358,29 @@ func (r *portProfileResource) setResourceData(
 
 	model.Isolation = types.BoolValue(portProfile.Isolation)
 
-	model.LLDPMedEnabled = types.BoolValue(portProfile.LldpmedEnabled)
-
-	// Only set lldpmed_notify_enabled if it was in the plan or if it's explicitly true
-	if !model.LLDPMedNotifyEnabled.IsNull() || portProfile.LldpmedNotifyEnabled {
-		model.LLDPMedNotifyEnabled = types.BoolValue(portProfile.LldpmedNotifyEnabled)
-	} else {
-		model.LLDPMedNotifyEnabled = types.BoolNull()
+	// Only set lldpmed.notify_enabled if it was in the plan or if it's explicitly true
+	notify := types.BoolNull()
+	priorNotifyNull := true
+	if prior, ok, _ := util.ObjectAs[portLldpmedModel](ctx, model.Lldpmed); ok {
+		priorNotifyNull = prior.NotifyEnabled.IsNull()
 	}
+	if !priorNotifyNull || portProfile.LldpmedNotifyEnabled {
+		notify = types.BoolValue(portProfile.LldpmedNotifyEnabled)
+	}
+	lldpmed, d := types.ObjectValueFrom(ctx, portLldpmedAttrTypes(), portLldpmedModel{
+		Enabled:       types.BoolValue(portProfile.LldpmedEnabled),
+		NotifyEnabled: notify,
+	})
+	diags.Append(d...)
+	model.Lldpmed = lldpmed
 
-	model.NativeNetworkConfID = types.StringNull() // Skip for now
+	// #383: the controller reports "" when the native network is explicitly set to
+	// None. Surface that as a known empty string (not null) so an explicit
+	// native_networkconf_id = "" round-trips and actually clears the native network,
+	// instead of triggering an inconsistent-result-after-apply. A profile that never
+	// set it gets the controller-assigned ID here (non-empty). Requires the go-unifi
+	// fix that stops dropping the empty value from the request body.
+	model.NativeNetworkConfID = types.StringValue(portProfile.NATiveNetworkID)
 
 	if portProfile.OpMode == "" {
 		model.OpMode = types.StringValue("switch")
@@ -706,50 +1394,123 @@ func (r *portProfileResource) setResourceData(
 		model.PoeMode = types.StringValue(portProfile.PoeMode)
 	}
 
-	model.PortSecurityEnabled = types.BoolValue(portProfile.PortSecurityEnabled)
-
-	// Convert port security MAC addresses
-	if len(portProfile.PortSecurityMACAddress) == 0 {
-		model.PortSecurityMacAddress = types.SetNull(types.StringType)
-	} else {
-		macAddressList := make([]types.String, len(portProfile.PortSecurityMACAddress))
-		for i, mac := range portProfile.PortSecurityMACAddress {
-			macAddressList[i] = types.StringValue(mac)
-		}
-		macAddressSet, _ := types.SetValueFrom(ctx, types.StringType, macAddressList)
-		model.PortSecurityMacAddress = macAddressSet
+	// Convert port security MAC addresses.
+	// An empty allowlist with port security on is how the controller stores a disabled port, so an
+	// explicitly empty set is meaningful and nulling it fails the apply as an inconsistent result.
+	macExplicitlyEmpty := false
+	if prior, ok, _ := util.ObjectAs[portProfilePortSecurityModel](ctx, model.PortSecurity); ok {
+		macExplicitlyEmpty = !prior.MACAddress.IsNull() &&
+			!prior.MACAddress.IsUnknown() &&
+			len(prior.MACAddress.Elements()) == 0
 	}
+
+	macAddressSet := types.SetNull(types.StringType)
+	if len(portProfile.PortSecurityMACAddress) > 0 {
+		set, d := types.SetValueFrom(ctx, types.StringType, portProfile.PortSecurityMACAddress)
+		diags.Append(d...)
+		macAddressSet = set
+	} else if macExplicitlyEmpty {
+		set, d := types.SetValueFrom(ctx, types.StringType, []string{})
+		diags.Append(d...)
+		macAddressSet = set
+	}
+	portSecurity, d := types.ObjectValueFrom(ctx, portProfilePortSecurityAttrTypes(),
+		portProfilePortSecurityModel{
+			Enabled:    types.BoolValue(portProfile.PortSecurityEnabled),
+			MACAddress: macAddressSet,
+		})
+	diags.Append(d...)
+	model.PortSecurity = portSecurity
 
 	// Only set speed if it was in the plan or if it's non-zero
 	model.Speed = types.Int64PointerValue(portProfile.Speed)
 
-	// Convert tagged network IDs - skip for now
+	// tagged_networkconf_ids has no corresponding go-unifi field; tagged VLANs are
+	// managed via tagged_vlan_mgmt + excluded_networkconf_ids instead.
 	model.TaggedNetworkConfIDs = types.SetNull(types.StringType)
 
-	model.VoiceNetworkConfID = types.StringNull() // Skip for now
+	if portProfile.VoiceNetworkID != "" {
+		model.VoiceNetworkConfID = types.StringValue(portProfile.VoiceNetworkID)
+	} else {
+		model.VoiceNetworkConfID = types.StringNull()
+	}
 
-	// Set remaining fields to defaults or null as appropriate
-	model.EgressRateLimitKbps = types.Int64Null()
-	model.EgressRateLimitKbpsEnabled = types.BoolValue(false)
-	model.PriorityQueue1Level = types.Int64Null()
-	model.PriorityQueue2Level = types.Int64Null()
-	model.PriorityQueue3Level = types.Int64Null()
-	model.PriorityQueue4Level = types.Int64Null()
-	model.StormctrlBcastEnabled = types.BoolValue(false)
-	model.StormctrlBcastLevel = types.Int64Null()
-	model.StormctrlBcastRate = types.Int64Null()
-	model.StormctrlMcastEnabled = types.BoolValue(false)
-	model.StormctrlMcastLevel = types.Int64Null()
-	model.StormctrlMcastRate = types.Int64Null()
-	model.StormctrlType = types.StringNull()
-	model.StormctrlUcastEnabled = types.BoolValue(false)
-	model.StormctrlUcastLevel = types.Int64Null()
-	model.StormctrlUcastRate = types.Int64Null()
-	model.STPPortMode = types.BoolNull()
+	if portProfile.TaggedVLANMgmt != "" {
+		model.TaggedVLANMgmt = types.StringValue(portProfile.TaggedVLANMgmt)
+	} else {
+		model.TaggedVLANMgmt = types.StringNull()
+	}
+
+	if portProfile.FecMode != "" {
+		model.FecMode = types.StringValue(portProfile.FecMode)
+	} else {
+		model.FecMode = types.StringNull()
+	}
+
+	if portProfile.SettingPreference != "" {
+		model.SettingPreference = types.StringValue(portProfile.SettingPreference)
+	} else {
+		model.SettingPreference = types.StringNull()
+	}
+
+	model.PortKeepaliveEnabled = types.BoolValue(portProfile.PortKeepaliveEnabled)
+
+	if len(portProfile.ExcludedNetworkIDs) > 0 {
+		s, d := types.SetValueFrom(ctx, types.StringType, portProfile.ExcludedNetworkIDs)
+		diags.Append(d...)
+		model.ExcludedNetworkConfIDs = s
+	} else {
+		model.ExcludedNetworkConfIDs = types.SetNull(types.StringType)
+	}
+
+	if len(portProfile.MulticastRouterNetworkIDs) > 0 {
+		s, d := types.SetValueFrom(ctx, types.StringType, portProfile.MulticastRouterNetworkIDs)
+		diags.Append(d...)
+		model.MulticastRouterNetworkIDs = s
+	} else {
+		model.MulticastRouterNetworkIDs = types.SetNull(types.StringType)
+	}
+
+	// Round-trip the rate-limit, priority-queue and storm-control fields from
+	// the controller. These used to be hardcoded to null/false regardless of
+	// what the controller held, so a configured value could not survive the
+	// post-apply read: Create reported "Provider produced inconsistent result
+	// after apply", left the resource tainted, and the next apply looped on the
+	// same error (#496). Every one of them exists on go-unifi's PortProfile.
+	egress, d := portEgressRateLimitObject(
+		ctx, &portProfile.EgressRateLimitKbpsEnabled, portProfile.EgressRateLimitKbps)
+	diags.Append(d...)
+	model.EgressRateLimit = egress
+
+	model.PriorityQueue1Level = types.Int64PointerValue(portProfile.PriorityQueue1Level)
+	model.PriorityQueue2Level = types.Int64PointerValue(portProfile.PriorityQueue2Level)
+	model.PriorityQueue3Level = types.Int64PointerValue(portProfile.PriorityQueue3Level)
+	model.PriorityQueue4Level = types.Int64PointerValue(portProfile.PriorityQueue4Level)
+
+	// go-unifi spells the broadcast fields StormctrlBroadcastast* (a codegen
+	// typo); they carry the stormctrl_bcast_* JSON keys.
+	stormctrl, d := portStormctrlObject(ctx, portStormctrlAPI{
+		Type:         portProfile.StormctrlType,
+		BcastEnabled: &portProfile.StormctrlBroadcastastEnabled,
+		BcastLevel:   portProfile.StormctrlBroadcastastLevel,
+		BcastRate:    portProfile.StormctrlBroadcastastRate,
+		McastEnabled: &portProfile.StormctrlMcastEnabled,
+		McastLevel:   portProfile.StormctrlMcastLevel,
+		McastRate:    portProfile.StormctrlMcastRate,
+		UcastEnabled: &portProfile.StormctrlUcastEnabled,
+		UcastLevel:   portProfile.StormctrlUcastLevel,
+		UcastRate:    portProfile.StormctrlUcastRate,
+	})
+	diags.Append(d...)
+	model.Stormctrl = stormctrl
+
+	model.STPPortMode = types.BoolValue(portProfile.StpPortMode)
+
+	return diags
 }
 
 func (r *portProfileResource) applyPlanToState(
-	_ context.Context,
+	ctx context.Context,
 	plan *portProfileResourceModel,
 	state *portProfileResourceModel,
 ) {
@@ -760,17 +1521,26 @@ func (r *portProfileResource) applyPlanToState(
 	if !plan.Autoneg.IsNull() && !plan.Autoneg.IsUnknown() {
 		state.Autoneg = plan.Autoneg
 	}
-	if !plan.Dot1XCtrl.IsNull() && !plan.Dot1XCtrl.IsUnknown() {
-		state.Dot1XCtrl = plan.Dot1XCtrl
-	}
-	if !plan.Dot1XIdleTimeout.IsNull() && !plan.Dot1XIdleTimeout.IsUnknown() {
-		state.Dot1XIdleTimeout = plan.Dot1XIdleTimeout
-	}
-	if !plan.EgressRateLimitKbps.IsNull() && !plan.EgressRateLimitKbps.IsUnknown() {
-		state.EgressRateLimitKbps = plan.EgressRateLimitKbps
-	}
-	if !plan.EgressRateLimitKbpsEnabled.IsNull() && !plan.EgressRateLimitKbpsEnabled.IsUnknown() {
-		state.EgressRateLimitKbpsEnabled = plan.EgressRateLimitKbpsEnabled
+	// Nested feature groups: re-assert every sub-attribute the plan knows,
+	// keeping the controller's value for the rest.
+	state.Dot1X = util.OverlayKnownObject(ctx, plan.Dot1X, state.Dot1X)
+	state.EgressRateLimit = util.OverlayKnownObject(
+		ctx,
+		plan.EgressRateLimit,
+		state.EgressRateLimit,
+	)
+	state.Lldpmed = util.OverlayKnownObject(ctx, plan.Lldpmed, state.Lldpmed)
+	state.PortSecurity = util.OverlayKnownObject(ctx, plan.PortSecurity, state.PortSecurity)
+	state.Stormctrl = util.OverlayKnownObject(ctx, plan.Stormctrl, state.Stormctrl)
+	for _, q := range []struct{ p, s *types.Int64 }{
+		{&plan.PriorityQueue1Level, &state.PriorityQueue1Level},
+		{&plan.PriorityQueue2Level, &state.PriorityQueue2Level},
+		{&plan.PriorityQueue3Level, &state.PriorityQueue3Level},
+		{&plan.PriorityQueue4Level, &state.PriorityQueue4Level},
+	} {
+		if !q.p.IsNull() && !q.p.IsUnknown() {
+			*q.s = *q.p
+		}
 	}
 	if !plan.Forward.IsNull() && !plan.Forward.IsUnknown() {
 		state.Forward = plan.Forward
@@ -781,12 +1551,6 @@ func (r *portProfileResource) applyPlanToState(
 	if !plan.Isolation.IsNull() && !plan.Isolation.IsUnknown() {
 		state.Isolation = plan.Isolation
 	}
-	if !plan.LLDPMedEnabled.IsNull() && !plan.LLDPMedEnabled.IsUnknown() {
-		state.LLDPMedEnabled = plan.LLDPMedEnabled
-	}
-	if !plan.LLDPMedNotifyEnabled.IsNull() && !plan.LLDPMedNotifyEnabled.IsUnknown() {
-		state.LLDPMedNotifyEnabled = plan.LLDPMedNotifyEnabled
-	}
 	if !plan.NativeNetworkConfID.IsNull() && !plan.NativeNetworkConfID.IsUnknown() {
 		state.NativeNetworkConfID = plan.NativeNetworkConfID
 	}
@@ -795,12 +1559,6 @@ func (r *portProfileResource) applyPlanToState(
 	}
 	if !plan.PoeMode.IsNull() && !plan.PoeMode.IsUnknown() {
 		state.PoeMode = plan.PoeMode
-	}
-	if !plan.PortSecurityEnabled.IsNull() && !plan.PortSecurityEnabled.IsUnknown() {
-		state.PortSecurityEnabled = plan.PortSecurityEnabled
-	}
-	if !plan.PortSecurityMacAddress.IsNull() && !plan.PortSecurityMacAddress.IsUnknown() {
-		state.PortSecurityMacAddress = plan.PortSecurityMacAddress
 	}
 	if !plan.Speed.IsNull() && !plan.Speed.IsUnknown() {
 		state.Speed = plan.Speed
@@ -811,5 +1569,154 @@ func (r *portProfileResource) applyPlanToState(
 	if !plan.VoiceNetworkConfID.IsNull() && !plan.VoiceNetworkConfID.IsUnknown() {
 		state.VoiceNetworkConfID = plan.VoiceNetworkConfID
 	}
+	if !plan.ExcludedNetworkConfIDs.IsNull() && !plan.ExcludedNetworkConfIDs.IsUnknown() {
+		state.ExcludedNetworkConfIDs = plan.ExcludedNetworkConfIDs
+	}
+	if !plan.MulticastRouterNetworkIDs.IsNull() && !plan.MulticastRouterNetworkIDs.IsUnknown() {
+		state.MulticastRouterNetworkIDs = plan.MulticastRouterNetworkIDs
+	}
+	if !plan.TaggedVLANMgmt.IsNull() && !plan.TaggedVLANMgmt.IsUnknown() {
+		state.TaggedVLANMgmt = plan.TaggedVLANMgmt
+	}
+	if !plan.FecMode.IsNull() && !plan.FecMode.IsUnknown() {
+		state.FecMode = plan.FecMode
+	}
+	if !plan.SettingPreference.IsNull() && !plan.SettingPreference.IsUnknown() {
+		state.SettingPreference = plan.SettingPreference
+	}
+	if !plan.PortKeepaliveEnabled.IsNull() && !plan.PortKeepaliveEnabled.IsUnknown() {
+		state.PortKeepaliveEnabled = plan.PortKeepaliveEnabled
+	}
+	if !plan.STPPortMode.IsNull() && !plan.STPPortMode.IsUnknown() {
+		state.STPPortMode = plan.STPPortMode
+	}
 	// Apply other fields as needed...
+}
+
+// ListResourceConfigSchema implements [list.ListResource].
+func (r *portProfileResource) ListResourceConfigSchema(
+	_ context.Context,
+	_ list.ListResourceSchemaRequest,
+	resp *list.ListResourceSchemaResponse,
+) {
+	resp.Schema = listschema.Schema{
+		MarkdownDescription: "List port profiles in a site.",
+		Attributes: map[string]listschema.Attribute{
+			"site": listschema.StringAttribute{
+				MarkdownDescription: "The name of the site to list port profiles from.",
+				Optional:            true,
+			},
+		},
+		Blocks: map[string]listschema.Block{
+			"filter": listschema.ListNestedBlock{
+				NestedObject: listschema.NestedBlockObject{
+					Attributes: map[string]listschema.Attribute{
+						"name": listschema.StringAttribute{
+							MarkdownDescription: "The name of the filter to apply. Supported values are: `name`.",
+							Required:            true,
+						},
+						"value": listschema.StringAttribute{
+							MarkdownDescription: "The value to filter by.",
+							Required:            true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// List implements [list.ListResource].
+func (r *portProfileResource) List(
+	ctx context.Context,
+	req list.ListRequest,
+	stream *list.ListResultsStream,
+) {
+	var config portProfileListConfigModel
+
+	diags := req.Config.Get(ctx, &config)
+	if diags.HasError() {
+		stream.Results = list.ListResultsStreamDiagnostics(diags)
+		return
+	}
+
+	site := config.Site.ValueString()
+	if site == "" {
+		site = r.client.Site
+	}
+
+	// Process filter blocks.
+	var filters []portProfileListFilterModel
+	if !config.Filter.IsNull() && !config.Filter.IsUnknown() {
+		config.Filter.ElementsAs(ctx, &filters, false)
+	}
+
+	postFilters := make(map[string]string)
+	for _, f := range filters {
+		postFilters[f.Name.ValueString()] = f.Value.ValueString()
+	}
+
+	profiles, err := r.client.ListPortProfile(ctx, site)
+	if err != nil {
+		var d diag.Diagnostics
+		d.AddError(
+			"Error Listing Port Profiles",
+			"Could not list port profiles: "+err.Error(),
+		)
+		stream.Results = list.ListResultsStreamDiagnostics(d)
+		return
+	}
+
+	stream.Results = func(push func(list.ListResult) bool) {
+		for _, profile := range profiles {
+			// Apply name filter.
+			if val, ok := postFilters["name"]; ok {
+				if profile.Name != val {
+					continue
+				}
+			}
+
+			result := req.NewListResult(ctx)
+
+			// Display name: prefer name, fall back to ID.
+			if profile.Name != "" {
+				result.DisplayName = profile.Name
+			} else {
+				result.DisplayName = profile.ID
+			}
+
+			// Set identity.
+			result.Diagnostics.Append(result.Identity.Set(ctx, portProfileIdentityModel{
+				ID:   types.StringValue(profile.ID),
+				Site: types.StringValue(site),
+			})...)
+
+			// Convert to model.
+			var model portProfileResourceModel
+			result.Diagnostics.Append(
+				r.portProfileToModel(ctx, &profile, &model, site)...,
+			)
+			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
+				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
+			}
+
+			if !push(result) {
+				return
+			}
+		}
+	}
+}
+
+// forwardForTaggedVLANMgmt is the forward mode the controller stores for a
+// tagged VLAN management mode.
+func forwardForTaggedVLANMgmt(taggedVLANMgmt string) string {
+	switch taggedVLANMgmt {
+	case "block_all":
+		return "native"
+	case "custom":
+		return "customize"
+	default:
+		return "all"
+	}
 }

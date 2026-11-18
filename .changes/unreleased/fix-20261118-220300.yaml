@@ -1,0 +1,3 @@
+kind: fix
+body: '**`unifi_device`: changing a port of a switch with a LAG no longer fails with `Provider returned invalid result object after apply`.** Create and Update stored the planned `port_override` set as it was. Once anything on the device changes, the framework marks the unset Optional+Computed attributes unknown in every element that equals its block, which is the case for a block that sets `op_mode`. The write went through and the apply then failed on 11 unknown attributes per LAG port. The attributes the plan left unknown are now stored as null, which is what Read keeps for an unset attribute'
+time: 2026-11-18T22:03:00Z

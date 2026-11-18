@@ -48,10 +48,32 @@ resource "unifi_static_route" "interface" {
 
 ### Optional
 
+- `enabled` (Boolean) Whether the static route is enabled. A new route is created enabled; an existing one keeps the controller's value when this is not set, so adopting a disabled route does not re-enable it (#544).
+- `gateway` (Attributes) The gateway that applies the static route. When not set, a new route uses the default gateway and an existing route keeps the controller's gateway (#544). (see [below for nested schema](#nestedatt--gateway))
 - `interface` (String) The interface of the static route (only valid for `interface-route` type). This can be `WAN1`, `WAN2`, or a network ID.
-- `next_hop` (String) The next hop of the static route (only valid for `nexthop-route` type).
+- `next_hop` (String) The next hop of the static route (only valid for `nexthop-route` type). Accepts IPv4 or IPv6 addresses.
 - `site` (String) The name of the site to associate the static route with.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 
 ### Read-Only
 
 - `id` (String) The ID of the static route.
+
+<a id="nestedatt--gateway"></a>
+### Nested Schema for `gateway`
+
+Optional:
+
+- `device` (String) The MAC address of the gateway device, used when `type` is `switch`.
+- `type` (String) The type of gateway for the static route. Can be `default` or `switch`. A new route defaults to `default`; an existing route keeps the controller's value when this is not set, so adopting a switch route does not move it to the gateway (#544).
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).

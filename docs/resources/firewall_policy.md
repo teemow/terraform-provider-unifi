@@ -1,0 +1,373 @@
+---
+page_title: Firewall Policy (Resource)
+subcategory: ""
+description: |-
+  Manages a UniFi zone-based firewall policy (UniFi Network 8.x+). Zone-based firewall policies replace the legacy firewall rules and are displayed under Settings → Security → Firewall Policies in the UniFi UI.
+---
+
+# Firewall Policy (Resource)
+
+Manages a UniFi zone-based firewall policy (UniFi Network 8.x+). Zone-based firewall policies replace the legacy firewall rules and are displayed under Settings → Security → Firewall Policies in the UniFi UI.
+
+## Example Usage
+
+```terraform
+# Networks referenced by the zones and policies below.
+resource "unifi_network" "lan" {
+  name   = "LAN"
+  subnet = "10.0.0.1/24"
+  vlan   = 10
+
+  dhcp_server = {
+    enabled = true
+    start   = "10.0.0.6"
+    stop    = "10.0.0.254"
+  }
+}
+
+resource "unifi_network" "dmz" {
+  name   = "DMZ"
+  subnet = "10.0.20.1/24"
+  vlan   = 20
+
+  dhcp_server = {
+    enabled = true
+    start   = "10.0.20.6"
+    stop    = "10.0.20.254"
+  }
+}
+
+resource "unifi_network" "iot" {
+  name   = "IoT"
+  subnet = "10.0.30.1/24"
+  vlan   = 30
+
+  dhcp_server = {
+    enabled = true
+    start   = "10.0.30.6"
+    stop    = "10.0.30.254"
+  }
+}
+
+# Zone-based firewall zones (UniFi OS 8.x+) grouping the networks above.
+resource "unifi_firewall_zone" "lan" {
+  name        = "LAN"
+  network_ids = [unifi_network.lan.id]
+}
+
+resource "unifi_firewall_zone" "dmz" {
+  name        = "DMZ"
+  network_ids = [unifi_network.dmz.id]
+}
+
+resource "unifi_firewall_zone" "iot" {
+  name        = "IoT"
+  network_ids = [unifi_network.iot.id]
+}
+
+# Allow web traffic from the LAN zone to a web server in the DMZ on tcp/443.
+# create_allow_respond lets UniFi auto-create the established/related return rule.
+resource "unifi_firewall_policy" "lan_to_dmz_https" {
+  name                 = "Allow LAN to DMZ HTTPS"
+  action               = "ALLOW"
+  protocol             = "tcp"
+  logging              = true
+  create_allow_respond = true
+
+  source = {
+    zone_id         = unifi_firewall_zone.lan.id
+    matching_target = "NETWORK"
+    network_ids     = [unifi_network.lan.id]
+  }
+
+  destination = {
+    zone_id            = unifi_firewall_zone.dmz.id
+    matching_target    = "IP"
+    ips                = ["10.0.20.10"]
+    port               = 443
+    port_matching_type = "SPECIFIC"
+  }
+}
+
+# Block all traffic from IoT devices to the LAN, with logging for visibility.
+resource "unifi_firewall_policy" "block_iot_to_lan" {
+  name        = "Block IoT to LAN"
+  action      = "BLOCK"
+  protocol    = "all"
+  description = "Keep IoT devices isolated from trusted clients."
+  logging     = true
+
+  source = {
+    zone_id         = unifi_firewall_zone.iot.id
+    matching_target = "ANY"
+  }
+
+  destination = {
+    zone_id         = unifi_firewall_zone.lan.id
+    matching_target = "ANY"
+  }
+}
+
+# Reject DNS (udp/53) from a specific IoT device to anywhere, forcing it to use
+# the local resolver. REJECT sends an ICMP unreachable instead of silently dropping.
+resource "unifi_firewall_policy" "iot_block_external_dns" {
+  name     = "Reject IoT external DNS"
+  action   = "REJECT"
+  protocol = "udp"
+
+  source = {
+    zone_id         = unifi_firewall_zone.iot.id
+    matching_target = "CLIENT"
+    client_macs     = ["00:11:22:33:44:55"]
+  }
+
+  destination = {
+    zone_id            = unifi_firewall_zone.iot.id
+    matching_target    = "ANY"
+    port               = 53
+    port_matching_type = "SPECIFIC"
+  }
+}
+
+# Allow internal ICMP (ping) between LAN and DMZ. For icmp/icmpv6 the controller
+# rejects create_allow_respond = true, so add an explicit reverse policy if you
+# need replies in the other direction.
+resource "unifi_firewall_policy" "lan_dmz_ping" {
+  name     = "Allow LAN to DMZ ping"
+  action   = "ALLOW"
+  protocol = "icmp"
+  enabled  = true
+
+  source = {
+    zone_id         = unifi_firewall_zone.lan.id
+    matching_target = "ANY"
+  }
+
+  destination = {
+    zone_id         = unifi_firewall_zone.dmz.id
+    matching_target = "ANY"
+  }
+}
+
+# Block access to specific web domains (FQDN matching) from the LAN zone.
+resource "unifi_firewall_policy" "block_web_domains" {
+  name     = "Block social media from LAN"
+  action   = "BLOCK"
+  protocol = "all"
+
+  source = {
+    zone_id         = unifi_firewall_zone.lan.id
+    matching_target = "ANY"
+  }
+
+  destination = {
+    zone_id         = unifi_firewall_zone.lan.id
+    matching_target = "WEB"
+    web_domains     = ["facebook.com", "tiktok.com"]
+  }
+}
+
+# Block inbound traffic from specific countries. The controller only accepts
+# matching_target = "REGION" on an external zone, and rejects an update that
+# leaves the list empty, so a region policy must always carry at least one code.
+resource "unifi_firewall_policy" "block_regions" {
+  name     = "block-high-risk-regions"
+  action   = "BLOCK"
+  protocol = "all"
+
+  source = {
+    zone_id         = data.unifi_firewall_zone.external.id
+    matching_target = "REGION"
+    regions         = ["KP", "RU"]
+  }
+
+  destination = {
+    zone_id         = data.unifi_firewall_zone.internal.id
+    matching_target = "ANY"
+  }
+}
+
+# Allow inbound HTTPS to one host over IPv6 by its interface identifier. The
+# mask keeps only the lower 64 bits (the EUI-64 interface ID), so the rule
+# keeps matching when the delegated prefix changes, where a full address in
+# `ips` would not.
+resource "unifi_firewall_policy" "allow_https_ipv6_host" {
+  name       = "allow-https-ipv6-host"
+  action     = "ALLOW"
+  protocol   = "tcp"
+  ip_version = "IPV6"
+
+  source = {
+    zone_id         = data.unifi_firewall_zone.external.id
+    matching_target = "ANY"
+  }
+
+  destination = {
+    zone_id            = data.unifi_firewall_zone.internal.id
+    matching_target    = "IID"
+    iid                = "::eaff:1eff:fed7:bf17/::ffff:ffff:ffff:ffff"
+    port_matching_type = "SPECIFIC"
+    port               = "443"
+  }
+}
+```
+
+<!-- schema generated by tfplugindocs -->
+## Schema
+
+### Required
+
+- `action` (String) The action to take when the policy matches: `ALLOW`, `BLOCK`, or `REJECT`.
+- `destination` (Attributes) The destination endpoint of the policy. (see [below for nested schema](#nestedatt--destination))
+- `name` (String) The name of the firewall policy.
+- `source` (Attributes) The source endpoint of the policy. (see [below for nested schema](#nestedatt--source))
+
+### Optional
+
+- `connection_state_type` (String) Connection-state matching mode: `ALL` (any state), `RESPOND_ONLY` (established/related returns), or `CUSTOM` (match the states listed in `connection_states`). Optional: if omitted the controller assigns it (defaults to `ALL`) and the provider round-trips the value so updates are accepted.
+- `connection_states` (List of String) Connection states matched when `connection_state_type` is `CUSTOM` (`NEW`, `ESTABLISHED`, `RELATED`, `INVALID`). Optional: leave unset for `ALL`/`RESPOND_ONLY` and the controller manages it; the provider round-trips the value so a `CUSTOM` policy's states are not dropped on update (which the firmware rejects with HTTP 400).
+- `create_allow_respond` (Boolean) When `true`, UniFi automatically creates a matching rule to allow established/related return traffic. Recommended for `ALLOW` policies. Taken from the controller when not set; a new policy is created with it off (#544).
+- `description` (String) A description for the policy. Taken from the controller when not set (#544).
+- `enabled` (Boolean) Whether the policy is enabled. Defaults to `true` for a newly created policy; an existing policy keeps whatever the controller holds, so adopting a policy disabled in the UI does not re-enable it (#544).
+- `ip_version` (String) The IP version to match: `BOTH`, `IPV4`, or `IPV6`. Defaults to `IPV4` for a newly created policy; an existing policy keeps whatever the controller holds, so adopting a dual-stack policy does not narrow it to IPv4 (#544). The controller requires this field, so it is always sent.
+- `logging` (Boolean) Whether to log packets matching this policy. Taken from the controller when not set; a new policy is created with logging off (#544).
+- `match_opposite_protocol` (Boolean) Invert the protocol match: when `true`, the policy matches every protocol **except** `protocol`. Corresponds to the "Match Opposite" toggle next to the protocol selector in the UniFi UI. Taken from the controller when not set; a new policy is created with it off (#544).
+- `protocol` (String) The protocol to match: `all`, `tcp`, `udp`, `tcp_udp`, `icmp`, or `icmpv6`. Note: for `icmp`/`icmpv6` policies the controller rejects `create_allow_respond = true` (`FirewallPolicyCreateRespondTrafficPolicyNotAllowed`) — keep it `false` and add an explicit reverse policy if you need the reply. Taken from the controller when not set; the controller assigns `all` to a new policy (#544).
+- `schedule` (Attributes) When the policy is active. The complete controller value is round-tripped so updating another policy field does not reset its schedule. Supported modes are `ALWAYS`, `EVERY_DAY`, `EVERY_WEEK`, `ONE_TIME_ONLY`, and `CUSTOM`. Timed modes require `time.all_day`; when false, both `time.range` boundaries are required. `EVERY_WEEK` also requires weekdays, `ONE_TIME_ONLY` requires `date` and a time range, and `CUSTOM` requires a date range and weekdays. Set `normalize` to clear inherited fields unused by the selected mode. (see [below for nested schema](#nestedatt--schedule))
+- `site` (String) The name of the UniFi site. Defaults to the site configured in the provider.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
+
+### Read-Only
+
+- `icmp` (Attributes) ICMP type matching modes. Managed by the UniFi controller; the provider round-trips them so updates are accepted. (see [below for nested schema](#nestedatt--icmp))
+- `id` (String) The ID of the firewall policy.
+- `index` (Number) The ordering index of the policy within its zone-pair, assigned by the controller. **Read-only:** UniFi does not accept a client-supplied index on create or update (the policy is always appended to the end of its source/destination zone-pair), and the supported API exposes no reorder operation, so policy ordering cannot be managed through this provider. Reorder policies in the UniFi UI if needed.
+
+<a id="nestedatt--destination"></a>
+### Nested Schema for `destination`
+
+Required:
+
+- `matching_target` (String) What to match: `ANY`, `NETWORK`, `CLIENT`, `IP`, `DEVICE`, `MAC`, `WEB` (domains/FQDN), `REGION` (country codes, set `regions`), or `IID` (IPv6 interface identifier, set `iid`). The controller only accepts `REGION` on an external zone.
+- `zone_id` (String) The ID of the firewall zone this endpoint belongs to. Use the `unifi_firewall_zone` data source to look up zone IDs by name.
+
+Optional:
+
+- `client_macs` (List of String) List of client MAC addresses to match. Used when `matching_target` is `CLIENT`.
+- `iid` (String) IPv6 interface identifier to match, written as `<address>/<mask>` with both parts in IPv6 notation (for example `::eaff:1eff:fed7:bf17/::ffff:ffff:ffff:ffff` matches the lower 64 bits, i.e. an EUI-64 interface ID under any prefix). Required when `matching_target` is `IID`, and only valid with it. Matching the interface ID instead of the full address keeps a rule working when the delegated IPv6 prefix changes. An existing policy keeps the controller's value while `matching_target` is unchanged (#544).
+- `ip_group_id` (String) ID of a `unifi_firewall_group` (address-group type) to match. Used when `matching_target` is `IP` with `matching_target_type = OBJECT`. Taken from the controller when not set (#544).
+- `ips` (List of String) List of IP addresses or CIDR ranges to match. Used when `matching_target` is `IP`.
+- `mac` (String) The MAC address bound to the source IP (IP/MAC binding). Only valid on the `source` endpoint with `matching_target = "IP"` and `match_mac = true`, which in turn requires it. An existing policy keeps the controller's value while `matching_target` is unchanged (#544).
+- `match_mac` (Boolean) The controller's `match_mac` flag (IP/MAC binding). Only valid on the `source` endpoint with `matching_target = "IP"`: the controller drops the flag on every other target (a `CLIENT` target already matches the clients in `client_macs` by MAC) and on the destination, so setting it to `true` anywhere else is rejected at plan time. On an `IP` source the controller also requires the bound MAC address, so `match_mac = true` also requires `mac`. Defaults to `false` for a new policy; an existing policy keeps the controller's value while `matching_target` is unchanged, so adopting an IP/MAC binding does not drop it (#544).
+- `match_opposite_iid` (Boolean) Invert the interface ID match: when `true`, the endpoint matches every address **except** those whose interface ID matches `iid`. Only valid with `matching_target = "IID"`. Defaults to `false` for a new policy; an existing policy keeps the controller's value while `matching_target` is unchanged (#544).
+- `match_opposite_ips` (Boolean) Invert the IP match: when `true`, the endpoint matches every address **except** those in `ips` / `ip_group_id`. Corresponds to the "Match Opposite" toggle on an `IP` matching target in the UniFi UI. Taken from the controller when not set (#544).
+- `match_opposite_networks` (Boolean) Invert the network match: when `true`, the endpoint matches every network **except** those in `network_ids`. Corresponds to the "Match Opposite" toggle on a `NETWORK` matching target in the UniFi UI. Taken from the controller when not set (#544).
+- `match_opposite_ports` (Boolean) Invert the port match: when `true`, the endpoint matches every port **except** those in `port` / `port_group_id`. Corresponds to the "Match Opposite" toggle on the port selector in the UniFi UI. Taken from the controller when not set (#544).
+- `network_ids` (List of String) List of UniFi network IDs to match. Used when `matching_target` is `NETWORK`.
+- `port` (String) Port(s) to match when `port_matching_type` is `SPECIFIC`. A single port (`161`) or a comma-separated list of ports/ranges (`80,443`, `8000-8100`). Leave unset for no port match.
+- `port_group_id` (String) ID of a `unifi_firewall_group` (port-group type) to match. Used when `port_matching_type` is `OBJECT`. Taken from the controller when not set (#544).
+- `port_matching_type` (String) How to match ports: `ANY`, `SPECIFIC`, or `OBJECT` (port group). Taken from the controller when not set; the controller assigns `ANY` to a new policy (#544).
+- `regions` (List of String) Two-letter ISO country codes to match (for example `["DE", "US"]`). Used when `matching_target` is `REGION`, which the controller only accepts on an external zone. The controller rejects an update that leaves the list empty, so a policy matching on region must always carry at least one code.
+- `web_domains` (List of String) List of domains/FQDNs to match. Used when `matching_target` is `WEB`.
+
+Read-Only:
+
+- `matching_target_type` (String) How the matching target is specified (`ANY`, `SPECIFIC`, `LIST`, `OBJECT`). Managed by the UniFi controller; the provider round-trips it so updates are accepted.
+
+
+<a id="nestedatt--source"></a>
+### Nested Schema for `source`
+
+Required:
+
+- `matching_target` (String) What to match: `ANY`, `NETWORK`, `CLIENT`, `IP`, `DEVICE`, `MAC`, `WEB` (domains/FQDN), `REGION` (country codes, set `regions`), or `IID` (IPv6 interface identifier, set `iid`). The controller only accepts `REGION` on an external zone.
+- `zone_id` (String) The ID of the firewall zone this endpoint belongs to. Use the `unifi_firewall_zone` data source to look up zone IDs by name.
+
+Optional:
+
+- `client_macs` (List of String) List of client MAC addresses to match. Used when `matching_target` is `CLIENT`.
+- `iid` (String) IPv6 interface identifier to match, written as `<address>/<mask>` with both parts in IPv6 notation (for example `::eaff:1eff:fed7:bf17/::ffff:ffff:ffff:ffff` matches the lower 64 bits, i.e. an EUI-64 interface ID under any prefix). Required when `matching_target` is `IID`, and only valid with it. Matching the interface ID instead of the full address keeps a rule working when the delegated IPv6 prefix changes. An existing policy keeps the controller's value while `matching_target` is unchanged (#544).
+- `ip_group_id` (String) ID of a `unifi_firewall_group` (address-group type) to match. Used when `matching_target` is `IP` with `matching_target_type = OBJECT`. Taken from the controller when not set (#544).
+- `ips` (List of String) List of IP addresses or CIDR ranges to match. Used when `matching_target` is `IP`.
+- `mac` (String) The MAC address bound to the source IP (IP/MAC binding). Only valid on the `source` endpoint with `matching_target = "IP"` and `match_mac = true`, which in turn requires it. An existing policy keeps the controller's value while `matching_target` is unchanged (#544).
+- `match_mac` (Boolean) The controller's `match_mac` flag (IP/MAC binding). Only valid on the `source` endpoint with `matching_target = "IP"`: the controller drops the flag on every other target (a `CLIENT` target already matches the clients in `client_macs` by MAC) and on the destination, so setting it to `true` anywhere else is rejected at plan time. On an `IP` source the controller also requires the bound MAC address, so `match_mac = true` also requires `mac`. Defaults to `false` for a new policy; an existing policy keeps the controller's value while `matching_target` is unchanged, so adopting an IP/MAC binding does not drop it (#544).
+- `match_opposite_iid` (Boolean) Invert the interface ID match: when `true`, the endpoint matches every address **except** those whose interface ID matches `iid`. Only valid with `matching_target = "IID"`. Defaults to `false` for a new policy; an existing policy keeps the controller's value while `matching_target` is unchanged (#544).
+- `match_opposite_ips` (Boolean) Invert the IP match: when `true`, the endpoint matches every address **except** those in `ips` / `ip_group_id`. Corresponds to the "Match Opposite" toggle on an `IP` matching target in the UniFi UI. Taken from the controller when not set (#544).
+- `match_opposite_networks` (Boolean) Invert the network match: when `true`, the endpoint matches every network **except** those in `network_ids`. Corresponds to the "Match Opposite" toggle on a `NETWORK` matching target in the UniFi UI. Taken from the controller when not set (#544).
+- `match_opposite_ports` (Boolean) Invert the port match: when `true`, the endpoint matches every port **except** those in `port` / `port_group_id`. Corresponds to the "Match Opposite" toggle on the port selector in the UniFi UI. Taken from the controller when not set (#544).
+- `network_ids` (List of String) List of UniFi network IDs to match. Used when `matching_target` is `NETWORK`.
+- `port` (String) Port(s) to match when `port_matching_type` is `SPECIFIC`. A single port (`161`) or a comma-separated list of ports/ranges (`80,443`, `8000-8100`). Leave unset for no port match.
+- `port_group_id` (String) ID of a `unifi_firewall_group` (port-group type) to match. Used when `port_matching_type` is `OBJECT`. Taken from the controller when not set (#544).
+- `port_matching_type` (String) How to match ports: `ANY`, `SPECIFIC`, or `OBJECT` (port group). Taken from the controller when not set; the controller assigns `ANY` to a new policy (#544).
+- `regions` (List of String) Two-letter ISO country codes to match (for example `["DE", "US"]`). Used when `matching_target` is `REGION`, which the controller only accepts on an external zone. The controller rejects an update that leaves the list empty, so a policy matching on region must always carry at least one code.
+- `web_domains` (List of String) List of domains/FQDNs to match. Used when `matching_target` is `WEB`.
+
+Read-Only:
+
+- `matching_target_type` (String) How the matching target is specified (`ANY`, `SPECIFIC`, `LIST`, `OBJECT`). Managed by the UniFi controller; the provider round-trips it so updates are accepted.
+
+
+<a id="nestedatt--schedule"></a>
+### Nested Schema for `schedule`
+
+Optional:
+
+- `date` (String) Date used by `ONE_TIME_ONLY`, in `YYYY-MM-DD` format.
+- `date_end` (String) End date used by `CUSTOM`, in `YYYY-MM-DD` format.
+- `date_start` (String) Start date used by `CUSTOM`, in `YYYY-MM-DD` format.
+- `mode` (String) Schedule mode.
+- `normalize` (Boolean) Clear inherited fields that are unused by the selected mode.
+- `repeat_on_days` (Set of String) Weekdays on which the policy is active.
+- `time` (Attributes) Time of day during which a timed schedule is active. (see [below for nested schema](#nestedatt--schedule--time))
+
+<a id="nestedatt--schedule--time"></a>
+### Nested Schema for `schedule.time`
+
+Optional:
+
+- `all_day` (Boolean) Whether the policy is active all day.
+- `range` (Attributes) Time range during which the policy is active when `all_day` is false. (see [below for nested schema](#nestedatt--schedule--time--range))
+
+<a id="nestedatt--schedule--time--range"></a>
+### Nested Schema for `schedule.time.range`
+
+Optional:
+
+- `end` (String) End time in 24-hour `HH:MM` format.
+- `start` (String) Start time in 24-hour `HH:MM` format.
+
+
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+
+
+<a id="nestedatt--icmp"></a>
+### Nested Schema for `icmp`
+
+Read-Only:
+
+- `typename` (String) ICMP type matching mode. Managed by the UniFi controller; the provider round-trips it so updates are accepted.
+- `v6_typename` (String) ICMPv6 type matching mode. Managed by the UniFi controller; the provider round-trips it so updates are accepted.
+
+## Import
+
+Import is supported using the following syntax:
+
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+
+```shell
+# Firewall policies can be imported using the policy ID, or site:id for a non-default site.
+terraform import unifi_firewall_policy.lan_to_dmz_https 6512a1f04ee8cb0f1f4a9876
+
+# For a non-default site, prefix the ID with the site name and a colon.
+terraform import unifi_firewall_policy.lan_to_dmz_https default:6512a1f04ee8cb0f1f4a9876
+```

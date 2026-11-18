@@ -111,18 +111,29 @@ resource "unifi_port_forward" "game_server" {
 
 ### Optional
 
-- `enabled` (Boolean, Deprecated) Specifies whether the port forwarding rule is enabled or not.
+- `destination_ips` (Attributes List) Additional destination IP/interface pairs for the port forwarding rule, used for multi-WAN setups. (see [below for nested schema](#nestedatt--destination_ips))
+- `enabled` (Boolean, Deprecated) Specifies whether the port forwarding rule is enabled or not. Taken from the controller when not set: a rule disabled on the controller stays disabled, rather than being re-enabled by a plan that does not mention it (#544).
 - `forward` (Attributes) Forward destination configuration. (see [below for nested schema](#nestedatt--forward))
-- `logging` (Boolean) Specifies whether to enable syslog logging for forwarded traffic.
+- `logging` (Boolean) Specifies whether to enable syslog logging for forwarded traffic. Taken from the controller when not set; a new rule is created with it off (#544).
 - `name` (String) The name of the port forwarding rule.
-- `protocol` (String) The protocol for the port forwarding rule. Can be `tcp`, `udp`, or `tcp_udp`.
+- `protocol` (String) The protocol for the port forwarding rule. Can be `tcp`, `udp`, or `tcp_udp`. A new rule is created with `tcp_udp` when not set; an existing rule keeps the controller's value, so adopting a `tcp`-only rule does not widen it to UDP (#544).
 - `site` (String) The name of the site to associate the port forwarding rule with.
 - `source_limiting` (Attributes) Source limiting configuration for the port forwarding rule. (see [below for nested schema](#nestedatt--source_limiting))
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 - `wan` (Attributes) WAN configuration for the port forwarding rule. (see [below for nested schema](#nestedatt--wan))
 
 ### Read-Only
 
 - `id` (String) The ID of the port forwarding rule.
+
+<a id="nestedatt--destination_ips"></a>
+### Nested Schema for `destination_ips`
+
+Optional:
+
+- `destination_ip` (String) The destination IPv4 address. Use `any` for all addresses.
+- `interface` (String) The WAN interface for this destination (e.g. `wan`, `wan2`, `wan3`).
+
 
 <a id="nestedatt--forward"></a>
 ### Nested Schema for `forward`
@@ -138,10 +149,21 @@ Optional:
 
 Optional:
 
-- `enabled` (Boolean) Specifies whether source limiting is enabled.
+- `enabled` (Boolean) Specifies whether source limiting is enabled. Taken from the controller when not set; a new rule is created with it off (#544).
 - `firewall_group_id` (String) The ID of the firewall group to use for source limiting.
-- `ip` (String) The source IPv4 address (or CIDR) of the port forwarding rule. For all traffic, specify `any`.
+- `ip` (String) The source IPv4 address (or CIDR) of the port forwarding rule. For all traffic, specify `any`. Taken from the controller when not set, and not sent on create: the controller stores no source address for a rule that does not limit by IP (#544).
 - `type` (String) The source limiting type. Can be `ip` or `firewall_group`. Inferred automatically when only one of `ip` or `firewall_group_id` is set.
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
 
 
 <a id="nestedatt--wan"></a>
@@ -149,7 +171,7 @@ Optional:
 
 Optional:
 
-- `interface` (String) The WAN interface (e.g. `wan`, `wan2`, `wan3`, or `both`).
+- `interface` (String) The WAN interface. Can be `wan`, `wan2`, `wan3`, or `both`.
 - `ip_address` (String) The WAN IP address for the port forwarding rule. Use `any` for all addresses.
 - `port` (String) The WAN port or port range (e.g. `1-10,11,12`).
 
@@ -157,7 +179,7 @@ Optional:
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # import from provider configured site

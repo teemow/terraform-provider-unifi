@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-nettypes/hwtypes"
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/action/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/action"
 	"github.com/hashicorp/terraform-plugin-framework/action/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -28,9 +31,10 @@ type portAction struct {
 
 // portActionModel describes the action request and response data model.
 type portActionModel struct {
-	DeviceMAC  types.String `tfsdk:"device_mac"`
-	PortNumber types.Int64  `tfsdk:"port_number"`
-	PoeMode    types.String `tfsdk:"poe_mode"`
+	DeviceMAC  hwtypes.MACAddress `tfsdk:"device_mac"`
+	PortNumber types.Int64        `tfsdk:"port_number"`
+	PoeMode    types.String       `tfsdk:"poe_mode"`
+	Timeouts   timeouts.Value     `tfsdk:"timeouts"`
 }
 
 func (a *portAction) Metadata(
@@ -52,6 +56,7 @@ func (a *portAction) Schema(
 		Attributes: map[string]schema.Attribute{
 			"device_mac": schema.StringAttribute{
 				MarkdownDescription: "MAC address of the device containing the port to configure.",
+				CustomType:          hwtypes.MACAddressType{},
 				Required:            true,
 			},
 			"port_number": schema.Int64Attribute{
@@ -62,6 +67,7 @@ func (a *portAction) Schema(
 				MarkdownDescription: "PoE mode to set for the port. Valid values are `auto`, `pasv24`, `passthrough`, and `off`.",
 				Required:            true,
 			},
+			"timeouts": timeouts.Attributes(ctx),
 		},
 	}
 }
@@ -104,6 +110,14 @@ func (a *portAction) Invoke(
 		return
 	}
 
+	invokeTimeout, timeoutDiags := config.Timeouts.Invoke(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, invokeTimeout)
+	defer cancel()
+
 	// Validate PoE mode
 	poeMode := config.PoeMode.ValueString()
 	validPoeModes := []string{"auto", "pasv24", "passthrough", "off"}
@@ -121,6 +135,12 @@ func (a *portAction) Invoke(
 
 	deviceMAC := config.DeviceMAC.ValueString()
 	portNumber := config.PortNumber.ValueInt64()
+
+	// Same read-modify-write of port_overrides as unifi_device and
+	// unifi_device_port: take the device's lock so a concurrent writer cannot
+	// overwrite this change with a stale copy of the array.
+	unlock := a.client.lockDevice(deviceLockKey(deviceMAC, ""))
+	defer unlock()
 
 	// Get the device first to retrieve its ID
 	device, err := a.client.GetDeviceByMAC(ctx, a.client.Site, deviceMAC)
@@ -171,6 +191,26 @@ func (a *portAction) Invoke(
 				portNumber,
 				deviceMAC,
 				err.Error(),
+			),
+		)
+		return
+	}
+
+	// The PUT provisions asynchronously. Wait for the device to settle before
+	// releasing the lock, so the next writer reads the updated port_overrides.
+	if _, err := waitForDeviceState(
+		ctx,
+		a.client,
+		a.client.Site, deviceMAC,
+		ui.DeviceStateConnected,
+		[]ui.DeviceState{ui.DeviceStateAdopting, ui.DeviceStateProvisioning},
+		3*time.Minute,
+	); err != nil {
+		resp.Diagnostics.AddError(
+			"Error Waiting for Device Port Update",
+			fmt.Sprintf(
+				"Could not wait for device %s to settle after updating port %d: %s",
+				deviceMAC, portNumber, err,
 			),
 		)
 		return

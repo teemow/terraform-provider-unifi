@@ -3,6 +3,7 @@ package unifi
 import (
 	"context"
 	"os"
+	"sync"
 
 	"github.com/hashicorp/terraform-plugin-framework/action"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -41,6 +42,73 @@ type unifiProviderModel struct {
 type Client struct {
 	*ui.ApiClient
 	Site string
+
+	// groupCache memoizes network members group name<->ID lookups per site. It lives
+	// on the shared *Client (one per provider configuration) rather than on the
+	// resource because the framework builds a fresh clientResource per RPC: keeping it
+	// here serializes concurrent group resolution across parallel unifi_client creates
+	// so they stop each creating a duplicate group with the same name (#389).
+	groupCacheMu sync.Mutex
+	groupCache   map[string]map[string]string // site -> (name -> id)
+
+	// integrationSiteMu guards integrationSites, which memoizes site -> Integration
+	// API UUID so the sites listing is fetched once per site, not on every CRUD call.
+	integrationSiteMu sync.Mutex
+	integrationSites  map[string]ui.IntegrationSiteID
+
+	// deviceLocks serialises the writers of one device's port_overrides array:
+	// unifi_device, unifi_device_port and the port action all read the device,
+	// change the array and PUT the device back, and the controller has no
+	// per-port endpoint. Two such writers for the same device in one apply
+	// would otherwise both read before either writes, and the second PUT would
+	// drop the first one's change. Keyed by cleaned MAC (deviceLockKey), shared
+	// across resource instances through the *Client. It only serialises within
+	// one provider process.
+	deviceLocksMu sync.Mutex
+	deviceLocks   map[string]*sync.Mutex
+}
+
+// lockDevice acquires the mutex of the device identified by key (see
+// deviceLockKey) and returns the function that releases it.
+func (c *Client) lockDevice(key string) func() {
+	c.deviceLocksMu.Lock()
+	if c.deviceLocks == nil {
+		c.deviceLocks = make(map[string]*sync.Mutex)
+	}
+	m, ok := c.deviceLocks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		c.deviceLocks[key] = m
+	}
+	c.deviceLocksMu.Unlock()
+
+	m.Lock()
+	return m.Unlock
+}
+
+// IntegrationSiteID resolves a site (legacy name such as "default", or a UUID) to the
+// site UUID the Network Integration API requires. Results are cached per client.
+func (c *Client) IntegrationSiteID(
+	ctx context.Context,
+	site string,
+) (ui.IntegrationSiteID, error) {
+	c.integrationSiteMu.Lock()
+	defer c.integrationSiteMu.Unlock()
+
+	if id, ok := c.integrationSites[site]; ok {
+		return id, nil
+	}
+
+	id, err := c.ResolveIntegrationSiteID(ctx, site)
+	if err != nil {
+		return "", err
+	}
+
+	if c.integrationSites == nil {
+		c.integrationSites = make(map[string]ui.IntegrationSiteID)
+	}
+	c.integrationSites[site] = id
+	return id, nil
 }
 
 // GetSiteName returns the site name for this client.
@@ -254,8 +322,12 @@ func (p *unifiProvider) Configure(
 	})
 	if err != nil {
 		resp.Diagnostics.AddError(
-			"Unable to Create HTTP Client",
-			"An unexpected error occurred when creating the HTTP client. "+
+			"Unable to Connect to UniFi Controller",
+			"Could not create the UniFi API client. With username/password auth the "+
+				"controller may have rate-limited the login (UniFi throttles "+
+				"POST /api/auth/login under rapid or back-to-back runs); using API-key "+
+				"authentication (the `api_key` argument or `UNIFI_API_KEY`) skips the "+
+				"per-run login entirely and avoids this. Underlying error: "+
 				err.Error(),
 		)
 		return
@@ -278,27 +350,37 @@ func (p *unifiProvider) Resources(ctx context.Context) []func() resource.Resourc
 	return []func() resource.Resource{
 		NewRadiusUserResource,
 		NewDeprecatedAccountResource,
+		NewAPGroupResource,
 		NewBGPResource,
 		NewDeviceFrameworkResource,
+		NewDevicePortResource,
 		NewDNSRecordFrameworkResource,
 		NewDynamicDNSResource,
 		NewFirewallGroupFrameworkResource,
+		NewFirewallPolicyResource,
 		NewFirewallRuleResource,
+		NewFirewallZoneResource,
+		NewNatResource,
 		NewNetworkResource,
 		NewPortForwardResource,
 		NewPortProfileFrameworkResource,
+		NewPowerSupervisorResource,
 		NewRadiusProfileResource,
 		NewSettingResource,
 		NewSiteFrameworkResource,
+		NewSiteToSiteVPNResource,
 		NewStaticRouteFrameworkResource,
 		NewClientResource,
 		NewWANResource,
 		NewWLANFrameworkResource,
 		NewVPNClientResource,
 		NewVPNServerResource,
+		NewWireguardPeerResource,
 		NewClientQosRateResource,
 		NewTrafficRouteResource,
-		NewWireGuardPeerResource,
+		NewTrafficMatchingListResource,
+		NewQOSRuleResource,
+		NewContentFilterResource,
 	}
 }
 
@@ -312,10 +394,12 @@ func (p *unifiProvider) DataSources(ctx context.Context) []func() datasource.Dat
 		NewRadiusUserDataSource,
 		NewDeprecatedAccountDataSource,
 		NewAPGroupDataSource,
+		NewFirewallZoneDataSource,
 		NewDNSRecordDataSource,
 		NewPortProfileDataSource,
 		NewRadiusProfileDataSource,
 		NewClientQosRateDataSource,
+		NewTeleportDataSource,
 	}
 }
 
@@ -336,10 +420,31 @@ func (p *unifiProvider) Actions(
 // ListResources implements [provider.ProviderWithListResources].
 func (p *unifiProvider) ListResources(context.Context) []func() list.ListResource {
 	return []func() list.ListResource{
+		NewAPGroupListResource,
 		NewClientListResource,
 		NewNetworkListResource,
 		NewVPNClientListResource,
 		NewVPNServerListResource,
 		NewTrafficRouteListResource,
+		NewRadiusUserListResource,
+		NewDNSRecordListResource,
+		NewDynamicDNSListResource,
+		NewRadiusProfileListResource,
+		NewFirewallRuleListResource,
+		NewFirewallZoneListResource,
+		NewPortForwardListResource,
+		NewStaticRouteListResource,
+		NewWANListResource,
+		NewSiteToSiteVPNListResource,
+		NewWLANListResource,
+		NewPowerSupervisorListResource,
+		NewClientQosRateListResource,
+		NewSiteListResource,
+		NewWireguardPeerListResource,
+		NewFirewallGroupListResource,
+		NewPortProfileListResource,
+		NewDeviceListResource,
+		NewFirewallPolicyListResource,
+		NewTrafficMatchingListListResource,
 	}
 }

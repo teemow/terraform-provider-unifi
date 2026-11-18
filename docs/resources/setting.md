@@ -19,14 +19,19 @@ resource "unifi_setting" "mgmt_only" {
   site = "default"
 
   mgmt = {
-    auto_upgrade = true
-    ssh_enabled  = true
-    ssh_keys = [{
-      name    = "admin-key"
-      type    = "ssh-rsa"
-      key     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD... admin@example.com"
-      comment = "Administrator SSH Key"
-    }]
+    auto_upgrade = {
+      enabled = true
+      hour    = 3
+    }
+    ssh = {
+      enabled = true
+      keys = [{
+        name    = "admin-key"
+        type    = "ssh-rsa"
+        key     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD... admin@example.com"
+        comment = "Administrator SSH Key"
+      }]
+    }
   }
 }
 
@@ -35,20 +40,58 @@ resource "unifi_setting" "combined" {
   site = "default"
 
   mgmt = {
-    auto_upgrade = true
-    ssh_enabled  = false
+    auto_upgrade = { enabled = true }
+    ssh          = { enabled = false }
   }
 
   radius = {
     accounting_enabled      = true
     auth_port               = 1812
     acct_port               = 1813
-    interim_update_interval = 600
+    interim_update_interval = "10m"
     secret                  = "my-radius-secret"
   }
 
   usg = {
-    multicast_dns_enabled = true
+    broadcast_ping = false
+    ftp_module     = false
+
+    upnp = {
+      enabled       = true
+      wan_interface = "WAN"
+    }
+
+    # DNS verification is a nested object on the USG/gateway settings.
+    dns_verification = {
+      domain             = "example.com"
+      primary_dns_server = "1.1.1.1"
+    }
+  }
+}
+
+# Configure only SNMP settings (v1/v2c community plus an SNMPv3 user).
+# The write-only password below requires Terraform 1.11+.
+variable "snmp_password" {
+  type      = string
+  sensitive = true
+  ephemeral = true
+}
+
+resource "unifi_setting" "snmp_only" {
+  site = "default"
+
+  snmp = {
+    enabled             = true
+    community           = "my-snmp-community"
+    enabled_v3          = true
+    username            = "monitor"
+    password_wo         = var.snmp_password
+    password_wo_version = 1 # Change this version whenever the password changes.
+
+    # Alternatively, replace the two password_wo fields with:
+    # password = "my-snmpv3-password"
+    # That value is stored in state and preserved on read. Neither password
+    # path detects controller-side password changes. Community is read back.
   }
 }
 
@@ -61,6 +104,102 @@ resource "unifi_setting" "radius_only" {
     auth_port          = 1812
   }
 }
+
+# Configure Global Switch Settings (spanning tree, rogue DHCP detection,
+# jumbo frames, 802.1X) for every switch on the site
+resource "unifi_setting" "global_switch" {
+  site = "default"
+
+  global_switch = {
+    stp_version            = "rstp"
+    dhcp_snoop             = true
+    jumboframe_enabled     = true
+    dot1x_portctrl_enabled = false
+  }
+}
+
+# Turn Wireless Meshing off on a fully wired site. Besides freeing the standby
+# mesh radio, this doubles the per-band SSID budget: with meshing on, APs
+# reserve a hidden backhaul SSID and allow 4 SSIDs per band instead of 8, so a
+# site rebuilt from code can otherwise fail to create its fifth WLAN. The
+# controller-generated mesh SSID and pre-shared key are left untouched.
+resource "unifi_setting" "wired_site" {
+  site = "default"
+
+  connectivity = {
+    enabled = false
+  }
+}
+
+# Keep Channel AI optimizing 5 GHz every night but leave 2.4 GHz alone: the
+# optimizer rewrites the channel of every radio in the bands listed in radios,
+# so a band left out keeps the channel it has (set it on the device). Useful
+# for 2.4 GHz-only IoT devices that do not follow a channel change.
+resource "unifi_setting" "channel_ai" {
+  site = "default"
+
+  radio_ai = {
+    enabled   = true
+    cron_expr = "0 3 * * *"
+    radios    = ["na"]
+    optimize  = ["channel"]
+  }
+}
+
+# Client Device Isolation (Settings > Networks > "Device Isolation (ACL)") is a
+# switch ACL listing the networks whose devices may not talk to each other. It
+# covers same-network traffic across access points, which unifi_wlan's
+# l2_isolation (one access point) and unifi_network's network_isolation (between
+# networks) do not. The controller only offers it for networks routed by a UniFi
+# gateway or L3 switch.
+resource "unifi_setting" "device_isolation" {
+  site = "default"
+
+  global_switch = {
+    acl_device_isolation = [
+      unifi_network.guest.id,
+      unifi_network.quarantine.id,
+    ]
+  }
+}
+
+# Site-wide Etherlighting colors: per link speed (used by switches in `speed`
+# mode) and per network (used in `network` mode). Colors are 6-digit hex codes
+# without the leading `#`.
+resource "unifi_setting" "etherlighting" {
+  site = "default"
+
+  etherlighting = {
+    speed_overrides = [
+      {
+        speed = "FE"
+        color = "ff0000"
+      },
+      {
+        speed = "GbE"
+        color = "00ff00"
+      },
+      {
+        speed = "2.5GbE"
+        color = "0000ff"
+      },
+      {
+        speed = "5GbE"
+        color = "ffff00"
+      },
+      {
+        speed = "10GbE"
+        color = "ffffff"
+      }
+    ]
+    network_overrides = [
+      {
+        network = unifi_network.guest.id
+        color   = "ffa500"
+      }
+    ]
+  }
+}
 ```
 
 <!-- schema generated by tfplugindocs -->
@@ -68,26 +207,287 @@ resource "unifi_setting" "radius_only" {
 
 ### Optional
 
+> **NOTE**: [Write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments) are supported in Terraform 1.11 and later.
+
+- `auto_speedtest` (Attributes) Periodic automated internet speed test settings. (see [below for nested schema](#nestedatt--auto_speedtest))
+- `connectivity` (Attributes) Wireless meshing and uplink connectivity (Settings > WiFi > Wireless Meshing). Disabling meshing frees the standby mesh radio and doubles the per-band SSID budget: with meshing on, APs reserve a hidden backhaul SSID and allow 4 SSIDs per band instead of 8. The controller-generated mesh SSID and pre-shared key are not exposed and are preserved across updates, as are any options this block does not model. (see [below for nested schema](#nestedatt--connectivity))
+- `country` (Attributes) Regulatory country settings. (see [below for nested schema](#nestedatt--country))
+- `doh` (Attributes) Encrypted DNS (DNS-over-HTTPS) settings. (see [below for nested schema](#nestedatt--doh))
+- `dpi` (Attributes) Deep Packet Inspection (DPI) settings. (see [below for nested schema](#nestedatt--dpi))
+- `etherlighting` (Attributes) Site-wide Etherlighting colors for switches with per-port LED lighting. Switches in `speed` mode color each port by its link speed, those in `network` mode by its network; set the mode per switch with `unifi_device`'s `etherlighting` block. Each list replaces the controller's list when set and is left untouched when omitted. (see [below for nested schema](#nestedatt--etherlighting))
+- `global_switch` (Attributes) Site-wide switch settings (Settings > Networks > Global Switch Settings). On current controllers jumbo frames are only honored here, not via `unifi_device.jumboframe_enabled`. Options not exposed by this block are preserved across updates. (see [below for nested schema](#nestedatt--global_switch))
+- `igmp_snooping` (Attributes) Site-level IGMP snooping setting. On UniFi Network 10.3.x+ the effective IGMP snooping toggle lives here rather than on each network. Advanced querier/flood options configured in the UI are preserved across updates. (see [below for nested schema](#nestedatt--igmp_snooping))
+- `ips` (Attributes) Intrusion Prevention System (IPS/IDS) and threat management settings. Basic IDS/IPS uses the built-in Emerging Threats ruleset and is free. A UniFi CyberSecure subscription adds enhanced threat intelligence from Proofpoint and Cloudflare on top of the base ruleset. (see [below for nested schema](#nestedatt--ips))
+- `lcm` (Attributes) LCD/display (LCM) settings for devices with a screen. (see [below for nested schema](#nestedatt--lcm))
+- `mdns` (Attributes) Multicast DNS (Settings > Networks > Multicast DNS): which networks mDNS is reflected between, and which services. Options not exposed by this block are preserved across updates. (see [below for nested schema](#nestedatt--mdns))
 - `mgmt` (Attributes) Management settings. (see [below for nested schema](#nestedatt--mgmt))
+- `network_optimization` (Attributes) Automated network optimization settings. (see [below for nested schema](#nestedatt--network_optimization))
+- `ntp` (Attributes) NTP (time server) settings. (see [below for nested schema](#nestedatt--ntp))
+- `radio_ai` (Attributes) Channel AI, the nightly channel optimization (Settings > WiFi > Channel AI). On its schedule the optimizer rewrites the channel of every radio in the bands listed in `radios`, overriding a channel set on the device, so leaving a band out of `radios` is how its channel is pinned while the others stay optimized. Only the attributes set in config are written; the others keep their controller values. (see [below for nested schema](#nestedatt--radio_ai))
 - `radius` (Attributes) RADIUS settings. (see [below for nested schema](#nestedatt--radius))
+- `radius_secret_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) Write-only equivalent of `radius.secret` (Terraform 1.11+). Used at apply time but never written to state. It sits at the root rather than inside `radius` because Terraform does not allow a write-only attribute inside a computed nested attribute. Requires the `radius` block (`radius = {}` is enough) and is mutually exclusive with `radius.secret`. Because nothing is stored, a secret changed outside Terraform produces no diff; increment `radius_secret_wo_version` to send a new value.
+- `radius_secret_wo_version` (Number) Version counter for `radius_secret_wo`. Increment this value to trigger a RADIUS secret update.
 - `site` (String) The name of the site to associate the settings with.
+- `snmp` (Attributes) SNMP agent settings (Settings > System > SNMP): a v1/v2c community and a single SNMPv3 user. Only configured SNMP settings are read; import does not populate this attribute. (see [below for nested schema](#nestedatt--snmp))
+- `syslog` (Attributes) Remote syslog (rsyslogd) settings. (see [below for nested schema](#nestedatt--syslog))
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 - `usg` (Attributes) USG settings. (see [below for nested schema](#nestedatt--usg))
 
 ### Read-Only
 
 - `id` (String) The ID of the settings.
 
+<a id="nestedatt--auto_speedtest"></a>
+### Nested Schema for `auto_speedtest`
+
+Optional:
+
+- `cron_expr` (String) Cron expression controlling when the speed test runs (e.g. `0 * * * *`).
+- `enabled` (Boolean) Whether periodic automated speed tests are enabled. Taken from the controller when not set (#544).
+
+
+<a id="nestedatt--connectivity"></a>
+### Nested Schema for `connectivity`
+
+Optional:
+
+- `enabled` (Boolean) Enable Wireless Meshing for the site.
+- `mlo_mesh_enabled` (Boolean) Enable Multi-Link Operation (MLO) for the mesh backhaul. Requires WiFi 7 hardware.
+- `uplink_host` (String) Host the site uses to verify connectivity when `uplink_type` is `internet`.
+- `uplink_type` (String) How the site reaches the controller: `gateway` or `internet`.
+
+
+<a id="nestedatt--country"></a>
+### Nested Schema for `country`
+
+Required:
+
+- `code` (Number) Regulatory country code (ISO 3166-1 numeric).
+
+
+<a id="nestedatt--doh"></a>
+### Nested Schema for `doh`
+
+Optional:
+
+- `custom_servers` (Attributes List) Custom DNS servers specified via DNS stamp. (see [below for nested schema](#nestedatt--doh--custom_servers))
+- `server_names` (List of String) Predefined DNS provider names (e.g. "cloudflare", "google").
+- `state` (String) Encrypted DNS state: off, auto, manual, or custom.
+
+<a id="nestedatt--doh--custom_servers"></a>
+### Nested Schema for `doh.custom_servers`
+
+Required:
+
+- `sdns_stamp` (String) DNS stamp (sdns://) for the custom resolver.
+- `server_name` (String) Human-readable name for this custom server.
+
+Optional:
+
+- `enabled` (Boolean) Enable this custom server. Defaults to true.
+
+
+
+<a id="nestedatt--dpi"></a>
+### Nested Schema for `dpi`
+
+Optional:
+
+- `enabled` (Boolean) Whether DPI is enabled. Taken from the controller when not set, so declaring the `dpi` block for one attribute no longer turns deep packet inspection off (#544).
+- `fingerprinting_enabled` (Boolean) Whether device fingerprinting is enabled.
+
+
+<a id="nestedatt--etherlighting"></a>
+### Nested Schema for `etherlighting`
+
+Optional:
+
+- `network_overrides` (Attributes List) Colors for ports on the given network. (see [below for nested schema](#nestedatt--etherlighting--network_overrides))
+- `speed_overrides` (Attributes List) Colors for ports linked at the given speed. (see [below for nested schema](#nestedatt--etherlighting--speed_overrides))
+
+<a id="nestedatt--etherlighting--network_overrides"></a>
+### Nested Schema for `etherlighting.network_overrides`
+
+Required:
+
+- `color` (String) 6-digit hex color without the leading `#` (e.g. `ff0000`).
+- `network` (String) ID of the network.
+
+
+<a id="nestedatt--etherlighting--speed_overrides"></a>
+### Nested Schema for `etherlighting.speed_overrides`
+
+Required:
+
+- `color` (String) 6-digit hex color without the leading `#` (e.g. `ff0000`).
+- `speed` (String) Link speed: `FE`, `GbE`, `2.5GbE`, `5GbE`, `10GbE`, `25GbE`, `40GbE` or `100GbE`.
+
+
+
+<a id="nestedatt--global_switch"></a>
+### Nested Schema for `global_switch`
+
+Optional:
+
+- `acl_device_isolation` (List of String) Network IDs with Client Device Isolation enabled (Settings > Networks > "Device Isolation (ACL)"), which blocks all communication between devices in the same network. This is a switch ACL: it covers same-network traffic across access points, which `unifi_wlan.l2_isolation` (one access point) and `unifi_network.network_isolation` (between networks) do not. The controller only offers it for networks routed by a UniFi gateway or L3 switch, and some switch models do not support ACLs at all - it rejects an unsupported network rather than silently ignoring it.
+- `dhcp_snoop` (Boolean) Enable Rogue DHCP Server Detection (DHCP snooping).
+- `dot1x_portctrl_enabled` (Boolean) Enable 802.1X port control.
+- `jumboframe_enabled` (Boolean) Enable jumbo frames on all switches.
+- `stp_version` (String) Spanning Tree Protocol mode for all switches: `stp`, `rstp`, or `disabled`.
+
+
+<a id="nestedatt--igmp_snooping"></a>
+### Nested Schema for `igmp_snooping`
+
+Optional:
+
+- `enabled` (Boolean) Whether IGMP snooping is enabled for the site.
+- `network_ids` (List of String) IDs of the networks IGMP snooping applies to.
+
+
+<a id="nestedatt--ips"></a>
+### Nested Schema for `ips`
+
+Optional:
+
+- `advanced_filtering_preference` (String) Advanced filtering mode: manual or disabled.
+- `content_filtering_blocking_page_enabled` (Boolean) Show a blocking page when content filtering blocks a request.
+- `enabled_categories` (List of String) Emerging Threats ruleset categories to enable (e.g. "emerging-malware", "tor", "phishing").
+- `enabled_networks` (List of String) Network IDs to apply IPS inspection to.
+- `honeypot` (Attributes List) Honeypot IP addresses per network. (see [below for nested schema](#nestedatt--ips--honeypot))
+- `honeypot_enabled` (Boolean) Enable honeypot to detect internal port scans.
+- `ips_mode` (String) IPS operating mode: ids (detect only), ips (detect and block), ipsInline, or disabled.
+- `memory_optimized` (Boolean) Use memory-optimized IPS ruleset (reduced rule set for low-memory devices).
+- `restrict_torrents` (Boolean) Block BitTorrent traffic.
+- `suppression` (Attributes) IPS suppression: signature alert suppression entries and whitelisted sources/destinations. (see [below for nested schema](#nestedatt--ips--suppression))
+
+<a id="nestedatt--ips--honeypot"></a>
+### Nested Schema for `ips.honeypot`
+
+Required:
+
+- `ip_address` (String) IP address to use as a honeypot.
+- `network_id` (String) Network ID this honeypot IP belongs to.
+- `version` (String) IP version: v4 or v6.
+
+
+<a id="nestedatt--ips--suppression"></a>
+### Nested Schema for `ips.suppression`
+
+Optional:
+
+- `alerts` (Attributes List) IPS signature alert suppression entries — silence specific signatures or categories. (see [below for nested schema](#nestedatt--ips--suppression--alerts))
+- `whitelist` (Attributes List) IPS suppression whitelist entries — sources/destinations to exclude from inspection. (see [below for nested schema](#nestedatt--ips--suppression--whitelist))
+
+<a id="nestedatt--ips--suppression--alerts"></a>
+### Nested Schema for `ips.suppression.alerts`
+
+Optional:
+
+- `category` (String) Alert suppression signature category.
+- `gid` (Number) Signature Generator ID (GID).
+- `id` (Number) Signature ID.
+- `signature` (String) Suppression signature name.
+- `tracking` (Attributes List) Tracking specifications (used when `type` is `track`). (see [below for nested schema](#nestedatt--ips--suppression--alerts--tracking))
+- `type` (String) Suppression type: `all` (everywhere) or `track` (only the tracked sources/destinations).
+
+<a id="nestedatt--ips--suppression--alerts--tracking"></a>
+### Nested Schema for `ips.suppression.alerts.tracking`
+
+Required:
+
+- `direction` (String) Match direction: both, src, or dest.
+- `mode` (String) Match mode: ip, subnet, or network.
+- `value` (String) IP address, CIDR subnet, or network ID to match.
+
+
+
+<a id="nestedatt--ips--suppression--whitelist"></a>
+### Nested Schema for `ips.suppression.whitelist`
+
+Required:
+
+- `direction` (String) Match direction: both, src, or dest.
+- `mode` (String) Match mode: ip, subnet, or network.
+- `value` (String) IP address, CIDR subnet, or network ID to whitelist.
+
+
+
+
+<a id="nestedatt--lcm"></a>
+### Nested Schema for `lcm`
+
+Optional:
+
+- `brightness` (Number) Display brightness (1-100).
+- `enabled` (Boolean) Whether the device display is enabled.
+- `idle_timeout` (Number) Seconds of inactivity before the display turns off (10-3600).
+- `sync` (Boolean) Sync display settings across devices. Taken from the controller when not set (#544).
+- `touch_event` (Boolean) Whether touch events on the display are enabled.
+
+
+<a id="nestedatt--mdns"></a>
+### Nested Schema for `mdns`
+
+Optional:
+
+- `custom_services` (Attributes List) Additional services reflected in `custom` mode. (see [below for nested schema](#nestedatt--mdns--custom_services))
+- `enabled_for` (String) Networks mDNS is enabled for: `all`, `some` (the networks with `multicast_dns` enabled on `unifi_network`), or `none`.
+- `mode` (String) Which services are reflected: `all`, `auto`, or `custom` (only `predefined_services` and `custom_services`).
+- `predefined_services` (List of String) Codes of the predefined services reflected in `custom` mode, e.g. `google_chromecast`, `apple_airPlay`, `printers`.
+
+Read-Only:
+
+- `enabled_for_network_ids` (List of String) IDs of the networks mDNS is enabled for when `enabled_for` is `some`. Read-only: the controller derives this list from each network's `mdns_enabled` flag and ignores writes to it, so choose the networks with `multicast_dns` on `unifi_network`.
+
+<a id="nestedatt--mdns--custom_services"></a>
+### Nested Schema for `mdns.custom_services`
+
+Required:
+
+- `address` (String) Service type, e.g. `_myservice._tcp.local`.
+
+Optional:
+
+- `name` (String) Display name of the service.
+
+
+
 <a id="nestedatt--mgmt"></a>
 ### Nested Schema for `mgmt`
 
 Optional:
 
-- `auto_upgrade` (Boolean) Automatically upgrade device firmware.
-- `ssh_enabled` (Boolean) Enable SSH authentication.
-- `ssh_keys` (Attributes List) SSH keys. (see [below for nested schema](#nestedatt--mgmt--ssh_keys))
+- `advanced_feature_enabled` (Boolean) Enable advanced features.
+- `auto_upgrade` (Attributes) Automatic device firmware upgrade settings. (see [below for nested schema](#nestedatt--mgmt--auto_upgrade))
+- `debug_tools_enabled` (Boolean) Enable debug tools.
+- `direct_connect_enabled` (Boolean) Enable Direct Connect (remote access).
+- `ssh` (Attributes) Device SSH access settings. (see [below for nested schema](#nestedatt--mgmt--ssh))
+- `unifi_idp_enabled` (Boolean) Enable the UniFi Identity Provider.
+- `wifiman_enabled` (Boolean) Enable WiFiman.
 
-<a id="nestedatt--mgmt--ssh_keys"></a>
-### Nested Schema for `mgmt.ssh_keys`
+<a id="nestedatt--mgmt--auto_upgrade"></a>
+### Nested Schema for `mgmt.auto_upgrade`
+
+Optional:
+
+- `enabled` (Boolean) Automatically upgrade device firmware.
+- `hour` (Number) Hour of day (0-23) for automatic firmware upgrades.
+
+
+<a id="nestedatt--mgmt--ssh"></a>
+### Nested Schema for `mgmt.ssh`
+
+Optional:
+
+- `auth_password_enabled` (Boolean) Allow SSH password authentication (in addition to keys).
+- `enabled` (Boolean) Enable SSH authentication.
+- `keys` (Attributes List) SSH keys. (see [below for nested schema](#nestedatt--mgmt--ssh--keys))
+- `password` (String, Sensitive) SSH password for device access. Sensitive — the controller stores only a hash, so this value is kept from configuration and not read back.
+- `username` (String) SSH username for device access.
+
+<a id="nestedatt--mgmt--ssh--keys"></a>
+### Nested Schema for `mgmt.ssh.keys`
 
 Required:
 
@@ -101,6 +501,71 @@ Optional:
 
 
 
+
+<a id="nestedatt--network_optimization"></a>
+### Nested Schema for `network_optimization`
+
+Optional:
+
+- `enabled` (Boolean) Whether automated network optimization is enabled.
+
+
+<a id="nestedatt--ntp"></a>
+### Nested Schema for `ntp`
+
+Optional:
+
+- `ntp_server_1` (String) Primary NTP server.
+- `ntp_server_2` (String) Second NTP server.
+- `ntp_server_3` (String) Third NTP server.
+- `ntp_server_4` (String) Fourth NTP server.
+- `setting_preference` (String) Configuration mode: `auto` or `manual`.
+
+
+<a id="nestedatt--radio_ai"></a>
+### Nested Schema for `radio_ai`
+
+Optional:
+
+- `auto_adjust_channels_to_country` (Boolean) Restrict the channel lists to the site's country.
+- `auto_channel_presets_type` (String) Channel preset: `maximum_speed`, `conservative` or `custom` (the `channels_*` lists).
+- `auto_enabled` (Boolean) The controller's `auto_enabled` flag: whether automatic channel optimization is enabled. It is a separate key from `enabled` and is written as given, without changing `enabled`. Left out of the configuration, the controller's value is kept (and not tracked when the controller does not report it).
+- `channels_6e` (List of Number) 6 GHz channels the optimizer may choose from.
+- `channels_blacklist` (Attributes List) Channels the optimizer must not use. (see [below for nested schema](#nestedatt--radio_ai--channels_blacklist))
+- `channels_na` (List of Number) 5 GHz channels the optimizer may choose from. The controller drops the DFS channels (52-144) when the `na` entry of `radios_configuration` has `dfs = false`, so listing them then fails the plan. It may also narrow the list to the site's country (`auto_adjust_channels_to_country`) or the preset (`auto_channel_presets_type` other than `custom`); leave the list out to keep what the controller derives.
+- `channels_ng` (List of Number) 2.4 GHz channels the optimizer may choose from.
+- `cron_expr` (String) When the optimizer runs, as a cron expression in the controller's time zone (e.g. `0 3 * * *`).
+- `enabled` (Boolean) The controller's `enabled` flag for Channel AI: run the optimizer on its `cron_expr` schedule.
+- `exclude_devices` (List of String) MAC addresses of devices the optimizer leaves alone.
+- `high_priority_devices` (List of String) MAC addresses of devices the optimizer handles first.
+- `ht_modes_na` (List of Number) 5 GHz channel widths (MHz) the optimizer may use: `20`, `40`, `80`, `160`. Each must be at most the `channel_width` of the `na` entry of `radios_configuration` (the controller drops wider ones), or the plan fails.
+- `ht_modes_ng` (List of Number) 2.4 GHz channel widths (MHz) the optimizer may use: `20`, `40`. Each must be at most the `channel_width` of the `ng` entry of `radios_configuration` (the controller drops wider ones), or the plan fails.
+- `optimize` (List of String) What the optimizer adjusts: `channel`, `power`.
+- `radios` (List of String) Bands the optimizer may change: `ng` (2.4 GHz), `na` (5 GHz), `6e` (6 GHz).
+- `radios_configuration` (Attributes List) Per-band channel width and DFS use. (see [below for nested schema](#nestedatt--radio_ai--radios_configuration))
+- `setting_preference` (String) `auto` or `manual`.
+
+<a id="nestedatt--radio_ai--channels_blacklist"></a>
+### Nested Schema for `radio_ai.channels_blacklist`
+
+Required:
+
+- `channel` (Number) Channel number.
+- `channel_width` (Number) Channel width in MHz.
+- `radio` (String) Band: `ng`, `na` or `6e`.
+
+
+<a id="nestedatt--radio_ai--radios_configuration"></a>
+### Nested Schema for `radio_ai.radios_configuration`
+
+Required:
+
+- `channel_width` (Number) Channel width in MHz.
+- `dfs` (Boolean) Whether DFS channels may be used.
+- `radio` (String) Band: `ng`, `na` or `6e`.
+
+
+
 <a id="nestedatt--radius"></a>
 ### Nested Schema for `radius`
 
@@ -109,8 +574,67 @@ Optional:
 - `accounting_enabled` (Boolean) Enable RADIUS accounting.
 - `acct_port` (Number) RADIUS accounting port.
 - `auth_port` (Number) RADIUS authentication port.
-- `interim_update_interval` (Number) Interim update interval in seconds.
-- `secret` (String, Sensitive) RADIUS shared secret.
+- `interim_update_interval` (String) Interim update interval, as a Go duration string (e.g. `1h`, `3600s`).
+- `secret` (String, Sensitive) RADIUS shared secret. Stored in state; use the root-level `radius_secret_wo` to avoid persisting the secret.
+
+
+<a id="nestedatt--snmp"></a>
+### Nested Schema for `snmp`
+
+Optional:
+
+- `community` (String, Sensitive) SNMP v1/v2c community string.
+- `enabled` (Boolean) Enable SNMP v1/v2c.
+- `enabled_v3` (Boolean) Enable SNMPv3.
+- `password` (String, Sensitive) SNMPv3 password, stored in state. The configured value is preserved on read because controllers may omit or mask the password. External password changes are not detected. Mutually exclusive with `password_wo`.
+- `password_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) Write-only SNMPv3 password (Terraform 1.11+), never stored in plan or state; accepts ephemeral values. Mutually exclusive with `password`. Set `password_wo_version` and change it to rotate this password. Changing only this value does not trigger an update. External password changes are not detected.
+- `password_wo_version` (Number) Positive version for `password_wo`. Required with `password_wo`; change it whenever the write-only password should be applied. The version is stored in state. An unchanged version preserves the controller password during other updates.
+- `username` (String) SNMPv3 username.
+
+
+<a id="nestedatt--syslog"></a>
+### Nested Schema for `syslog`
+
+Optional:
+
+- `contents` (List of String) Logged facilities (e.g. `device`, `client`, `firewall_default_policy`, `triggers`, `updates`, `admin_activity`, `critical`, `security_detections`, `vpn`).
+- `debug` (Boolean) Enable debug logging.
+- `enabled` (Boolean) Whether remote syslog is enabled. Taken from the controller when not set, so declaring the `syslog` block to manage its server address no longer disables logging (#544).
+- `ip` (String) Remote syslog server IP address.
+- `log_all_contents` (Boolean) Log all available facilities. Taken from the controller when not set (#544).
+- `netconsole` (Attributes) Netconsole logging settings. (see [below for nested schema](#nestedatt--syslog--netconsole))
+- `port` (Number) Remote syslog server port (1-65535).
+- `this_controller` (Attributes) Forwarding of this controller's own events to the remote syslog server. (see [below for nested schema](#nestedatt--syslog--this_controller))
+
+<a id="nestedatt--syslog--netconsole"></a>
+### Nested Schema for `syslog.netconsole`
+
+Optional:
+
+- `enabled` (Boolean) Whether netconsole logging is enabled. Defaults to `false` when `syslog` is configured and this is not set.
+- `host` (String) Netconsole host.
+- `port` (Number) Netconsole port (1-65535).
+
+
+<a id="nestedatt--syslog--this_controller"></a>
+### Nested Schema for `syslog.this_controller`
+
+Optional:
+
+- `enabled` (Boolean) Also log this controller's events.
+- `encrypted_only` (Boolean) Only send this controller's logs over an encrypted channel.
+
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
 
 
 <a id="nestedatt--usg"></a>
@@ -121,40 +645,24 @@ Optional:
 - `broadcast_ping` (Boolean) Enable broadcast ping.
 - `dns_verification` (Attributes) DNS verification settings. (see [below for nested schema](#nestedatt--usg--dns_verification))
 - `ftp_module` (Boolean) Enable FTP module.
-- `geo_ip_filtering_block` (String) Geo IP filtering action: block or allow.
-- `geo_ip_filtering_countries` (String) Comma-separated list of country codes for geo IP filtering.
-- `geo_ip_filtering_enabled` (Boolean) Enable geo IP filtering.
-- `geo_ip_filtering_traffic_direction` (String) Geo IP filtering traffic direction: both, ingress, or egress.
+- `geo_ip_filtering` (Attributes) Geo IP filtering (Region Blocking) settings. (see [below for nested schema](#nestedatt--usg--geo_ip_filtering))
 - `gre_module` (Boolean) Enable GRE module.
 - `h323_module` (Boolean) Enable H.323 module.
-- `icmp_timeout` (Number) ICMP connection timeout in seconds.
+- `icmp_timeout` (String) ICMP connection timeout, as a Go duration string (e.g. `30s`, `1m`).
 - `mss_clamp` (String) MSS clamping mode: auto, custom, or disabled.
-- `offload_accounting` (Boolean) Enable hardware offload for accounting.
-- `offload_l2_blocking` (Boolean) Enable hardware offload for L2 blocking.
-- `offload_sch` (Boolean) Enable hardware offload for scheduling.
-- `other_timeout` (Number) Other connections timeout in seconds.
+- `offload` (Attributes) Hardware offload settings. (see [below for nested schema](#nestedatt--usg--offload))
+- `other_timeout` (String) Other connections timeout, as a Go duration string (e.g. `600s`, `10m`).
 - `pptp_module` (Boolean) Enable PPTP module.
 - `receive_redirects` (Boolean) Accept ICMP redirects.
 - `send_redirects` (Boolean) Send ICMP redirects.
 - `sip_module` (Boolean) Enable SIP module.
 - `syn_cookies` (Boolean) Enable SYN cookies.
-- `tcp_close_timeout` (Number) TCP close timeout in seconds.
-- `tcp_close_wait_timeout` (Number) TCP close wait timeout in seconds.
-- `tcp_established_timeout` (Number) TCP established connection timeout in seconds.
-- `tcp_fin_wait_timeout` (Number) TCP fin wait timeout in seconds.
-- `tcp_last_ack_timeout` (Number) TCP last ACK timeout in seconds.
-- `tcp_syn_recv_timeout` (Number) TCP SYN received timeout in seconds.
-- `tcp_syn_sent_timeout` (Number) TCP SYN sent timeout in seconds.
-- `tcp_time_wait_timeout` (Number) TCP time wait timeout in seconds.
+- `tcp` (Attributes) TCP connection tracking timeouts. (see [below for nested schema](#nestedatt--usg--tcp))
 - `tftp_module` (Boolean) Enable TFTP module.
 - `timeout_setting_preference` (String) Timeout setting preference: auto or manual.
-- `udp_other_timeout` (Number) UDP other timeout in seconds.
-- `udp_stream_timeout` (Number) UDP stream timeout in seconds.
+- `udp` (Attributes) UDP connection tracking timeouts. (see [below for nested schema](#nestedatt--usg--udp))
 - `unbind_wan_monitors` (Boolean) Unbind WAN monitors.
-- `upnp_enabled` (Boolean) Enable UPnP.
-- `upnp_nat_pmp_enabled` (Boolean) Enable UPnP NAT-PMP.
-- `upnp_secure_mode` (Boolean) Enable UPnP secure mode.
-- `upnp_wan_interface` (String) UPnP WAN interface (e.g., WAN, WAN2).
+- `upnp` (Attributes) UPnP settings. (see [below for nested schema](#nestedatt--usg--upnp))
 
 <a id="nestedatt--usg--dns_verification"></a>
 ### Nested Schema for `usg.dns_verification`
@@ -165,3 +673,59 @@ Optional:
 - `primary_dns_server` (String) Primary DNS server.
 - `secondary_dns_server` (String) Secondary DNS server.
 - `setting_preference` (String) Setting preference: auto or manual.
+
+
+<a id="nestedatt--usg--geo_ip_filtering"></a>
+### Nested Schema for `usg.geo_ip_filtering`
+
+Optional:
+
+- `block` (String) Geo IP filtering action: block or allow.
+- `countries` (String) Comma-separated list of country codes for geo IP filtering.
+- `enabled` (Boolean) Enable geo IP filtering.
+- `traffic_direction` (String) Geo IP filtering traffic direction: both, ingress, or egress.
+
+
+<a id="nestedatt--usg--offload"></a>
+### Nested Schema for `usg.offload`
+
+Optional:
+
+- `accounting` (Boolean) Enable hardware offload for accounting.
+- `l2_blocking` (Boolean) Enable hardware offload for L2 blocking.
+- `sch` (Boolean) Enable hardware offload for scheduling.
+
+
+<a id="nestedatt--usg--tcp"></a>
+### Nested Schema for `usg.tcp`
+
+Optional:
+
+- `close_timeout` (String) TCP close timeout, as a Go duration string (e.g. `10s`).
+- `close_wait_timeout` (String) TCP close wait timeout, as a Go duration string (e.g. `60s`, `1m`).
+- `established_timeout` (String) TCP established connection timeout, as a Go duration string (e.g. `7440s`, `2h4m`).
+- `fin_wait_timeout` (String) TCP fin wait timeout, as a Go duration string (e.g. `120s`, `2m`).
+- `last_ack_timeout` (String) TCP last ACK timeout, as a Go duration string (e.g. `30s`).
+- `syn_recv_timeout` (String) TCP SYN received timeout, as a Go duration string (e.g. `60s`, `1m`).
+- `syn_sent_timeout` (String) TCP SYN sent timeout, as a Go duration string (e.g. `120s`, `2m`).
+- `time_wait_timeout` (String) TCP time wait timeout, as a Go duration string (e.g. `120s`, `2m`).
+
+
+<a id="nestedatt--usg--udp"></a>
+### Nested Schema for `usg.udp`
+
+Optional:
+
+- `other_timeout` (String) UDP other timeout, as a Go duration string (e.g. `30s`).
+- `stream_timeout` (String) UDP stream timeout, as a Go duration string (e.g. `180s`, `3m`).
+
+
+<a id="nestedatt--usg--upnp"></a>
+### Nested Schema for `usg.upnp`
+
+Optional:
+
+- `enabled` (Boolean) Enable UPnP.
+- `nat_pmp_enabled` (Boolean) Enable UPnP NAT-PMP.
+- `secure_mode` (Boolean) Enable UPnP secure mode.
+- `wan_interface` (String) UPnP WAN interface (e.g., WAN, WAN2).
