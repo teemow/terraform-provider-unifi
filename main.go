@@ -25,7 +25,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		Address: "registry.terraform.io/ubiquiti-community/unifi",
+		Address: "registry.terraform.io/teemow/unifi",
 		Debug:   debug,
 	}
 
