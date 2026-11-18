@@ -27,9 +27,9 @@ import (
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                   = &deviceResource{}
-	_ resource.ResourceWithImportState    = &deviceResource{}
-	_ resource.ResourceWithModifyPlan     = &deviceResource{}
+	_ resource.Resource                = &deviceResource{}
+	_ resource.ResourceWithImportState = &deviceResource{}
+	_ resource.ResourceWithModifyPlan  = &deviceResource{}
 )
 
 func NewDeviceFrameworkResource() resource.Resource {
@@ -708,7 +708,7 @@ func (r *deviceResource) Schema(
 							Optional:    true,
 							Computed:    true,
 						},
-					"isolation": schema.BoolAttribute{
+						"isolation": schema.BoolAttribute{
 							Description: "Enable port isolation.",
 							Optional:    true,
 							Computed:    true,
@@ -935,11 +935,13 @@ func (r *deviceResource) ModifyPlan(
 
 		if !model.Index.IsNull() {
 			if cfgModel, exists := configOverrides[model.Index.ValueInt64()]; exists {
-				if !cfgModel.OpMode.IsNull() && model.OpMode.ValueString() != cfgModel.OpMode.ValueString() {
+				if !cfgModel.OpMode.IsNull() &&
+					model.OpMode.ValueString() != cfgModel.OpMode.ValueString() {
 					model.OpMode = cfgModel.OpMode
 					modified = true
 				}
-				if !cfgModel.LagIdx.IsNull() && (model.LagIdx.IsNull() || model.LagIdx.ValueInt64() != cfgModel.LagIdx.ValueInt64()) {
+				if !cfgModel.LagIdx.IsNull() &&
+					(model.LagIdx.IsNull() || model.LagIdx.ValueInt64() != cfgModel.LagIdx.ValueInt64()) {
 					model.LagIdx = cfgModel.LagIdx
 					modified = true
 				}
