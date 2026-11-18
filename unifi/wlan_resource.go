@@ -1125,7 +1125,11 @@ func (m *wlanBandsFromBandModifier) MarkdownDescription(ctx context.Context) str
 	return m.Description(ctx)
 }
 
-func (m *wlanBandsFromBandModifier) PlanModifySet(ctx context.Context, req planmodifier.SetRequest, resp *planmodifier.SetResponse) {
+func (m *wlanBandsFromBandModifier) PlanModifySet(
+	ctx context.Context,
+	req planmodifier.SetRequest,
+	resp *planmodifier.SetResponse,
+) {
 	if !req.ConfigValue.IsNull() {
 		return
 	}
