@@ -149,7 +149,7 @@ Optional:
 
 Optional:
 
-- `interface` (String) The WAN interface. Can be `wan`, `wan2`, or `both`.
+- `interface` (String) The WAN interface (e.g. `wan`, `wan2`, `wan3`, or `both`).
 - `ip_address` (String) The WAN IP address for the port forwarding rule. Use `any` for all addresses.
 - `port` (String) The WAN port or port range (e.g. `1-10,11,12`).
 
