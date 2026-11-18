@@ -1,13 +1,13 @@
 ---
-page_title: WireGuard Peer (Resource)
+page_title: Wireguard Peer (Resource)
 subcategory: ""
 description: |-
-  Manages WireGuard VPN peers on a UniFi WireGuard server.
+  unifi_wireguard_peer manages WireGuard VPN peers on a UniFi WireGuard server. The controller auto-generates the keypair and assigns an IP address when a peer is created.
 ---
 
-# WireGuard Peer (Resource)
+# Wireguard Peer (Resource)
 
-Manages WireGuard VPN peers on a UniFi WireGuard server. The controller auto-generates the keypair and assigns an IP address when a peer is created.
+`unifi_wireguard_peer` manages WireGuard VPN peers on a UniFi WireGuard server. The controller auto-generates the keypair and assigns an IP address when a peer is created.
 
 ## Example Usage
 
@@ -64,7 +64,7 @@ resource "unifi_wireguard_peer" "guest" {
 
 Import is supported using the following syntax:
 
-The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # import from provider configured site

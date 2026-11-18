@@ -87,7 +87,7 @@ resource "unifi_wlan" "wifi" {
 - `vlan` (Number) VLAN ID.
 - `vlan_enabled` (Boolean) Enable VLAN tagging.
 - `wlan_band` (String) WLAN band.
-- `wlan_bands` (Set of String) List of WLAN bands.
+- `wlan_bands` (Set of String) List of WLAN bands. If not set, derived from `wlan_band`.
 - `wpa3_support` (Boolean) Enable WPA 3 support (security must be `wpapsk` and PMF must be turned on).
 - `wpa3_transition` (Boolean) Enable WPA 3 and WPA 2 support (security must be `wpapsk` and `wpa3_support` must be true).
 

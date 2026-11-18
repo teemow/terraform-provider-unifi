@@ -156,6 +156,7 @@ Optional:
 - `forward` (String) Forwarding mode.
 - `full_duplex` (Boolean) Enable full duplex mode.
 - `isolation` (Boolean) Enable port isolation.
+- `lag_idx` (Number) LAG group number (starting at 1). Required when op_mode is `aggregate` to identify the LAG group on the switch.
 - `lldpmed_enabled` (Boolean) Enable LLDP-MED.
 - `lldpmed_notify_enabled` (Boolean) Enable LLDP-MED notifications.
 - `mirror_port_idx` (Number) Mirror port index.
